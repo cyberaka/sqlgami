@@ -25,7 +25,7 @@ from .checks import CheckContext, Probe, run_static_checks
 from .checks.base import PROBE_HAS_NULL, PROBE_QUERY, PROBE_TIMESTAMP_FORMAT, PROBE_UNIQUE, PROBE_VALUE
 from .checks.predicates import _ISO_DATE_RE, judge_value, value_finding
 from .engines.base import INVALID, TIMEOUT, Adapter
-from .errors import AdapterError, SqlgamiError
+from .errors import AdapterError, SqlgamiError, UnsafeQueryError
 from .report import (
     CostEstimate,
     Finding,
@@ -554,7 +554,22 @@ def _database_stages(
         engine_version = None
     if engine_version:
         report.signals["engine_version"] = engine_version
-    dry = adapter.dry_run(sql)
+    try:
+        dry = adapter.dry_run(sql)
+    except UnsafeQueryError as exc:
+        # The statement as it would be sent (a template with its values filled in) is not one
+        # read-only query: it does not parse, or it calls something the gate refuses.
+        report.findings.append(
+            Finding(
+                "render_error",
+                Severity.ERROR,
+                f"With its parameters filled in, the statement cannot be sent to the database: {exc}",
+                "dry_run",
+            )
+        )
+        _stage(report, "dry_run", StageStatus.FAILED, str(exc)[:200], clock.lap())
+        _not_run(report, ("sample",), "the statement cannot be sent")
+        return
     elapsed = clock.lap()
     report.plan = dry.plan
     report.findings.extend(dry.findings)

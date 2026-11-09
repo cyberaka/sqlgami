@@ -71,6 +71,7 @@ GATE_CODES = {
     "ambiguous_column": CAP_CANNOT_RUN,
     "dry_run_error": CAP_CANNOT_RUN,
     "unknown_function": CAP_CANNOT_RUN,
+    "render_error": CAP_CANNOT_RUN,
     "execution_error": CAP_CANNOT_RUN,
     "external_access": CAP_CANNOT_RUN,
 }

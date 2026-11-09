@@ -512,3 +512,10 @@ def test_top_n_query_is_not_blamed_for_dropping_empty_groups(scorer):
         "Across all tenants, which customer has the most orders?",
     )
     assert not report.findings_at_least(Severity.MEDIUM), report.summary()
+
+
+def test_a_template_that_renders_into_nonsense_is_a_finding_not_a_crash(scorer):
+    # '{codes}' inside a plain comparison: filled with a list it reads "country = 'US', 'DE'".
+    report = scorer.sample("SELECT name FROM customers WHERE country = {codes}", "names", params={"codes": ["US", "DE"]})
+    assert report.has("render_error") and report.verdict.value == "invalid"
+    assert report.stage("dry_run").status.value == "failed" and report.stage("sample").status.value == "not_run"

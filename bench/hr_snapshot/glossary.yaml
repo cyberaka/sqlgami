@@ -36,6 +36,13 @@ definitions:
       An associate whose snapshot row carries new_hire_ind = 1. A new hire is counted in a
       window if their hire date (hire_dt) falls inside that window's pay periods.
 
+  authoritative_hire_and_term_dates:
+    meaning: >
+      hr.employee_dim is the system of record for an associate's hire date and termination
+      date. Metrics that compare an associate's hire and termination (e.g. "terminated within
+      N days of hire") read hire_dt and term_dt from hr.employee_dim — not from the
+      snapshot's own term_dt, which only reflects what was known at that period's close.
+
   ninety_day_new_hire_turnover:
     meaning: >
       Among new hires in a given window, the portion whose term_dt is within 90 calendar days
@@ -65,6 +72,20 @@ definitions:
       unknown, not active. 'L' (Leave), 'T' (Terminated), 'R' (Retired), 'U' (Unknown) are
       not active.
 
+  on_leave:
+    meaning: >
+      An authoritative snapshot row is on leave when status_cd = 'L'. NULL status_cd is
+      unknown (not on leave); every other status is not on leave either. Phrased in the
+      negative, "not on leave" covers all rows where status_cd is NOT 'L', INCLUDING rows
+      where status_cd is NULL.
+
+  year_over_year_growth:
+    meaning: >
+      Year-over-year change in a count, expressed as basis points of the anchor value:
+      (current - prior) × 10000 / prior, truncated to an integer. "A year ago" is the pay
+      period 26 biweekly periods before the current one. The result is NULL when the prior
+      anchor count is 0.
+
   headcount:
     meaning: >
       The distinct count of in-scope active associates at a pay period.
@@ -72,6 +93,7 @@ definitions:
   basis_points:
     meaning: >
       A rate expressed as an integer in ten-thousandths. 1.25% = 125 basis points; 50% = 5000.
+      Basis points are truncated (floored) to an integer, not rounded.
 
   deleted_at_defaults:
     meaning: >
