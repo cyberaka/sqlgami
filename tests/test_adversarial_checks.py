@@ -359,13 +359,6 @@ MISSED = [
         "GROUP BY total removes the repeats but also merges different orders with the same total",
     ),
     # cartesian_join
-    (
-        'cartesian_join',
-        'or_true',
-        "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id OR 1 = 1",
-        {},
-        "OR 1 = 1 makes the join condition always true",
-    ),
     # null_comparison
     (
         'null_comparison',
@@ -467,13 +460,6 @@ MISSED = [
 
 FALSE_ALARMS = [
     # fan_out
-    (
-        'fan_out',
-        'view_grouped_by_pk_plus',
-        "SELECT SUM(o.total) FROM orders o JOIN order_totals t ON t.order_id = o.id",
-        {},
-        "order_totals is grouped by orders.id plus columns that depend on it, so it has one row per order_id and cannot repeat orders",
-    ),
     # outer_join_nullified
     (
         'outer_join_nullified',
@@ -707,13 +693,6 @@ FALSE_ALARMS = [
     # missing_tenant_filter
     (
         'missing_tenant_filter',
-        'using_tenant_unqualified',
-        "SELECT c.name, o.total FROM customers c JOIN orders o USING (tenant_id) WHERE tenant_id = 7 AND o.customer_id = c.id",
-        {'hints': {'tenant_column': 'tenant_id'}},
-        "tenant_id = 7 is unqualified because USING merged the column; it pins both tables",
-    ),
-    (
-        'missing_tenant_filter',
         'conditional_aggregate',
         "SELECT SUM(CASE WHEN tenant_id = 7 THEN total ELSE 0 END) FROM orders",
         {'hints': {'tenant_column': 'tenant_id'}},
@@ -729,6 +708,12 @@ FALSE_ALARMS = [
 ]
 
 STILL_FIRES = [
+    (
+        'cartesian_join',
+        'or_true',
+        "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id OR 1 = 1",
+        {},
+    ),
     # fan_out
     (
         'fan_out',
@@ -1413,6 +1398,18 @@ STILL_FIRES = [
 ]
 
 STILL_QUIET = [
+    (
+        'missing_tenant_filter',
+        'using_tenant_unqualified',
+        "SELECT c.name, o.total FROM customers c JOIN orders o USING (tenant_id) WHERE tenant_id = 7 AND o.customer_id = c.id",
+        {'hints': {'tenant_column': 'tenant_id'}},
+    ),
+    (
+        'fan_out',
+        'view_grouped_by_pk_plus',
+        "SELECT SUM(o.total) FROM orders o JOIN order_totals t ON t.order_id = o.id",
+        {},
+    ),
     # fixed false alarms, kept as regressions
     (
         'fan_out',
@@ -1987,14 +1984,6 @@ NATURAL_JOIN_MERGED_COLUMN = [
 ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "NATURAL JOIN merges the shared column, so writing it without a table name is valid on "
-        "SQLite, DuckDB and Postgres. The schema stage reports ambiguous_column (an error) and "
-        "no static check runs. The same query written with USING (order_id) passes."
-    ),
-)
 @pytest.mark.parametrize("dialect", DIALECTS)
 @pytest.mark.parametrize("sql", NATURAL_JOIN_MERGED_COLUMN)
 def test_natural_join_merged_column_is_not_ambiguous(dialect, sql):
@@ -2047,14 +2036,6 @@ def test_tenant_filter_carries_across_a_left_join(dialect):
     assert not _explain(dialect, _TENANT_LEFT, _TENANT).has("missing_tenant_filter")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The same query written as a RIGHT JOIN (tables swapped) is reported, medium, for "
-        "orders, although the ON clause ties o.tenant_id to the pinned c.tenant_id exactly as "
-        "in the LEFT JOIN form, which is not reported."
-    ),
-)
 @pytest.mark.parametrize("dialect", DIALECTS)
 def test_tenant_filter_carries_across_a_right_join(dialect):
     assert not _explain(dialect, _TENANT_RIGHT, _TENANT).has("missing_tenant_filter")

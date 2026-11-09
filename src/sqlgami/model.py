@@ -68,6 +68,22 @@ def flatten_and(node: exp.Expression | None) -> list[exp.Expression]:
     return out
 
 
+def always_true(node: exp.Expression) -> bool:
+    """A condition that holds for every row: TRUE, 1 = 1, or an OR with such a branch."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.EQ):
+        left, right = strip(node.this), strip(node.expression)
+        return isinstance(left, exp.Literal) and isinstance(right, exp.Literal) and left == right
+    if isinstance(node, exp.Or):
+        return always_true(node.this) or always_true(node.expression)
+    if isinstance(node, exp.And):
+        return always_true(node.this) and always_true(node.expression)
+    return False
+
+
 def flatten_or(node: exp.Expression | None) -> list[exp.Expression]:
     if node is None:
         return []
@@ -184,6 +200,7 @@ class Conjunct:
     origin: str  # where | on
     join_aliases: frozenset[str] = frozenset()  # sources brought in by the join this ON belongs to
     outer_join: bool = False
+    side: str = ""  # LEFT, RIGHT or FULL for an outer join's ON clause
     aliases: frozenset[str] = frozenset()
 
 
@@ -240,6 +257,7 @@ class SelectModel:
         self.restricted: set[ColRef] = set()
         self.links: list[frozenset[str]] = []
         # Columns equated to another column of the same source (f.snap_dt = f.period_end_dt).
+        self.tautologies: list[exp.Expression] = []
         self.self_equal: set[ColRef] = set()
         # OR chains of "column = constant": (columns, True if every branch uses the same constant, node).
         self.or_groups: list[tuple[list[ColRef], bool, exp.Expression]] = []
@@ -320,7 +338,7 @@ class SelectModel:
         for record in self.joins:
             targets = frozenset(record.targets)
             for expr in flatten_and(record.join.args.get("on")):
-                self.conjuncts.append(Conjunct(expr, "on", targets, record.is_outer))
+                self.conjuncts.append(Conjunct(expr, "on", targets, record.is_outer, record.side))
             if (record.join.method or "").upper() == "NATURAL" or record.join.args.get("using"):
                 # The join condition is implied by column names; treat the sources as linked.
                 self.links.append(frozenset(record.targets) | frozenset(record.left))
@@ -328,6 +346,9 @@ class SelectModel:
         for conjunct in self.conjuncts:
             expr = conjunct.expr
             conjunct.aliases = self.aliases_in(expr)
+            if always_true(expr):
+                self.tautologies.append(expr)  # "ON a.x = b.y OR 1 = 1" links nothing
+                continue
             if len(conjunct.aliases) >= 2:
                 self.links.append(conjunct.aliases)
             self._record(conjunct)
@@ -359,6 +380,15 @@ class SelectModel:
                 self._bind(left_col, right, conjunct)
             elif right_col and self._is_constant(left):
                 self._bind(right_col, left, conjunct)
+            else:
+                # USING (k) ... WHERE k = 7 is resolved to COALESCE(a.k, b.k) = 7: both are pinned.
+                for merged, value in ((left, right), (right, left)):
+                    if isinstance(merged, exp.Coalesce) and self._is_constant(value):
+                        parts = [merged.this, *merged.expressions]
+                        refs = [self._local_ref(strip(part)) for part in parts]
+                        if refs and all(refs):
+                            for ref in refs:
+                                self._bind(ref, value, conjunct)
         elif isinstance(expr, exp.In) and not expr.args.get("query"):
             ref = self._local_ref(strip(expr.this))
             values = expr.expressions
@@ -412,7 +442,13 @@ class SelectModel:
         if conjunct.origin != "on" or not conjunct.outer_join:
             return True
         source = self.sources.get(ref[0])
-        return bool(source is not None and source.null_supplied and ref[0] in conjunct.join_aliases)
+        if source is None or not source.null_supplied:
+            return False
+        if conjunct.side == "RIGHT":
+            return ref[0] not in conjunct.join_aliases  # the left-hand sources are the optional side
+        if conjunct.side == "FULL":
+            return False
+        return ref[0] in conjunct.join_aliases
 
     def _bind(self, ref: ColRef, value: exp.Expression, conjunct: Conjunct) -> None:
         if not self.filters(ref, conjunct):
@@ -667,13 +703,31 @@ class SelectModel:
                     if not any(isinstance(n, exp.AggFunc) for n in walk_own(p))
                 ]
                 return KeyInfo([frozenset(plain)], True) if plain else KeyInfo([frozenset()], True)
+            reduced: list[frozenset[str]] = []
+            # Grouping by a table's whole key fixes its other grouped columns, so the key alone
+            # identifies a group: GROUP BY o.id, o.customer_id is unique on o.id.
+            grouped_by_alias: dict[str, set[str]] = {}
+            for expr in group.expressions:
+                inner = strip(expr)
+                if isinstance(inner, exp.Column) and inner.table in self.sources:
+                    grouped_by_alias.setdefault(inner.table, set()).add(inner.name)
+            only_alias = len(grouped_by_alias) == 1 and all(
+                isinstance(strip(e), exp.Column) for e in group.expressions
+            )
+            if only_alias:
+                alias, columns = next(iter(grouped_by_alias.items()))
+                for key in self.key_info(alias).keys:
+                    if key and key <= columns:
+                        names = [self._projection_name_for_ref((alias, c)) for c in key]
+                        if all(names):
+                            reduced.append(frozenset(names))
             mapped: list[str] = []
             for expr in group.expressions:
                 name = self._projection_name_for(expr)
                 if name is None:
-                    return KeyInfo([], False)
+                    return KeyInfo(reduced, bool(reduced))
                 mapped.append(name)
-            return KeyInfo([frozenset(mapped)], True)
+            return KeyInfo([frozenset(mapped), *reduced], True)
 
         distinct = select.args.get("distinct")
         if distinct is not None:

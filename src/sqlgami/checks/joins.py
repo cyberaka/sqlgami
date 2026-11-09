@@ -366,21 +366,20 @@ def outer_join_nullified(ctx: CheckContext) -> Iterable[Finding]:
 
 @check("natural_join", description="NATURAL JOIN joins on whatever column names happen to match.")
 def natural_join(ctx: CheckContext) -> Iterable[Finding]:
-    for model in ctx.cache.models():
-        for record in model.joins:
-            join = record.join
-            if (join.method or "").upper() == "NATURAL":
-                yield ctx.finding(
-                    "natural_join",
-                    Severity.MEDIUM,
-                    (
-                        "NATURAL JOIN matches on every column name the two tables share, which "
-                        "often includes columns such as id, name or created_at that were not "
-                        "meant as join keys."
-                    ),
-                    join,
-                    suggestion="Write the join condition out with ON.",
-                )
+    for written in ctx.analysis.natural_joins:
+        text = " ".join(written.split())
+        yield Finding(
+            "natural_join",
+            Severity.MEDIUM,
+            (
+                "NATURAL JOIN matches on every column name the two tables share, which "
+                "often includes columns such as id, name or created_at that were not "
+                "meant as join keys."
+            ),
+            "static",
+            text if len(text) <= 160 else text[:157] + "...",
+            "Write the join condition out with ON.",
+        )
 
 
 # ------------------------------------------------------------ repeated rows

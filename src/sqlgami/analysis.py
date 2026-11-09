@@ -107,6 +107,7 @@ class Analysis:
     string_identifiers: list[str] = field(default_factory=list)
     types_annotated: bool = False
     # For a script (DECLARE ...; SET ...; SELECT ...): what came before the query.
+    natural_joins: list[str] = field(default_factory=list)  # NATURAL joins as written, for reporting
     script_statements: list[str] = field(default_factory=list)
     variables: dict[str, str] = field(default_factory=dict)  # lower-cased name -> declared type
     shadowed_variables: list[str] = field(default_factory=list)
@@ -289,6 +290,10 @@ class _Resolver:
             self._sqlite_string_identifiers(tree)
         if analysis.variables:
             self._bind_variables(tree)
+        try:
+            self._expand_natural_joins(tree)
+        except (SqlglotError, RecursionError, KeyError, AttributeError):
+            pass  # left as written; the engine remains the judge of validity
 
         schema = self._mapping_schema()
         try:
@@ -435,6 +440,63 @@ class _Resolver:
             }
             mapping.setdefault(schema_key, {})[name_key] = columns
         return MappingSchema(mapping or None, dialect=self.dialect, normalize=False)
+
+    # ---------------------------------------------------------- NATURAL JOIN
+
+    def _expand_natural_joins(self, tree: exp.Expression) -> None:
+        """Rewrite ``a NATURAL JOIN b`` as ``a JOIN b USING (shared columns)``.
+
+        A NATURAL JOIN merges the columns the two sides share, so the shared
+        name is legal without a table qualifier. Spelling the join out lets the
+        usual USING handling resolve it, instead of calling the column ambiguous.
+        """
+        naturals = [j for j in tree.find_all(exp.Join) if (j.method or "").upper() == "NATURAL"]
+        if not naturals:
+            return
+        root = build_scope(tree)
+        if root is None:
+            return
+        for scope in root.traverse():
+            select = scope.expression
+            if not isinstance(select, exp.Select):
+                continue
+            seen: list[str] = []
+            first = select.args.get("from_") or select.args.get("from")
+            if first is not None and first.this is not None:
+                seen.append(first.this.alias_or_name)
+            for join in select.args.get("joins") or []:
+                alias = join.this.alias_or_name if join.this is not None else ""
+                if (join.method or "").upper() == "NATURAL":
+                    self.analysis.natural_joins.append(join.sql(dialect=self.dialect))
+                    right = self._columns_of(scope, alias)
+                    left: set[str] = set()
+                    for other in seen:
+                        left |= self._columns_of(scope, other) or set()
+                    shared = sorted((right or set()) & left)
+                    join.set("method", None)
+                    if shared:
+                        join.set("using", [exp.to_identifier(name) for name in shared])
+                seen.append(alias)
+
+    def _columns_of(self, scope: Scope, alias: str) -> set[str] | None:
+        source = scope.sources.get(alias)
+        if isinstance(source, exp.Table):
+            table = self.analysis.table_for(source)
+            if table is None:
+                return None
+            return {c.name.lower() for c in table.columns}
+        if isinstance(source, Scope) and isinstance(source.expression, exp.Query):
+            names = [n for n in source.expression.named_selects if n and n != "*"]
+            if source.expression.is_star:
+                # SELECT * FROM t: the names are those of the tables underneath.
+                names = []
+                for inner in source.sources.values():
+                    if isinstance(inner, exp.Table):
+                        table = self.analysis.table_for(inner)
+                        if table is not None:
+                            names.extend(c.name for c in table.columns)
+            return {n.lower() for n in names}
+        return None
 
     # ------------------------------------------------------ script variables
 
