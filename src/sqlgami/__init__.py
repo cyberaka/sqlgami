@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 
+from .calibration import IsotonicCalibrator
 from .catalog import Catalog, Column, ForeignKey, Table
 from .errors import (
     AdapterError,
@@ -59,6 +60,7 @@ __all__ = [
     "CostEstimate",
     "Finding",
     "ForeignKey",
+    "IsotonicCalibrator",
     "MissingDependencyError",
     "Options",
     "Report",

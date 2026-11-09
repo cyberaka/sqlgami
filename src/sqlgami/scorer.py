@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from .catalog import Catalog
@@ -36,6 +37,9 @@ class Scorer:
         SQLite and DuckDB). Above it the query is not run.
     tenant_column, soft_delete_column:
         Policy hints, applied to the catalog.
+    calibrator:
+        A fitted calibrator, or the path of a calibration file written by
+        ``IsotonicCalibrator.save``. Without one, scores are provisional.
     glossary:
         Business definitions, as text or a ``{term: meaning}`` dictionary. Values
         named here are not reported as filters the question never asked for.
@@ -56,7 +60,7 @@ class Scorer:
         timeout_s: float | None = None,
         tenant_column: str | None = None,
         soft_delete_column: str | None = None,
-        calibrator: Calibrator | None = None,
+        calibrator: Calibrator | str | os.PathLike | None = None,
         options: Options | None = None,
         glossary: str | dict | None = None,
     ) -> None:
@@ -97,6 +101,10 @@ class Scorer:
             self.options.sample_rows = sample_rows
         if timeout_s is not None:
             self.options.timeout_s = timeout_s
+        if isinstance(calibrator, (str, os.PathLike)):
+            from .calibration import IsotonicCalibrator
+
+            calibrator = IsotonicCalibrator.load(calibrator)
         self.calibrator = calibrator
         if isinstance(glossary, dict):
             glossary = "\n".join(f"{term}: {meaning}" for term, meaning in glossary.items())

@@ -129,6 +129,7 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
                 cap=cap,
                 cap_reason=cap_reason,
                 basis="hard gate: the statement cannot produce an answer as written",
+                raw=value,
             ),
             Verdict.INVALID,
         )
@@ -175,8 +176,7 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
     sample = report.stage("sample")
     if sample is not None and sample.status == StageStatus.SKIPPED and report.mode in ("sample", "full"):
         parts.append("unverified beyond static and dry-run checks")
-    if not calibrated:
-        parts.append("provisional heuristic, not calibrated")
+    parts.append("calibrated on labelled data" if calibrated else "provisional heuristic, not calibrated")
     basis = "; ".join(parts)
 
     if value >= LIKELY_RIGHT_AT:
@@ -194,6 +194,7 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
             cap=cap,
             cap_reason=cap_reason,
             basis=basis,
+            raw=raw,
         ),
         verdict,
     )

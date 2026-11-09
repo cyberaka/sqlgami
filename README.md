@@ -19,8 +19,9 @@ to show anything, is up to your application.
 Early and private. Working today: the core, the static and question checks,
 and adapters for SQLite, DuckDB and Postgres. Planned next, in this order:
 BigQuery, then Cosmos DB. The confidence number is a **provisional heuristic** until a
-calibration model has been fitted on labelled data; reports say so with
-`"calibrated": false`.
+calibrator fitted on labelled data is loaded; reports say so with
+`"calibrated": false`. The calibration mechanism exists; a fitted calibration
+does not ship yet.
 
 ## Install
 
@@ -158,7 +159,7 @@ if the column really holds NULLs. Filter values are looked up in the column.
   "sql": "SELECT ...",
   "verdict": "likely_wrong",
   "confidence": {
-    "value": 0.39, "low": 0.27, "high": 0.4,
+    "value": 0.39, "raw": 0.39, "low": 0.27, "high": 0.4,
     "calibrated": false,
     "cap": 0.4, "cap_reason": "high-severity finding: fan_out",
     "basis": "sample evidence; provisional heuristic, not calibrated"
@@ -180,6 +181,33 @@ Stages, in order, are `parse`, `statement`, `schema`, `static`, `dry_run`,
 Verdicts are `invalid`, `likely_wrong`, `uncertain`, `likely_right` and
 `unverified`. A check that could not run is listed under `checks_not_run`
 rather than counted as passed.
+
+### Calibration
+
+Out of the box the confidence value is a heuristic: it ranks statements from
+more to less trustworthy, and reports mark it `"calibrated": false`. To make
+the number mean something measurable, fit a calibrator on statements whose
+correctness you know and load it:
+
+```python
+from sqlgami import IsotonicCalibrator, Scorer
+
+calibrator = IsotonicCalibrator.fit(samples)   # (provisional score, was it correct, depth) triples
+calibrator.save("calibration.json")
+
+scorer = Scorer("postgres", db=conn, calibrator="calibration.json")
+```
+
+With a calibrator loaded, a value of 0.8 means that about 80% of comparable
+statements in the fitting data were correct, the report says
+`"calibrated": true`, and the provisional score stays available as
+`confidence.raw`. Hard gates and caps still apply on top. A calibration only
+carries over to workloads that resemble the data it was fitted on, so it does
+not turn the report into a guarantee. Depths with too few labelled examples
+are left uncalibrated.
+
+`uv run python -m benchkit calibrate <suite>... --out calibration.json` fits
+one from bench suites and prints its error on questions held out of the fit.
 
 ### Safety
 

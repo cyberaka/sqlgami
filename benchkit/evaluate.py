@@ -268,6 +268,55 @@ def label_run(suite: Suite, run: Path) -> Path:
     return target
 
 
+def calibration_samples(items: list[Item], depth: str) -> list[tuple[float, bool, str, str]]:
+    """``(score, correct, depth, question id)`` for items that got past the hard gates.
+
+    Gated statements keep their fixed near-zero score and are not part of the fit.
+    """
+    return [(i.score, i.correct, depth, i.question_id) for i in items if i.score is not None and i.score > 0.1]
+
+
+def fit_calibration(samples: list[tuple[float, bool, str, str]], folds: int = 5, meta: dict[str, Any] | None = None):
+    """Fit a calibrator and estimate its error on questions it was not fitted on.
+
+    Folds are split by question, so a question's gold, bugs and rewrites never
+    sit on both sides of a split.
+    """
+    from sqlgami import IsotonicCalibrator
+
+    calibrator = IsotonicCalibrator.fit([(s, y, d) for s, y, d, _ in samples], meta=meta)
+    questions = sorted({q for _, _, _, q in samples})
+    held_scores: list[float] = []
+    held_labels: list[bool] = []
+    raw_scores: list[float] = []
+    if len(questions) >= folds:
+        for fold in range(folds):
+            held = {q for index, q in enumerate(questions) if index % folds == fold}
+            train = [(s, y, d) for s, y, d, q in samples if q not in held]
+            part = IsotonicCalibrator.fit(train, min_samples=max(10, 30 * (folds - 1) // folds))
+            for score, correct, depth, question in samples:
+                if question not in held:
+                    continue
+                value = part.calibrate(score, depth)
+                if value is None:
+                    continue
+                held_scores.append(value)
+                held_labels.append(correct)
+                raw_scores.append(score)
+    report = {
+        "samples": len(samples),
+        "questions": len(questions),
+        "fitted_depths": sorted(calibrator.curves),
+        "held_out_items": len(held_scores),
+        "ece_before": expected_calibration_error(raw_scores, held_labels),
+        "ece_after_held_out": expected_calibration_error(held_scores, held_labels),
+        "auroc_before": auroc(raw_scores, held_labels),
+        "auroc_after_held_out": auroc(held_scores, held_labels),
+    }
+    calibrator.meta["cross_validation"] = report
+    return calibrator, report
+
+
 def write_run(suite: Suite, engine: str, mode: str, items: list[Item], result: dict[str, Any], run_id: str) -> Path:
     out = RUNS_DIR / run_id
     out.mkdir(parents=True, exist_ok=True)
