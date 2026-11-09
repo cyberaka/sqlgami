@@ -26,6 +26,16 @@ def _unparen(node: exp.Expression) -> exp.Expression:
     return node
 
 
+def _is_scalar_extreme(node: exp.Expression, dialect: str) -> bool:
+    """SQLite's MAX(a, b) and MIN(a, b): with several arguments they return the greater or lesser one."""
+    return dialect == "sqlite" and isinstance(node, (exp.Max, exp.Min)) and bool(node.expressions)
+
+
+def _aggregates(model: SelectModel, dialect: str) -> list[exp.AggFunc]:
+    """The SELECT's own aggregate calls, leaving out SQLite's scalar MAX and MIN."""
+    return [a for a in model.own_aggregates() if not _is_scalar_extreme(a, dialect)]
+
+
 def _determining_keys(model: SelectModel, alias: str, dialect: str) -> list[frozenset[str]]:
     rule = _KEY_DEPENDENCY.get(dialect)
     if rule is None:
@@ -101,7 +111,7 @@ def _ungrouped_columns(model: SelectModel, dialect: str) -> list[exp.Column]:
             for column in _outer_references(model, node):
                 judge(column)
             return
-        if isinstance(node, exp.AggFunc) and not is_window_function(node):
+        if isinstance(node, exp.AggFunc) and not is_window_function(node) and not _is_scalar_extreme(node, dialect):
             return
         if isinstance(node, (exp.Filter, exp.WithinGroup)) and isinstance(node.this, exp.AggFunc):
             if not is_window_function(node.this):
@@ -123,7 +133,7 @@ def _ungrouped_columns(model: SelectModel, dialect: str) -> list[exp.Column]:
 
 def _single_min_or_max(model: SelectModel) -> bool:
     """SQLite: with exactly one MIN() or MAX(), bare columns come from the row holding that value."""
-    extremes = [a for a in model.own_aggregates() if isinstance(a, (exp.Min, exp.Max))]
+    extremes = [a for a in _aggregates(model, "sqlite") if isinstance(a, (exp.Min, exp.Max))]
     return len(extremes) == 1
 
 
@@ -131,7 +141,7 @@ def _single_min_or_max(model: SelectModel) -> bool:
 def missing_group_by(ctx: CheckContext) -> Iterable[Finding]:
     for model in ctx.cache.models():
         group = model.group
-        if group is None and not model.own_aggregates():
+        if group is None and not _aggregates(model, ctx.dialect):
             continue
         if group is not None and group.args.get("all"):
             continue
@@ -408,7 +418,7 @@ def limit_without_order(ctx: CheckContext) -> Iterable[Finding]:
         nested = model.scope.parent is not None
         order = select.args.get("order")
 
-        one_row = (model.group is None and bool(model.own_aggregates())) or _at_most_one_row(model)
+        one_row = (model.group is None and bool(_aggregates(model, ctx.dialect))) or _at_most_one_row(model)
         if model.sources and not one_row and not _constant_output(select):
             finding = _cut_finding(ctx, select, nested)
             if finding is not None:

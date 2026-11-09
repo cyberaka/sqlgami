@@ -1284,6 +1284,18 @@ STILL_FIRES = [
         "SELECT id FROM orders WHERE created_at >= '2024-01-01' AND created_at < '2024-01-31'",
         {},
     ),
+    (
+        'missing_group_by',
+        'sqlite_scalar_max_beside_real_aggregate',
+        "SELECT o.status, MAX(0, o.total - 10), COUNT(*) FROM orders o",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'limit_without_order',
+        'sqlite_scalar_max_is_not_one_row',
+        "SELECT o.id, MAX(0, o.total - 10) FROM orders o LIMIT 2",
+        {'dialects': ('sqlite',)},
+    ),
 ]
 
 STILL_QUIET = [
@@ -2205,6 +2217,18 @@ STILL_QUIET = [
         'exclusive_next_day',
         "SELECT id FROM orders WHERE created_at < '2024-02-01'",
         {},
+    ),
+    (
+        'missing_group_by',
+        'sqlite_scalar_max_is_not_an_aggregate',
+        "SELECT o.id, MAX(0, o.total - 10) AS over, MIN(o.total, 5) AS capped, MAX(1, o.id) AS floor FROM orders o",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'missing_group_by',
+        'sqlite_scalar_max_in_case',
+        "SELECT o.id, CASE WHEN MAX(0, o.total - 10) < 5 THEN 'low' WHEN MAX(0, o.total - 10) < 50 THEN 'mid' ELSE 'high' END AS band FROM orders o",
+        {'dialects': ('sqlite',)},
     ),
 ]
 
