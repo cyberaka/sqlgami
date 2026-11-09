@@ -7,6 +7,7 @@ import logging
 from ..report import Finding, SkippedCheck
 from .base import REGISTRY, Check, CheckContext, Probe
 from . import aggregation, joins, policy, predicates  # noqa: F401  (registration)
+from . import expressions  # noqa: F401,E402  (registration; builds on predicates)
 
 logger = logging.getLogger("sqlgami")
 

@@ -1,3 +1,10 @@
+rules:
+  soft_delete_default: >
+    Unless a question says "including deleted", soft-deleted rows
+    (deleted_at IS NOT NULL) are EXCLUDED everywhere: tenants, users,
+    subscriptions, invoices, payment_methods. Gold SQL follows this
+    rule even when the question text does not spell it out.
+
 terms:
   active_subscription: >
     deleted_at IS NULL AND status IN ('active','past_due') AND
@@ -24,7 +31,9 @@ terms:
   revenue: >
     SUM(total_cents) over invoices with status IN ('paid','partial') and
     deleted_at IS NULL. Returns are not deducted inside this suite; see
-    retail suite for return-aware revenue.
+    retail suite for return-aware revenue. Questions that specify a
+    single status ("paid invoices", "overdue invoices") override this
+    default and use only the stated status.
   last_month: >
     In this suite, "last month" is the previous calendar month in UTC —
     e.g. for as_of 2026-06-30T00:00:00Z, last month is 2026-05-01 through

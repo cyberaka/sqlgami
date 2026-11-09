@@ -68,6 +68,23 @@ def flatten_and(node: exp.Expression | None) -> list[exp.Expression]:
     return out
 
 
+def flatten_or(node: exp.Expression | None) -> list[exp.Expression]:
+    if node is None:
+        return []
+    out: list[exp.Expression] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        while isinstance(current, exp.Paren):
+            current = current.this
+        if isinstance(current, exp.Or):
+            stack.append(current.expression)
+            stack.append(current.this)
+        else:
+            out.append(current)
+    return out
+
+
 def from_clause(select: exp.Select) -> exp.Expression | None:
     return select.args.get("from_") or select.args.get("from")
 
@@ -222,6 +239,10 @@ class SelectModel:
         self.bound: dict[ColRef, exp.Expression] = {}
         self.restricted: set[ColRef] = set()
         self.links: list[frozenset[str]] = []
+        # Columns equated to another column of the same source (f.snap_dt = f.period_end_dt).
+        self.self_equal: set[ColRef] = set()
+        # OR chains of "column = constant": (columns, True if every branch uses the same constant, node).
+        self.or_groups: list[tuple[list[ColRef], bool, exp.Expression]] = []
         self._parent: dict[ColRef, ColRef] = {}
         self._mult: dict[tuple[str, bool], Multiplication] = {}
         self._key_info: dict[str, KeyInfo] = {}
@@ -332,6 +353,8 @@ class SelectModel:
                 if left_col[0] != right_col[0]:
                     self.equalities.append((left_col, right_col, conjunct))
                     self._union(left_col, right_col)
+                elif left_col != right_col:
+                    self.self_equal.update((left_col, right_col))
             elif left_col and self._is_constant(right):
                 self._bind(left_col, right, conjunct)
             elif right_col and self._is_constant(left):
@@ -344,6 +367,24 @@ class SelectModel:
                     self._bind(ref, values[0], conjunct)
                 elif self.filters(ref, conjunct):
                     self.restricted.add(ref)
+        elif isinstance(expr, exp.Or):
+            refs: list[ColRef] = []
+            values: list[exp.Expression] = []
+            for branch in flatten_or(expr):
+                if not isinstance(branch, exp.EQ):
+                    refs = []
+                    break
+                left, right = strip(branch.this), strip(branch.expression)
+                ref = self._local_ref(left) or self._local_ref(right)
+                value = right if self._local_ref(left) else left
+                if ref is None or not self._is_constant(value):
+                    refs = []
+                    break
+                refs.append(ref)
+                values.append(value)
+            if len(refs) >= 2:
+                same = all(v == values[0] for v in values)
+                self.or_groups.append((refs, same, expr))
         elif isinstance(expr, exp.Is):
             ref = self._local_ref(strip(expr.this))
             if ref and isinstance(expr.expression, exp.Boolean):
@@ -474,6 +515,20 @@ class SelectModel:
                     keys.append(key)
         return keys
 
+    def anti_joined(self) -> set[str]:
+        """Outer-joined sources that the WHERE clause keeps only where they found no match."""
+        found: set[str] = set()
+        for conjunct in self.conjuncts:
+            if conjunct.origin != "where":
+                continue
+            expr = conjunct.expr
+            if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Null):
+                column = strip(expr.this)
+                if isinstance(column, exp.Column) and column.table in self.sources:
+                    if self.sources[column.table].null_supplied:
+                        found.add(column.table)
+        return found
+
     def group_refs(self) -> set[ColRef]:
         """Columns named directly in GROUP BY. Within one group each has a single value."""
         refs: set[ColRef] = set()
@@ -525,6 +580,9 @@ class SelectModel:
         if cached is not None:
             return cached
         visited = {alias}
+        # An anti-joined source (LEFT JOIN x ... WHERE x.col IS NULL) contributes exactly one
+        # all-NULL row per surviving row, so it cannot repeat anything.
+        visited |= self.anti_joined() - {alias}
         changed = True
         while changed:
             changed = False
@@ -589,6 +647,12 @@ class SelectModel:
             return KeyInfo([frozenset()], True)
         if group is None and self.own_aggregates():
             return KeyInfo([frozenset()], True)
+
+        # Every key column of some source pinned to a constant, and nothing repeating it: one row.
+        if group is None:
+            for alias in self.sources:
+                if self.joins_at_most_one(alias, set()) and self.multiplied(alias).state == NO:
+                    return KeyInfo([frozenset()], True)
 
         keys: list[frozenset[str]] = []
         certain = True

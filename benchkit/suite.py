@@ -104,6 +104,17 @@ class Suite:
     def soft_delete_column(self) -> str | None:
         return self.config.get("soft_delete_column")
 
+    @property
+    def soft_delete_policy(self) -> str:
+        """``required`` when the suite declares that deleted rows are excluded by default."""
+        declared = (self.config.get("policy") or {}).get("soft_delete")
+        if declared in ("required", "advisory"):
+            return declared
+        glossary = self.path / "glossary.yaml"
+        if glossary.exists() and "soft_delete_default" in glossary.read_text(encoding="utf-8"):
+            return "required"
+        return "advisory"
+
     def schema_file(self, engine: str) -> Path:
         return self.path / "schema" / f"{engine}.sql"
 

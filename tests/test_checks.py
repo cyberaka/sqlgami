@@ -374,6 +374,9 @@ TENANT_OK = [
     "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id "
     "AND o.tenant_id = c.tenant_id WHERE c.tenant_id = 7",
     "SELECT SUM(amount) FROM order_totals WHERE tenant_id = 7",
+    # A join on a single-column key picks out rows that belong to the filtered ones.
+    "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.tenant_id = 7",
+    "SELECT o.total FROM orders o WHERE o.id IN (SELECT id FROM orders WHERE tenant_id = 7)",
     "WITH x AS (SELECT tenant_id AS t, total FROM orders) SELECT SUM(total) FROM x WHERE t = 7",
     "SELECT c.name FROM customers c LEFT JOIN orders o ON o.customer_id = c.id AND o.tenant_id = 7 "
     "WHERE c.tenant_id = 7",
@@ -389,7 +392,8 @@ TENANT_BAD = [
     ("SELECT SUM(amount) FROM order_totals", Severity.HIGH),
     ("SELECT COUNT(*) FROM orders WHERE tenant_id > 0", Severity.HIGH),
     (
-        "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.tenant_id = 7",
+        # Joined to a filtered table, but on columns that are not a key of either side.
+        "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.referrer_id WHERE c.tenant_id = 7",
         Severity.MEDIUM,
     ),
     (

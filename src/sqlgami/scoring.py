@@ -37,6 +37,14 @@ WEIGHT = {
 }
 REPEAT_DISCOUNT = 0.5  # second and later findings of the same kind count for less
 
+STACK_DISCOUNT = 0.6  # each further medium or low finding counts for this much of the one before
+
+# Positive evidence, in log-odds. Without it nothing could score in the upper band,
+# and a host application could never let anything through unreviewed.
+BONUS_QUESTION_AGREES = 0.40  # the question was given and none of its checks objected
+BONUS_NOTHING_FOUND = 0.30  # no finding of any severity, and every check ran
+BONUS_ROWS_RETURNED = 0.15  # the query ran and returned something
+
 HALF_WIDTH = {"static": 0.20, "dry": 0.17, "sample": 0.12}
 
 LIKELY_RIGHT_AT = 0.70
@@ -96,6 +104,23 @@ def evidence_depth(report: Report) -> str:
     return "static"
 
 
+def _clean_bonus(report: Report, depth: str, analysed: bool) -> float:
+    """Log-odds added for what went right. Only earned once the query has actually run."""
+    if depth != "sample" or not analysed:
+        return 0.0
+    bonus = 0.0
+    scored = [f for f in report.findings if f.severity != Severity.INFO]
+    question = report.stage("question")
+    if question is not None and question.status == StageStatus.PASSED:
+        if not any(f.stage == "question" for f in scored):
+            bonus += BONUS_QUESTION_AGREES
+    if not scored and not report.checks_not_run:
+        bonus += BONUS_NOTHING_FOUND
+    if report.signals.get("rows_returned"):
+        bonus += BONUS_ROWS_RETURNED
+    return bonus
+
+
 def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored:
     findings = report.findings
     depth = evidence_depth(report)
@@ -139,13 +164,21 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
     prior = PRIOR[depth] if analysed else min(PRIOR[depth], PRIOR_UNANALYSED)
     logit = _logit(prior)
     seen: dict[str, int] = {}
+    softer = 0  # medium and low findings counted so far
     for finding in sorted(findings, key=lambda f: -f.severity.rank):
         weight = WEIGHT.get(finding.severity, 0.0)
         if not weight:
             continue
         count = seen.get(finding.code, 0)
         seen[finding.code] = count + 1
-        logit -= weight * (REPEAT_DISCOUNT**count)
+        weight *= REPEAT_DISCOUNT**count
+        if finding.severity != Severity.HIGH:
+            # Heuristic findings are rarely independent of one another: each further one
+            # counts for less, so a pile of soft doubts cannot by itself amount to "likely wrong".
+            weight *= STACK_DISCOUNT**softer
+            softer += 1
+        logit -= weight
+    logit += _clean_bonus(report, depth, analysed)
     raw = _sigmoid(logit)
     if cap is not None:
         raw = min(raw, cap)

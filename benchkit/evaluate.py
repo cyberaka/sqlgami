@@ -204,6 +204,7 @@ def evaluate(
                 db=conn,
                 tenant_column=suite.tenant_column if scoped else None,
                 soft_delete_column=suite.soft_delete_column,
+                soft_delete_policy=suite.soft_delete_policy,
                 glossary=glossary,
             )
         return scorers[scoped]

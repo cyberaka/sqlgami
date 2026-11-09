@@ -16,6 +16,7 @@ from sqlglot import exp
 
 from . import types as T
 from .checks.base import CheckContext
+from .checks.policy import inside_view
 from .model import NO, YES, SelectModel, strip, walk_own
 from .report import Finding, Severity
 
@@ -42,6 +43,7 @@ _STRONG_DIRECTION = {
 }
 
 _COUNT_PHRASE = re.compile(r"\b(how many|number of|count of|count)\b", re.IGNORECASE)
+_TOTAL_WORD = re.compile(r"\b(total|sum)\b(?!\s+(?:number|count)\b)", re.IGNORECASE)
 _AVG_WORD = re.compile(r"\b(average|avg|mean)\b", re.IGNORECASE)
 _MEDIAN_WORD = re.compile(r"\bmedian\b", re.IGNORECASE)
 _GROUP_PHRASE = re.compile(
@@ -84,6 +86,9 @@ def run_question_checks(ctx: CheckContext, question: str, glossary: str | None =
         _grouping,
         _negation,
         _time_period,
+        _comparison_words,
+        _flags_named_but_unused,
+        _pattern_match,
     ):
         try:
             findings.extend(check(asked) or [])
@@ -114,7 +119,15 @@ class _Asked:
                     self.number_literals.append(float(node.name))
                 except ValueError:
                     pass
-        top = _TOP_N.search(text)
+        top = None
+        for candidate in _TOP_N.finditer(text):
+            before = text[max(0, candidate.start() - 4): candidate.start()].lower()
+            if before.endswith("at ") or before.endswith("the "):
+                # "at least one", "at most 5": a bound, not a ranking. "the first 5" stays a ranking.
+                if before.endswith("at "):
+                    continue
+            top = candidate
+            break
         self.top_word: str | None = None
         self.top_n: int | None = None
         if top:
@@ -190,6 +203,8 @@ def _values_named_but_unused(asked: _Asked) -> list[Finding]:
                 continue
             if folded in asked.string_literals_lower:
                 continue
+            if len(folded) >= 3 and any(folded in literal for literal in asked.string_literals_lower):
+                continue  # used inside a pattern such as 'pro%'
             if _column_is_broken_out(asked, table, column):
                 continue
             # The same word may be a value of several columns; one use anywhere settles it.
@@ -239,7 +254,7 @@ def _filters_not_asked_for(asked: _Asked) -> list[Finding]:
                 if base is None:
                     continue
                 # Written inside a view: the view's author chose it, not the model.
-                if _inside_view(node):
+                if inside_view(node):
                     continue
                 seen.add(folded)
                 findings.append(
@@ -253,15 +268,6 @@ def _filters_not_asked_for(asked: _Asked) -> list[Finding]:
                     )
                 )
     return findings
-
-
-def _inside_view(node: exp.Expression) -> bool:
-    current: exp.Expression | None = node
-    while current is not None:
-        if isinstance(current, exp.Subquery) and current.meta.get("sqlgami_view"):
-            return True
-        current = current.parent
-    return False
 
 
 # -------------------------------------------------------------------- counts
@@ -436,7 +442,7 @@ def _top_n(asked: _Asked) -> list[Finding]:
             findings.append(
                 asked.finding(
                     "order_direction",
-                    Severity.MEDIUM if word in _STRONG_DIRECTION else Severity.LOW,
+                    Severity.HIGH if word in _STRONG_DIRECTION else Severity.LOW,
                     f"The question asks for the {word}, but the SQL sorts "
                     f"{'descending' if is_desc else 'ascending'} before taking the first rows.",
                     suggestion="Check the ORDER BY direction.",
@@ -492,6 +498,15 @@ def _aggregates(asked: _Asked) -> list[Finding]:
                     "The question asks for a median, but the SQL computes no median or percentile.",
                 )
             )
+    total = _TOTAL_WORD.search(asked.text)
+    if total and not asked.has(exp.Sum) and asked.has(exp.Count) and not _COUNT_PHRASE.search(asked.text):
+        findings.append(
+            asked.finding(
+                "aggregate_mismatch",
+                Severity.MEDIUM,
+                f"The question asks for a {total.group(1).lower()}, but the SQL counts rows and sums nothing.",
+            )
+        )
     if _COUNT_PHRASE.search(asked.text) and not asked.has(exp.Count, exp.Sum, exp.CountIf):
         findings.append(
             asked.finding(
@@ -576,7 +591,66 @@ def _grouping(asked: _Asked) -> list[Finding]:
 # ------------------------------------------------------------------ negation
 
 
+_NO_RELATED = re.compile(
+    r"\b(?:have|has|had|with|having|contain|contains|containing)\s+no\b|\bnever\b|\bwithout\b|"
+    r"\bno\s+(?:associated|matching|corresponding|related|linked)\b|"
+    r"\b(?:do|does|did)\s*(?:not|n't)\s+have\b|\bnot\s+(?:have|having)\b|\bhave\s+not\b|\bhas\s+not\b",
+    re.IGNORECASE,
+)
+
+
+def _has_anti_pattern(asked: _Asked) -> bool:
+    """NOT EXISTS, NOT IN, EXCEPT, an anti-join, or a zero-count test."""
+    for node in asked.tree.find_all(exp.Not):
+        inner = node.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        if isinstance(inner, (exp.Exists, exp.In)):
+            return True
+    if asked.has(exp.Except):
+        return True
+    if any((j.kind or "").upper() == "ANTI" for j in asked.tree.find_all(exp.Join)):
+        return True
+    for model in asked.ctx.cache.models():
+        for conjunct in model.conjuncts:
+            expr = conjunct.expr
+            if isinstance(expr, exp.Is) and isinstance(expr.expression, exp.Null):
+                column = strip(expr.this)
+                if isinstance(column, exp.Column) and column.table in model.sources:
+                    if model.sources[column.table].null_supplied:
+                        return True  # LEFT JOIN ... WHERE other.key IS NULL
+    for node in asked.tree.find_all(exp.EQ, exp.LTE, exp.LT):
+        sides = (strip(node.this), strip(node.expression))
+        if any(isinstance(side, exp.Literal) and side.name in ("0", "1") for side in sides) and any(
+            isinstance(side, (exp.Count, exp.Sum, exp.Coalesce, exp.Column, exp.Subquery)) for side in sides
+        ):
+            if any(n for n in node.find_all(exp.Count)) or isinstance(node, exp.EQ):
+                if any(isinstance(side, exp.Literal) and side.name == "0" for side in sides):
+                    return True
+    return False
+
+
 def _negation(asked: _Asked) -> list[Finding]:
+    related = _NO_RELATED.search(asked.text)
+    if related is not None:
+        if _has_anti_pattern(asked):
+            return []
+        # "no ended_at", "no email": a missing value, which IS NULL answers.
+        if asked.has(exp.Is):
+            tail = asked.lower[related.end(): related.end() + 40]
+            column_names = {c.name.lower() for t in asked.ctx.analysis.tables.values() for c in t.columns}
+            words = re.findall(r"[a-z_]+", tail)
+            if any(w in column_names or w.replace(" ", "_") in column_names for w in words[:3]):
+                return []
+        return [
+            asked.finding(
+                "negation_missing",
+                Severity.MEDIUM,
+                f"The question asks for things that lack something (\"{related.group(0).strip()}\"), but "
+                "the SQL has no NOT EXISTS, NOT IN, EXCEPT, anti-join or zero-count test.",
+                phrase=related.group(0).strip(),
+            )
+        ]
     match = _NEGATION.search(asked.text)
     if match is None:
         return []
@@ -639,4 +713,230 @@ def _time_period(asked: _Asked) -> list[Finding]:
     ]
 
 
-__all__ = ["run_question_checks", "STAGE"]
+# ---------------------------------------------------------- comparison words
+
+_STRICT_ABOVE = r"greater than|more than|over|above|exceeds?|exceeding|strictly after|after|later than|higher than|bigger than|larger than"
+_INCLUSIVE_ABOVE = r"at least|no less than|not less than|on or after|or more|or greater|or later|minimum of|from"
+_STRICT_BELOW = r"less than|fewer than|under|below|strictly before|before|earlier than|lower than|smaller than"
+_INCLUSIVE_BELOW = r"at most|no more than|not more than|on or before|or less|or fewer|or earlier|up to|maximum of|through|until"
+_BOUND_WORDS = re.compile(
+    rf"\b(?:(?P<sa>{_STRICT_ABOVE})|(?P<ia>{_INCLUSIVE_ABOVE})|(?P<sb>{_STRICT_BELOW})|(?P<ib>{_INCLUSIVE_BELOW}))\b",
+    re.IGNORECASE,
+)
+_DATE_IN_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _bound_phrase(asked: _Asked, position: int, end: int) -> str | None:
+    """The comparison wording attached to a number at ``position``: 'sa', 'ia', 'sb', 'ib' or None."""
+    before = asked.text[max(0, position - 28): position]
+    after = asked.text[end: end + 14]
+    found = None
+    for match in _BOUND_WORDS.finditer(before):
+        gap = before[match.end():]
+        if len(gap.split()) <= 2 and match.lastgroup not in ("ia", "ib") or len(gap.split()) <= 2:
+            found = match.lastgroup
+    trailing = re.match(r"\s*(or more|or greater|or later|or less|or fewer|or earlier)\b", after, re.IGNORECASE)
+    if trailing:
+        found = "ia" if trailing.group(1).lower() in ("or more", "or greater", "or later") else "ib"
+    return found
+
+
+def _comparison_words(asked: _Asked) -> list[Finding]:
+    """'greater than 50000' written as >= 50000, and the like."""
+    findings: list[Finding] = []
+    mentions: list[tuple[str, str]] = []  # (literal text as it would appear in SQL, phrase kind)
+    for match in _QUESTION_NUMBER.finditer(asked.text):
+        kind = _bound_phrase(asked, match.start(), match.end())
+        if kind:
+            mentions.append((match.group(1).replace(",", ""), kind))
+    for match in _DATE_IN_TEXT.finditer(asked.text):
+        kind = _bound_phrase(asked, match.start(), match.end())
+        if kind:
+            mentions.append((match.group(0), kind))
+    if not mentions:
+        return findings
+    operators = {exp.GT: "sa", exp.GTE: "ia", exp.LT: "sb", exp.LTE: "ib"}
+    flipped = {"sa": "sb", "ia": "ib", "sb": "sa", "ib": "ia"}
+    symbol = {"sa": ">", "ia": ">=", "sb": "<", "ib": "<="}
+    seen: set[str] = set()
+    for node in asked.tree.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE):
+        left, right = strip(node.this), strip(node.expression)
+        used = operators[type(node)]
+        literal = right if isinstance(right, exp.Literal) else left if isinstance(left, exp.Literal) else None
+        if literal is None:
+            continue
+        if literal is left:
+            used = flipped[used]  # 50000 < x  is  x > 50000
+        for text, wanted in mentions:
+            is_date = "-" in text
+            if is_date:
+                if not literal.is_string or not literal.name.startswith(text):
+                    continue
+                rest = literal.name[len(text):]
+                if rest and not re.fullmatch(r"[ T]00:00(:00(\.0+)?)?\s*(Z|[-+]00(:?00)?)?", rest):
+                    continue  # a time of day other than midnight changes what the bound means
+            else:
+                try:
+                    if literal.is_string or float(literal.name) != float(text):
+                        continue
+                except ValueError:
+                    continue
+            if used == wanted or text in seen:
+                continue
+            seen.add(text)
+            same_side = used[1] == wanted[1]
+            findings.append(
+                asked.finding(
+                    "comparison_operator",
+                    Severity.MEDIUM if same_side else Severity.HIGH,
+                    f"The question's wording for {text} calls for {symbol[wanted]}, but the SQL uses "
+                    f"{symbol[used]}."
+                    + (" A row exactly on the boundary falls on the wrong side." if same_side else ""),
+                    asked.ctx.snippet(node),
+                    value=text,
+                    wanted=symbol[wanted],
+                    used=symbol[used],
+                )
+            )
+    return findings
+
+
+# ------------------------------------------------------------- flag columns
+
+_FLAG_NAME = re.compile(r"^(?:is|has)_?(.+)$|^(.+?)_?(?:flag|flg|ind|yn)$", re.IGNORECASE)
+
+
+def _split_words(name: str) -> str:
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name).replace("_", " ")
+    return " ".join(spaced.lower().split())
+
+
+def _flags_named_but_unused(asked: _Asked) -> list[Finding]:
+    """'active plans' against a table with an is_active column that the SQL never mentions."""
+    findings: list[Finding] = []
+    used = {c.name.lower() for c in asked.tree.find_all(exp.Column)}
+    for table in asked.ctx.analysis.tables.values():
+        nouns = _name_forms(table.name)
+        for column in table.columns:
+            match = _FLAG_NAME.match(column.name)
+            if not match:
+                continue
+            is_boolean = T.family_of_declared(column.type, asked.ctx.dialect) == T.BOOLEAN
+            if not is_boolean and not column.name.lower().startswith(("is_", "has_")):
+                continue
+            word = _split_words(match.group(1) or match.group(2) or "")
+            if len(word) < 4 or asked.ctx.catalog.column_key(column.name).lower() in used:
+                continue
+            adjacent = False
+            for noun in nouns:
+                head, _, last = noun.rpartition(" ")
+                stem = re.escape(_singular(last))
+                noun_pattern = (re.escape(head) + r"\s+" if head else "") + stem + r"(?:s|es|ies)?"
+                if re.search(rf"(?<![a-z]){re.escape(word)}\s+(?:[a-z-]+\s+)?{noun_pattern}(?![a-z])", asked.lower):
+                    adjacent = True
+                elif re.search(rf"{noun_pattern}\s+(?:that|which|who)?\s*(?:are|is|were)\s+{re.escape(word)}(?![a-z])", asked.lower):
+                    adjacent = True
+            if not adjacent:
+                continue
+            findings.append(
+                asked.finding(
+                    "question_flag_unused",
+                    Severity.MEDIUM,
+                    f"The question asks about {word} {table.name}, and {table.name} has a column "
+                    f"{column.name} for that, but the SQL never looks at it.",
+                    suggestion=f"Check whether a condition on {column.name} belongs in the query.",
+                    column=f"{table.name}.{column.name}",
+                )
+            )
+    return findings
+
+
+# ---------------------------------------------------------- pattern matches
+
+_PATTERN_WORDS = re.compile(
+    r"\b(starts? with|starting with|begins? with|beginning with|prefix(?:ed)?|ends? with|ending with|suffix|"
+    r"contains?|containing|includes? the (?:word|text|string))\b",
+    re.IGNORECASE,
+)
+
+
+def _pattern_match(asked: _Asked) -> list[Finding]:
+    match = _PATTERN_WORDS.search(asked.text)
+    if match is None:
+        return []
+    kinds = tuple(
+        getattr(exp, name)
+        for name in ("Like", "ILike", "Glob", "SimilarTo", "RegexpLike", "StartsWith", "EndsWith", "Substring",
+                     "Left", "Right", "StrPosition", "Contains")
+        if hasattr(exp, name)
+    )
+    if asked.has(*kinds):
+        return []
+    if any(isinstance(n, exp.Anonymous) and n.name.lower() in ("instr", "strpos", "position", "starts_with", "prefix", "contains", "regexp_matches") for n in asked.tree.find_all(exp.Anonymous)):
+        return []
+    return [
+        asked.finding(
+            "pattern_match_missing",
+            Severity.MEDIUM,
+            f"The question asks for a partial match (\"{match.group(0)}\"), but the SQL uses no LIKE, "
+            "prefix or substring test, only exact comparisons.",
+            phrase=match.group(0),
+        )
+    ]
+
+
+# ----------------------------------------------- findings the question firms up
+
+_NOT_DELETED = re.compile(
+    r"\b(non-?deleted|not\s+(?:soft[- ])?deleted|un-?deleted|excluding\s+(?:soft[- ])?deleted|"
+    r"haven't been (?:soft[- ])?deleted|have not been (?:soft[- ])?deleted|live|still exist)\b",
+    re.IGNORECASE,
+)
+_WANTS_DELETED = re.compile(r"\b(including\s+(?:soft[- ])?deleted|deleted\s+\w+|were deleted|was deleted|soft[- ]deleted)\b", re.IGNORECASE)
+_CURRENT = re.compile(r"\b(current|currently|latest|present|in force|as of now|today's)\b", re.IGNORECASE)
+_EVERY = re.compile(r"\b(for every|for each|every|each|for all|all)\b", re.IGNORECASE)
+_DISTINCT_WORDS = re.compile(r"\b(distinct|unique|different|de-?duplicated|without duplicates|no duplicates)\b", re.IGNORECASE)
+_LISTING = re.compile(r"^\s*(list|which|show|return|give|name|find|what are)\b", re.IGNORECASE)
+
+
+def adjust_findings(findings: list[Finding], question: str) -> None:
+    """Raise or drop earlier findings in the light of what the question says.
+
+    A missing soft-delete filter matters more when the question says "non-deleted",
+    and not at all when it asks about deleted rows; and so on.
+    """
+    text = " ".join((question or "").split())
+    if not text:
+        return
+    asks_not_deleted = bool(_NOT_DELETED.search(text))
+    asks_deleted = bool(_WANTS_DELETED.search(text)) and not asks_not_deleted
+    for finding in list(findings):
+        if finding.code == "soft_deleted_rows":
+            if asks_deleted:
+                findings.remove(finding)
+            elif asks_not_deleted and not finding.evidence.get("bridge"):
+                finding.severity = Severity.HIGH
+                finding.message += " The question explicitly asks for rows that are not deleted."
+        elif finding.code == "history_rows" and _CURRENT.search(text):
+            finding.severity = Severity.HIGH
+            finding.message += " The question asks for the current state."
+        elif finding.code == "duplicate_rows":
+            if _DISTINCT_WORDS.search(text):
+                finding.severity = Severity.HIGH
+                finding.message += " The question asks for distinct values."
+            elif _LISTING.search(text) and finding.severity == Severity.LOW:
+                finding.severity = Severity.MEDIUM
+        elif finding.code == "inner_join_drops_rows" and _EVERY.search(text):
+            check = finding.evidence.get("data_check")
+            if check == "unmatched":
+                # A count of zero is an answer the question asked for; a missing sum is more arguable.
+                finding.severity = Severity.HIGH if finding.evidence.get("counts_only") else Severity.MEDIUM
+                finding.message += " The question asks for every one, including those with none."
+            elif check is None:
+                finding.severity = Severity.MEDIUM
+                finding.message += " The question asks for every one."
+            else:
+                finding.severity = Severity.LOW
+
+
+__all__ = ["run_question_checks", "adjust_findings", "STAGE"]

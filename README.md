@@ -17,8 +17,8 @@ to show anything, is up to your application.
 ## Status
 
 Early and private. Working today: the core, the static and question checks,
-and adapters for SQLite, DuckDB and Postgres. Planned next, in this order:
-BigQuery, then Cosmos DB. The confidence number is a **provisional heuristic** until a
+and adapters for SQLite, DuckDB and Postgres. BigQuery SQL can be analysed
+statically; its adapter comes next, then Cosmos DB. The confidence number is a **provisional heuristic** until a
 calibrator fitted on labelled data is loaded; reports say so with
 `"calibrated": false`. The calibration mechanism exists; a fitted calibration
 does not ship yet.
@@ -52,7 +52,7 @@ report = scorer.sample(
 )
 
 report.verdict           # Verdict.LIKELY_WRONG
-report.score             # 0.39
+report.score             # 0.4
 report.findings[0].code  # "fan_out"
 report.to_dict()         # JSON-serialisable
 print(report.summary())  # short text form
@@ -118,6 +118,16 @@ Static checks, each reported as a finding with a severity:
 | `soft_deleted_rows` | a soft-delete marker that is never looked at (needs `soft_delete_column`) |
 | `history_rows` | a table that keeps old versions of rows (`effective_to`, `valid_to`, `is_current`) read without choosing a version |
 | `natural_join` | `NATURAL JOIN` |
+| `snapshot_grain` | a periodic snapshot table read without choosing which snapshots, so everything is counted once per snapshot |
+| `required_predicate` | a filter your policy requires on a table (see below) is missing or incomplete |
+| `or_chain_gap` | `LVL_2 = v OR LVL_3 = v OR LVL_5 = v` where the table also has `LVL_4` |
+| `partition_filter` | a partitioned table read with no partition filter, or only a non-constant one |
+| `duplicate_rows` | a plain listing that repeats rows because of a join |
+| `inner_join_drops_rows` | an inner join that leaves out things with no related rows (raised when the question says "for every ...") |
+| `scalar_subquery_rows` | a subquery used as one value that nothing limits to one row |
+| `self_comparison`, `empty_string_comparison` | `x <> x`; `x = ''` where missing values are NULL |
+| `date_arithmetic` | a bare number added to a date where the engine does not define that |
+| `json_path` | a JSON path no row has (found in `sample` mode) |
 
 When you pass the question, sqlgami also compares it with the SQL. These checks
 are word-and-structure matching with no language model involved:
@@ -133,6 +143,14 @@ are word-and-structure matching with no language model involved:
 | `grouping_missing` | "per customer" answered with a single aggregate |
 | `negation_missing` | "not", "never", "without" with no negation in the SQL |
 | `time_filter_missing` | a year or period in the question with no date condition |
+| `comparison_operator` | "greater than 50" written as `>= 50`, "at least" as `>`, and so on |
+| `question_flag_unused` | "active plans" where the table has an `is_active` column the SQL ignores |
+| `pattern_match_missing` | "starts with" answered by an exact comparison |
+
+The question also firms up earlier findings: a missing soft-delete filter is
+raised when the question says "non-deleted" and dropped when it asks about
+deleted rows; a history table read without choosing a version is raised when
+the question says "current".
 
 Matching the question's words to stored values needs the values, which sqlgami
 reads in `sample` mode (low-cardinality text columns of the tables the query
@@ -159,7 +177,7 @@ if the column really holds NULLs. Filter values are looked up in the column.
   "sql": "SELECT ...",
   "verdict": "likely_wrong",
   "confidence": {
-    "value": 0.39, "raw": 0.39, "low": 0.27, "high": 0.4,
+    "value": 0.4, "raw": 0.4, "low": 0.28, "high": 0.4,
     "calibrated": false,
     "cap": 0.4, "cap_reason": "high-severity finding: fan_out",
     "basis": "sample evidence; provisional heuristic, not calibrated"
@@ -181,6 +199,59 @@ Stages, in order, are `parse`, `statement`, `schema`, `static`, `dry_run`,
 Verdicts are `invalid`, `likely_wrong`, `uncertain`, `likely_right` and
 `unverified`. A check that could not run is listed under `checks_not_run`
 rather than counted as passed.
+
+### Policies
+
+Some filters are rules of your organisation, not properties of the SQL. Tell
+the scorer about them and a query that breaks one is reported at high severity:
+
+```python
+from sqlgami import RequiredPredicate, Scorer
+
+scorer = Scorer(
+    "bigquery",
+    catalog=ddl,
+    tenant_column="tenant_id",              # every multi-tenant table must be pinned to one tenant
+    soft_delete_column="deleted_at",
+    soft_delete_policy="required",          # deleted rows are excluded unless a question asks for them
+    snapshot_columns={"EMP_SNAPSHOT_FACT": "SNAP_DT"},
+    required_predicates=[
+        RequiredPredicate(
+            name="manager scope",
+            tables=("EMP_SNAPSHOT_FACT",),
+            columns=("LVL_2_ID", "LVL_3_ID", "LVL_4_ID", "LVL_5_ID"),
+            match="or_chain",               # one OR chain against one value must cover all of them
+        )
+    ],
+)
+```
+
+`match` is `any` (one of the columns pinned to a value), `all`, or `or_chain`.
+With `soft_delete_policy="advisory"`, the default, a missing soft-delete filter
+is a medium-severity finding instead.
+
+### Templates and scripts
+
+SQL kept as a Python format string can be scored as it is. `{name}`
+placeholders are found before parsing and analysed as query parameters:
+
+```python
+report = scorer.score("SELECT ... WHERE mgr_id = {mgr_id} AND grp IN ('{groups}')")
+report.signals["template_parameters"]   # names, whether quoted, inferred types
+report = scorer.score(sql, params={"mgr_id": 7, "groups": "ENG,OPS"})
+```
+
+A template is never sent to the database unless every placeholder has a value.
+`IN ('{groups}')` is reported as `template_list_param`: filled with `ENG,OPS`
+it becomes one string and matches nothing.
+
+On BigQuery, a script of `DECLARE` and `SET` statements followed by one query
+is scored on that query, with the declared variables resolved. Filters that
+are commented out are listed under `signals["disabled_filters"]`.
+
+BigQuery support is static analysis only for now: three-part
+`project.dataset.table` names (dashes in the project included), case-sensitive
+table names and case-insensitive column names. The BigQuery adapter is next.
 
 ### Calibration
 

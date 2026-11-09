@@ -203,7 +203,12 @@ class Catalog:
         Column name that isolates tenants. When set, every table that has this
         column is expected to be filtered on it.
     soft_delete_column:
-        Column name that marks soft-deleted rows, used for an advisory check.
+        Column name that marks soft-deleted rows.
+    soft_delete_policy:
+        ``advisory`` (the default): reading such a table without looking at the
+        marker is a medium-severity finding. ``required``: your rule is that
+        deleted rows are excluded unless a question asks for them, so the same
+        omission is a high-severity policy violation.
     required_predicates:
         :class:`RequiredPredicate` rules (or dictionaries in the same shape), for
         filters such as access control that every query on a table must carry.
@@ -226,6 +231,7 @@ class Catalog:
         default_project: str | None = None,
         required_predicates: Iterable[Any] | None = None,
         snapshot_columns: dict[str, str] | None = None,
+        soft_delete_policy: str = "advisory",
     ) -> None:
         self.dialect = dialect
         # BigQuery: the project assumed for names written as dataset.table.
@@ -241,6 +247,9 @@ class Catalog:
         )
         self.tenant_column = tenant_column
         self.soft_delete_column = soft_delete_column
+        if soft_delete_policy not in ("advisory", "required"):
+            raise CatalogError("soft_delete_policy must be 'advisory' or 'required'")
+        self.soft_delete_policy = soft_delete_policy
         self._loader = loader
         self._tables: dict[tuple[str, str], Table] = {}
         self._index: dict[tuple[str, str], tuple[str | None, str]] | None = None
@@ -454,6 +463,7 @@ class Catalog:
             "search_path": list(self.search_path),
             "tenant_column": self.tenant_column,
             "soft_delete_column": self.soft_delete_column,
+            "soft_delete_policy": self.soft_delete_policy,
             "default_project": self.default_project,
             "required_predicates": [p.to_dict() for p in self.required_predicates],
             "snapshot_columns": dict(self.snapshot_columns),
@@ -473,6 +483,7 @@ class Catalog:
             search_path=data.get("search_path"),
             tenant_column=data.get("tenant_column"),
             soft_delete_column=data.get("soft_delete_column"),
+            soft_delete_policy=data.get("soft_delete_policy") or "advisory",
             default_project=data.get("default_project"),
             required_predicates=data.get("required_predicates"),
             snapshot_columns=data.get("snapshot_columns"),

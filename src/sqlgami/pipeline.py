@@ -21,7 +21,7 @@ from . import template
 from . import types as T
 from .catalog import Catalog, Table
 from .checks import CheckContext, Probe, run_static_checks
-from .checks.base import PROBE_HAS_NULL, PROBE_TIMESTAMP_FORMAT, PROBE_UNIQUE, PROBE_VALUE
+from .checks.base import PROBE_HAS_NULL, PROBE_QUERY, PROBE_TIMESTAMP_FORMAT, PROBE_UNIQUE, PROBE_VALUE
 from .checks.predicates import _ISO_DATE_RE, judge_value, value_finding
 from .engines.base import INVALID, TIMEOUT, Adapter
 from .errors import AdapterError, SqlgamiError
@@ -34,7 +34,7 @@ from .report import (
     StageResult,
     StageStatus,
 )
-from .question import run_question_checks
+from .question import adjust_findings, run_question_checks
 from .scoring import Calibrator, score_report
 
 logger = logging.getLogger("sqlgami")
@@ -320,6 +320,7 @@ def _question_stage(
     ran = sample is not None and sample.status in (StageStatus.PASSED, StageStatus.SKIPPED)
     if adapter is not None and mode in ("sample", "full") and ran and options.profile_values:
         _profile_values(report, ctx, adapter, options)
+    adjust_findings(report.findings, question)
     findings = run_question_checks(ctx, question, glossary)
     report.findings.extend(findings)
     _stage(report, "question", StageStatus.PASSED, f"{len(findings)} finding(s)", clock.lap())
@@ -471,6 +472,11 @@ def _database_stages(
             _stage(report, "sample", StageStatus.SKIPPED, result.error, elapsed)
         else:
             _result_signals(report, result, ctx)
+            for finding in report.findings:
+                if finding.code == "scalar_subquery_rows" and not finding.evidence.get("lenient"):
+                    finding.severity = Severity.LOW
+                    finding.evidence["data_check"] = "ran"
+                    finding.message += " The query ran, so it returned at most one row on today's data."
             detail = f"{len(result.rows)} row(s)" + (" (more available)" if result.truncated else "")
             _stage(report, "sample", StageStatus.PASSED, detail, elapsed)
 
@@ -511,6 +517,10 @@ def _row_cost(adapter: Adapter, analysis: A.Analysis) -> CostEstimate:
 def _result_signals(report: Report, result: Any, ctx: CheckContext | None) -> None:
     rows = result.rows
     report.signals["rows_returned"] = len(rows)
+    try:
+        report.signals["duplicate_rows_in_sample"] = len(rows) - len(set(rows))
+    except TypeError:
+        pass  # unhashable values (arrays, structs)
     report.signals["rows_truncated"] = result.truncated
     report.signals["columns"] = list(result.columns)
 
@@ -623,6 +633,8 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
                 _probe_value(report, ctx, adapter, probe, options)
             elif probe.kind == PROBE_TIMESTAMP_FORMAT:
                 _probe_timestamp_format(report, adapter, probe, options)
+            elif probe.kind == PROBE_QUERY:
+                _probe_query(adapter, probe, options)
         except AdapterError as exc:
             logger.debug("probe failed: %s", exc)
             report.checks_not_run.append(SkippedCheck(f"probe:{probe.kind}", str(exc)))
@@ -680,13 +692,28 @@ def _probe_has_null(adapter: Adapter, probe: Probe, options: Options) -> None:
     if finding is None:
         return
     if has_null:
-        finding.severity = Severity.HIGH
+        finding.severity = probe.confirm
         finding.evidence["data_check"] = "has_null"
         finding.message += " Checked against the data: the column does hold NULLs, so this returns no rows."
     else:
-        finding.severity = Severity.LOW
+        finding.severity = probe.dismiss
         finding.evidence["data_check"] = "no_null"
         finding.message += " Checked against the data: the column holds no NULLs at present."
+
+
+def _probe_query(adapter: Adapter, probe: Probe, options: Options) -> None:
+    """Run a query a check prepared, and adjust its finding by whether a row comes back."""
+    if probe.query is None or probe.finding is None:
+        return
+    rows = adapter.query(probe.query, max_rows=1, timeout_s=options.probe_timeout_s)
+    outcome = probe.on_rows if rows else probe.on_empty
+    if outcome is None:
+        return
+    severity, text, tag = outcome
+    if severity is not None:
+        probe.finding.severity = severity
+    probe.finding.message += text
+    probe.finding.evidence["data_check"] = tag
 
 
 def _probe_value(report: Report, ctx: CheckContext, adapter: Adapter, probe: Probe, options: Options) -> None:
@@ -733,6 +760,17 @@ def _probe_value(report: Report, ctx: CheckContext, adapter: Adapter, probe: Pro
                 timeout_s=options.probe_timeout_s,
             )
             near = [str(row[0]) for row in rows]
+    if probe.finding is not None:
+        # The check already reported; the data only confirms or weakens it.
+        if present:
+            probe.finding.severity = Severity.LOW
+            probe.finding.evidence["data_check"] = "value_present"
+            probe.finding.message += " Checked against the data: the column does hold this value in some rows."
+        else:
+            probe.finding.severity = Severity.HIGH
+            probe.finding.evidence["data_check"] = "value_absent"
+            probe.finding.message += " Checked against the data: no row holds this value, so the test matches nothing."
+        return
     if not present:
         report.findings.append(value_finding(probe.snippet, table, column, literal, near, negated, "sample"))
 

@@ -37,6 +37,9 @@ class Scorer:
         SQLite and DuckDB). Above it the query is not run.
     tenant_column, soft_delete_column:
         Policy hints, applied to the catalog.
+    soft_delete_policy:
+        ``advisory`` (default) or ``required``. With ``required``, reading a table
+        without its soft-delete filter is a high-severity policy violation.
     calibrator:
         A fitted calibrator, or the path of a calibration file written by
         ``IsotonicCalibrator.save``. Without one, scores are provisional.
@@ -65,6 +68,7 @@ class Scorer:
         timeout_s: float | None = None,
         tenant_column: str | None = None,
         soft_delete_column: str | None = None,
+        soft_delete_policy: str | None = None,
         calibrator: Calibrator | str | os.PathLike | None = None,
         options: Options | None = None,
         glossary: str | dict | None = None,
@@ -101,6 +105,10 @@ class Scorer:
                 self.catalog.tenant_column = tenant_column
             if soft_delete_column is not None:
                 self.catalog.soft_delete_column = soft_delete_column
+            if soft_delete_policy is not None:
+                if soft_delete_policy not in ("advisory", "required"):
+                    raise ConfigurationError("soft_delete_policy must be 'advisory' or 'required'")
+                self.catalog.soft_delete_policy = soft_delete_policy
             if required_predicates:
                 self.catalog.required_predicates.extend(RequiredPredicate.coerce(p) for p in required_predicates)
             if snapshot_columns:

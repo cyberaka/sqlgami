@@ -17,6 +17,7 @@ PROBE_UNIQUE = "unique"
 PROBE_HAS_NULL = "has_null"
 PROBE_VALUE = "value"
 PROBE_TIMESTAMP_FORMAT = "timestamp_format"
+PROBE_QUERY = "query"  # run a ready-made query; act on whether it returns a row
 
 
 @dataclass
@@ -30,6 +31,14 @@ class Probe:
     literal: Any = None
     operator: str = "="
     snippet: str | None = None
+    # For PROBE_HAS_NULL: the severity when NULLs are found, and when they are not.
+    confirm: Severity = Severity.HIGH
+    dismiss: Severity = Severity.LOW
+    # For PROBE_QUERY: the query, and what to do with the finding in each outcome.
+    # Each outcome is (new severity or None to leave it, text appended to the message, data_check tag).
+    query: Any = None
+    on_rows: tuple[Severity | None, str, str] | None = None
+    on_empty: tuple[Severity | None, str, str] | None = None
 
 
 @dataclass
