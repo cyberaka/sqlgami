@@ -232,10 +232,29 @@ report = scorer.score(sql, question, mode="full")
 
 | Outcome | Effect |
 |---|---|
-| the candidate matches most alternatives | the score rises into the upper band (0.9 and above is only reachable this way) |
-| the alternatives match each other, not the candidate | `consistency_disagreement`, high severity |
-| one alternative, and it differs | `consistency_disagreement`, medium severity |
+| the candidate matches most sources | the score rises into the upper band (0.9 and above is only reachable this way) |
+| the sources match each other, not the candidate | `consistency_disagreement`: medium severity by default, high in the `judge` role |
+| one source, and it differs | `consistency_disagreement`, medium severity |
 | nothing matches anything | `consistency_no_consensus`: the question is probably ambiguous |
+
+Votes are counted per source, not per query. Tag an alternative with who
+wrote it, `(sql, "model-a")`, and several samples from one model become one
+voice, voting with that model's most common answer. Untagged alternatives are
+each their own voice. `sqlgami.consistency.combine(gen_a, gen_b)` draws from
+several generators and tags them for you.
+
+Two settings in `Options` matter:
+
+- `consistency_role`: `confirm` (default) or `judge`. With `confirm`, agreement
+  supports the candidate and disagreement is only a doubt. With `judge`, two
+  or more independent sources agreeing against the candidate is treated as
+  strong evidence it is wrong. Choose `judge` only when the alternatives come
+  from something at least as capable as whatever wrote the candidate: in our
+  tests, two mid-strength open models disagreed with a stronger model's query
+  that was in fact right about two times in three.
+- `consistency_k`: samples asked of each generator, 1 by default. Extra
+  samples of the same model lowered precision in our tests; a second model
+  raised it.
 
 Alternatives that are not single read-only queries, that name things that do
 not exist, or that reach outside the database are never run. Result sets are

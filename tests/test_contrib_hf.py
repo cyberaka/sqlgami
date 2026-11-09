@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from sqlgami import ConfigurationError, Scorer
+from sqlgami import ConfigurationError, Options, Scorer
 from sqlgami.contrib.hf import GeneratorError, HFGenerator, check_model, extract_sql
 
 from conftest import make_db
@@ -89,7 +89,7 @@ def test_generator_in_full_mode(engine, db):
         "SELECT c.name, (SELECT SUM(o.total) FROM orders o WHERE o.customer_id = c.id) FROM customers c "
         "WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id)"
     )
-    with Scorer(engine, db=db, generator=generator) as scorer:
+    with Scorer(engine, db=db, generator=generator, options=Options(consistency_k=3)) as scorer:
         report = scorer.score(candidate, "Total order value per customer", mode="full")
     signal = report.signals["consistency"]
     # Two samples of one model that agree with the candidate: one voice, so support but not the top band.

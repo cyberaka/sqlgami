@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sqlgami import Scorer
+from sqlgami import Options, Scorer
 
 from . import build
 from .suite import RUNS_DIR, Question, Suite
@@ -191,6 +191,7 @@ def evaluate(
     verifiers: list[str] | None = None,
     max_samples: int | None = None,
     only_generators: list[str] | None = None,
+    role: str = "confirm",
 ) -> tuple[list[Item], dict[str, Any]]:
     """Score every labelled statement for one engine. Returns the items and their metrics.
 
@@ -218,6 +219,7 @@ def evaluate(
                 soft_delete_column=suite.soft_delete_column,
                 soft_delete_policy=suite.soft_delete_policy,
                 glossary=glossary,
+                options=Options(consistency_role=role, consistency_max_alternatives=24),
             )
         return scorers[scoped]
 

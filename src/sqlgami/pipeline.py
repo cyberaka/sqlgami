@@ -59,9 +59,15 @@ class Options:
     max_profile_values: int = 40
     # Consistency stage: how many alternatives to ask a generator for, how many to run at most,
     # and the largest result that is compared.
-    consistency_k: int = 3
+    # One sample per source by default: in our tests extra samples of the same model lowered
+    # precision, while a second model raised it.
+    consistency_k: int = 1
     consistency_max_alternatives: int = 8
     consistency_rows: int = 5000
+    # "confirm": alternatives that agree support the candidate; disagreement is a doubt.
+    # "judge": two or more independent sources agreeing against the candidate is strong
+    # evidence against it. Only for alternatives at least as capable as the candidate's author.
+    consistency_role: str = "confirm"
 
 
 class _Clock:
@@ -394,6 +400,7 @@ def _consistency_stage(
         timeout_s=options.timeout_s,
         cost_ceiling=options.cost_ceiling,
         max_alternatives=options.consistency_max_alternatives,
+        role=options.consistency_role,
     )
     report.signals["consistency"] = outcome.to_dict()
     if not outcome.ran:

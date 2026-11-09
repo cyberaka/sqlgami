@@ -51,7 +51,22 @@ def test_agreement_lifts_the_score(scorer):
     assert alone.stage("consistency").status.value == "not_run"
 
 
-def test_alternatives_that_agree_with_each_other_but_not_the_candidate(scorer):
+@pytest.fixture
+def judge(engine, db):
+    with Scorer(engine, db=db, options=Options(consistency_role="judge")) as s:
+        yield s
+
+
+def test_by_default_disagreement_is_a_doubt_not_a_verdict(scorer):
+    report = scorer.sample(RIGHT, QUESTION, alternatives=[FANNED, FANNED + " ORDER BY 1", ONLY_PAID])
+    finding = next(f for f in report.findings if f.code == "consistency_disagreement")
+    assert finding.severity == Severity.MEDIUM and finding.evidence["role"] == "confirm"
+    assert "depends on how capable" in finding.message
+    assert report.verdict.value == "uncertain"
+
+
+def test_alternatives_that_agree_with_each_other_but_not_the_candidate(judge):
+    scorer = judge
     report = scorer.sample(FANNED, QUESTION, alternatives=[RIGHT, SAME_1, SAME_2])
     finding = next(f for f in report.findings if f.code == "consistency_disagreement")
     assert finding.severity == Severity.HIGH and finding.evidence["largest_disagreeing_cluster_sources"] == 3
@@ -160,7 +175,26 @@ def test_full_mode_without_a_generator_says_so(scorer):
     assert stage.status.value == "not_run" and "no alternative queries" in stage.detail
 
 
-def test_samples_from_one_source_are_one_voice(scorer):
+def test_each_source_votes_with_its_most_common_answer(judge):
+    # Model a: three samples say RIGHT, one says FANNED. Model b: the same. The stray samples
+    # happen to coincide, but each model's vote is its majority, which supports the candidate.
+    alternatives = [
+        (SAME_1, "a"), (SAME_2, "a"), (REORDERED, "a"), (FANNED, "a"),
+        (SAME_1, "b"), (SAME_2, "b"), (FANNED + " ORDER BY 1", "b"),
+    ]
+    report = judge.sample(RIGHT, QUESTION, alternatives=alternatives)
+    signal = consistency(report)
+    assert signal["sources"] == 2 and signal["agreeing_sources"] == 2
+    assert signal["largest_disagreeing_cluster_sources"] == 0
+    assert not [f for f in report.findings if f.stage == "consistency"]
+    # Turned round: the candidate matches only the stray samples.
+    against = judge.sample(FANNED, QUESTION, alternatives=[(a, s) for a, s in alternatives if a != FANNED] + [(FANNED + " ORDER BY 2", "a")])
+    assert consistency(against)["agreeing_sources"] == 0
+    assert next(f for f in against.findings if f.code == "consistency_disagreement").severity == Severity.HIGH
+
+
+def test_samples_from_one_source_are_one_voice(judge):
+    scorer = judge
     # Three samples of one model agree with each other and not with the candidate: a doubt, not a verdict.
     one_model = scorer.sample(
         FANNED, QUESTION, alternatives=[(RIGHT, "model-a"), (SAME_1, "model-a"), (SAME_2, "model-a")]

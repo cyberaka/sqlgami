@@ -180,8 +180,17 @@ def run(
     timeout_s: float = 15.0,
     cost_ceiling: float | None = None,
     max_alternatives: int = 8,
+    role: str = "confirm",
 ) -> Outcome:
-    """Run the candidate and each alternative, and compare what they return."""
+    """Run the candidate and each alternative, and compare what they return.
+
+    ``role`` says how far the alternatives are trusted. ``confirm`` (the default):
+    their agreement supports the candidate, and their disagreement is a doubt.
+    ``judge``: when two or more independent sources agree with each other against
+    the candidate, that is treated as strong evidence the candidate is wrong. Use
+    ``judge`` only when the alternatives come from sources at least as capable as
+    whatever wrote the candidate.
+    """
     outcome = Outcome()
     seen: set[tuple[str, str | None]] = set()
     unique: list[tuple[str, str | None]] = []
@@ -211,9 +220,9 @@ def run(
 
     clusters: dict[tuple, int] = {}
     cluster_sizes: dict[int, int] = {}
-    cluster_sources: dict[int, set[str]] = {}
-    agreeing_sources: set[str] = set()
-    all_sources: set[str] = set()
+    # For each source, how many of its comparable samples landed on each result. Result 0 is
+    # the candidate's own.
+    tallies: dict[str, dict[int, int]] = {}
     for position, (alt, source) in enumerate(unique):
         voice = source if source is not None else f"#{position}"  # unlabelled: each its own voice
         entry = Alternative(sql=alt, status=INVALID, source=source)
@@ -258,21 +267,21 @@ def run(
             continue
         strict, loose = fingerprint(result.rows)
         outcome.comparable += 1
-        all_sources.add(voice)
+        tally = tallies.setdefault(voice, {})
         if strict == base_strict:
             entry.status = AGREES
             outcome.agreeing += 1
-            agreeing_sources.add(voice)
+            tally[0] = tally.get(0, 0) + 1
         elif loose == base_loose:
             entry.status = AGREES_REORDERED
             outcome.agreeing += 1
-            agreeing_sources.add(voice)
+            tally[0] = tally.get(0, 0) + 1
         else:
             entry.status = DIFFERS
             number = clusters.setdefault(loose, len(clusters) + 1)
             entry.cluster = number
             cluster_sizes[number] = cluster_sizes.get(number, 0) + 1
-            cluster_sources.setdefault(number, set()).add(voice)
+            tally[number] = tally.get(number, 0) + 1
             entry.detail = _difference(base.rows, result.rows)
 
     outcome.ran = outcome.comparable > 0
@@ -280,10 +289,19 @@ def run(
         outcome.reason = "no alternative could be run and compared"
         return outcome
     outcome.largest_other_cluster = max(cluster_sizes.values(), default=0)
-    outcome.sources = len(all_sources)
-    outcome.agreeing_sources = len(agreeing_sources)
-    outcome.largest_other_cluster_sources = max((len(v) for v in cluster_sources.values()), default=0)
-    outcome.findings = _judge(outcome)
+    # Each source casts one vote: the result most of its samples returned. A source whose
+    # samples are split evenly between the candidate's result and another sides with the candidate.
+    outcome.sources = len(tallies)
+    votes_against: dict[int, int] = {}
+    for tally in tallies.values():
+        top = max(tally.values())
+        if tally.get(0, 0) == top:
+            outcome.agreeing_sources += 1
+        else:
+            winner = min(number for number, count in tally.items() if count == top)
+            votes_against[winner] = votes_against.get(winner, 0) + 1
+    outcome.largest_other_cluster_sources = max(votes_against.values(), default=0)
+    outcome.findings = _judge(outcome, role)
     return outcome
 
 
@@ -335,7 +353,7 @@ def _difference(base: Sequence[Sequence[Any]], other: Sequence[Sequence[Any]]) -
     return "same shape, different values"
 
 
-def _judge(outcome: Outcome) -> list[Finding]:
+def _judge(outcome: Outcome, role: str = "confirm") -> list[Finding]:
     """Turn the counts into findings. Votes are counted in distinct sources."""
     n, agree, rival = outcome.sources, outcome.agreeing_sources, outcome.largest_other_cluster_sources
     evidence = {
@@ -348,16 +366,22 @@ def _judge(outcome: Outcome) -> list[Finding]:
     if agree and agree >= rival and agree * 2 >= n:
         return []  # the candidate is in the largest group: support, expressed through the score
     if rival >= 2 and rival > agree:
+        judged = role == "judge"
         return [
             Finding(
                 "consistency_disagreement",
-                Severity.HIGH,
+                Severity.HIGH if judged else Severity.MEDIUM,
                 f"{rival} of {n} independent sources wrote queries for this question that return the same "
                 "result as one another, and it is not what this query returns"
-                + (f" ({agree} agree with this query)." if agree else "."),
+                + (f" ({agree} agree with this query)." if agree else ".")
+                + (
+                    ""
+                    if judged
+                    else " Whether that makes this query wrong depends on how capable those sources are."
+                ),
                 "consistency",
                 suggestion="Compare this query with the alternatives listed under signals.consistency.",
-                evidence=evidence,
+                evidence={**evidence, "role": role},
             )
         ]
     if n == 1:
