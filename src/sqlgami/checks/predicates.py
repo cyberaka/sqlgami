@@ -761,6 +761,44 @@ def type_mismatch(ctx: CheckContext) -> Iterable[Finding]:
                 )
 
 
+def _whole_number(node: exp.Expression) -> int | None:
+    node = unparen(node)
+    if isinstance(node, exp.Literal) and not node.is_string and node.name.isdigit():
+        return int(node.name)
+    return None
+
+
+def _scaled_before_dividing(numerator: exp.Expression) -> bool:
+    """``100 * a / b``: multiplying by 100 or more first is how a whole-number percentage is written."""
+    numerator = unparen(numerator)
+    if not isinstance(numerator, exp.Mul):
+        return False
+    for side in (numerator.this, numerator.expression):
+        scale = _whole_number(side)
+        if scale is not None and scale >= 100 and scale % 100 == 0:
+            return True
+    return False
+
+
+def _deliberate_bucketing(model: SelectModel, node: exp.Div) -> bool:
+    """``(qty / 10) * 10``, or ``GROUP BY qty / 10``: dropping the fraction is the point."""
+    divisor = _whole_number(node.expression)
+    if divisor is None:
+        return False
+    outer: exp.Expression = node
+    while isinstance(outer.parent, exp.Paren):
+        outer = outer.parent
+    parent = outer.parent
+    if isinstance(parent, exp.Mul):
+        other = parent.expression if parent.this is outer else parent.this
+        if _whole_number(other) == divisor:
+            return True
+    group = model.group
+    if group is not None and any(unparen(expr) == node for expr in group.expressions):
+        return True
+    return False
+
+
 @check("integer_division", needs_types=True, description="Two integers are divided, dropping the fraction.")
 def integer_division(ctx: CheckContext) -> Iterable[Finding]:
     if ctx.dialect not in ("sqlite", "postgres", "redshift", "tsql"):
@@ -773,6 +811,8 @@ def integer_division(ctx: CheckContext) -> Iterable[Finding]:
             if lt is None or rt is None or lt.this not in integers or rt.this not in integers:
                 continue
             if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
+                continue
+            if _scaled_before_dividing(left) or _deliberate_bucketing(model, node):
                 continue
             yield ctx.finding(
                 "integer_division",
@@ -821,6 +861,32 @@ def _temporal_kind(ctx: CheckContext, model: SelectModel, column: exp.Column) ->
 
 # Columns that mark when something stops. "end > date" is an as-of test, not the start of a range.
 _END_COLUMN = re.compile(r"(_to|_until|_end|^end_|ended_|expires|expiry|expired|due_|_due|closed_|left_at|revoked)", re.IGNORECASE)
+
+
+# '... 23:59:59', with or without a run of nines after it.
+_END_OF_DAY_RE = re.compile(r"[ T]23:59:59(\.9+)?\s*(Z|[-+]\d{2}(:?\d{2})?)?$")
+
+
+def _starts_mid_month(ctx: CheckContext, model: SelectModel, column: exp.Column) -> bool:
+    """True when the same column also has a lower bound that is not the first of a month.
+
+    ``>= '2024-01-30' AND < '2024-01-31'`` is one whole day, not a month cut short.
+    """
+    for conjunct in model.conjuncts:
+        for left, right, operator in _comparison_pairs(unparen(conjunct.expr)):
+            oriented = _oriented(left, right, operator)
+            if oriented is None:
+                continue
+            other_column, value, op = oriented
+            if op not in (">", ">=") or not _same_column(other_column, column):
+                continue
+            value = strip(value)
+            if not isinstance(value, exp.Literal) or not value.is_string:
+                continue
+            parsed = _parse_date_literal(value.name)
+            if parsed is not None and parsed[0] is not None and parsed[0].day != 1:
+                return True
+    return False
 
 
 def _last_day_of_month(day: _dt.date) -> bool:
@@ -881,9 +947,22 @@ def date_boundary(ctx: CheckContext) -> Iterable[Finding]:
                     ctx.probes.append(
                         Probe(PROBE_TIMESTAMP_FORMAT, info[0], (info[1].name,), None, literal=text)
                     )
-                if has_time:
-                    continue
                 next_day = (day + _dt.timedelta(days=1)).isoformat()
+                if has_time:
+                    if op == "<=" and kind == T.TIMESTAMP and _END_OF_DAY_RE.search(text.strip()):
+                        yield ctx.finding(
+                            "date_boundary",
+                            Severity.LOW,
+                            (
+                                f"{ctx.snippet(node)} stops at the last whole second of "
+                                f"{day.isoformat()}, so a row stamped in the fraction of a second "
+                                "after that is left out."
+                            ),
+                            node,
+                            suggestion=f"Use < '{next_day}' to include the whole of {day.isoformat()}.",
+                            bound=text,
+                        )
+                    continue
                 if op == "<=" and kind == T.TIMESTAMP:
                     first = day.day == 1
                     yield ctx.finding(
@@ -914,7 +993,7 @@ def date_boundary(ctx: CheckContext) -> Iterable[Finding]:
                         suggestion=f"End the range with < '{day.isoformat()}'.",
                         bound=text,
                     )
-                elif op == "<" and _last_day_of_month(day):
+                elif op == "<" and _last_day_of_month(day) and not _starts_mid_month(ctx, model, column):
                     yield ctx.finding(
                         "date_boundary",
                         Severity.MEDIUM,
