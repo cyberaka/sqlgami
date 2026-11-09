@@ -119,6 +119,24 @@ def segments(sql: str, dialect: str) -> Iterator[tuple[str, str]]:
     yield from flush(n)
 
 
+def _render(value: Any) -> str:
+    """A value as ``str.format`` would write it, except that a list becomes a comma-separated
+    list of SQL literals (``IN ({codes})`` with ``["A", "B"]`` gives ``IN ('A', 'B')``)."""
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return ", ".join(_literal(v) for v in value)
+    return str(value)
+
+
+def _literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _marker(name: str, dialect: str) -> str:
     return f"@{name}" if dialect == "bigquery" else f":{name}"
 
@@ -238,7 +256,7 @@ def prepare(sql: str, dialect: str, values: dict[str, Any] | None = None) -> Pre
             note(name, False, declared.group(1).upper() if declared else None)
             out_analysis.append(prefix + _marker(name, dialect))
             if name in values:
-                out_rendered.append(prefix + str(values[name]))
+                out_rendered.append(prefix + _render(values[name]))
             else:
                 missing = True
                 out_rendered.append(prefix + match.group(0))

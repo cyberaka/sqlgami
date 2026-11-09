@@ -16,6 +16,14 @@ engines:
 
 as_of: "2026-06-30"
 
+history:
+  current_ppe: "2026-06-20"            # period_seq = 0 on freq_cd='B'
+  biweekly_periods: 52                 # period_seq -51..0
+  earliest_period_end_dt: "2024-07-06" # 2026-06-20 minus 51*14 days
+  earliest_snap_dt: "2024-07-06"       # snap_dt = period_end_dt for frozen past periods
+  weekly_periods: 104
+  restatement_window_days: 28          # snap_dt = period_end_dt + {0, 14, 28}
+
 sqlite_naming:
   rule: "<schema>_<table>"
   notes: >
@@ -37,10 +45,12 @@ seeds:
   - {seed: 3, profile: clean}
   - {seed: 42, profile: nasty}
   - {seed: 43, profile: nasty}
+  - {seed: 44, profile: nasty}
 
 row_budget:
   clean_seed_1: 35149    # 156 + 1112 + 250 + 33606 + 15 + 10 + 5 (ref)
   nasty_seed_42: 35234   # 156 + 1093 + 256 + 33699 + 30 (ref totals)
+  nasty_seed_44: 36750   # 156 + 1092 + 264 (250 + 8 early leavers + 6 nasty) + 35205 + 30
   cap: 50000
 
 session:
@@ -69,9 +79,10 @@ profile_hazards:
     - "One assoc_id has term_dt < hire_dt (bad row)"
     - "Functional hierarchy has ~10% LVL_6 nodes removed (gaps in _FN chain)"
     - "One zero-headcount period (status='A' rows removed for one PPE on snap_dt=PPE)"
-    - "One duplicate snapshot row (same PK on nasty; dedup gold must handle)"
     - "One associate's lvl_5_id points to node_id 999999 (orphan in hierarchy_dim)"
     - "One extra bad associate (999001) with term before hire"
+    - "Some restated rows carry a corrected status_cd (A↔L flip) vs their snap=PPE row"
+    - "One restated row carries a corrected job_grp vs the snap=PPE row"
 
 views:
   - hr.current_snapshot_v
@@ -82,6 +93,7 @@ views:
   - hr.invol_turnover_26p_v
   - hr.orphaned_hierarchy_v
   - hr.active_at_current_period_by_region_v
+
 materialized_views:
   - hr.monthly_headcount_mv  # Postgres only; loader refreshes after load.
 
@@ -93,3 +105,20 @@ snapshot_semantics:
     for reading period_end_dt is always snap_dt = period_end_dt (the snapshot
     taken at the period's close). Gold uses snap_dt = period_end_dt by default.
     Treating a later restatement as the authoritative row is a gold bug.
+
+# How sqlgami is configured for this suite (the owner's real-world setup). benchkit passes
+# these to Scorer(...) when it evaluates the suite.
+sqlgami:
+  snapshot_columns:
+    hr.emp_period_snapshot: snap_dt
+  required_predicates:
+    - name: hierarchy_access
+      description: >
+        Every read of the fact is scoped to a manager's subtree: an OR chain over the
+        reporting levels (lvl_2_id ... lvl_7_id) or over the functional levels (_fn).
+      tables: [hr.emp_period_snapshot]
+      groups:
+        - [lvl_2_id, lvl_3_id, lvl_4_id, lvl_5_id, lvl_6_id, lvl_7_id]
+        - [lvl_2_id_fn, lvl_3_id_fn, lvl_4_id_fn, lvl_5_id_fn, lvl_6_id_fn, lvl_7_id_fn]
+      match: or_chain
+      severity: high

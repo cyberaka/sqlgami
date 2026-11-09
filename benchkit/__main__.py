@@ -92,6 +92,11 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--role", choices=["confirm", "judge"], default="confirm", help="how far the alternatives are trusted")
     p_eval.add_argument("--max-samples", type=int, help="with --consistency: use only samples 0..N-1 of each verifier")
     p_eval.add_argument("--score-only", action="append", help="score only candidates from these generators (repeatable)")
+    p_eval.add_argument(
+        "--substitute",
+        action="store_true",
+        help="score the SQL with its template parameters filled in, instead of the template plus values",
+    )
 
     p_label = sub.add_parser("label", help="label candidate SQL as right or wrong by running it on every seed")
     p_label.add_argument("suite")
@@ -170,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_samples=args.max_samples,
                     only_generators=args.score_only,
                     role=args.role,
+                    substitute=args.substitute,
                 )
                 path = write_run(suite, engine, mode, items, result, run_id)
                 print(f"== {suite.name} / {engine} / {mode}")

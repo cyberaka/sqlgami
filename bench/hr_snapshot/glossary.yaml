@@ -1,0 +1,79 @@
+# hr_snapshot data dictionary — what the business terms in questions mean.
+# This describes columns and concepts; it does not spell out how to write the query.
+
+definitions:
+  my_organisation:
+    meaning: >
+      "My organisation" for a manager scope is every associate whose reporting-chain columns
+      (lvl_2_id through lvl_7_id) include the manager's node, OR whose functional-chain columns
+      (lvl_2_id_fn through lvl_7_id_fn) include it. A manager appears at any reporting or
+      functional level.
+
+  pay_period:
+    meaning: >
+      Unless a question explicitly says "weekly", a pay period means a biweekly period —
+      pay_period_dim rows with freq_cd = 'B'.
+
+  current_pay_period:
+    meaning: >
+      The single biweekly pay period whose is_current_flag is TRUE. Business questions phrased
+      around "the current period" refer to this.
+
+  last_n_pay_periods:
+    meaning: >
+      A window counted back from the current biweekly pay period, using period_seq. For
+      example "the last 13 pay periods" spans today's period and the 12 biweekly periods
+      before it; "the last 26 pay periods" spans today and the 25 before.
+
+  authoritative_snapshot:
+    meaning: >
+      Each biweekly pay period can be snapshotted more than once as later facts become known.
+      A period's authoritative snapshot is the one taken on its own period end date (snap_dt
+      equal to the period's ppe_dt).
+
+  new_hire:
+    meaning: >
+      An associate whose snapshot row carries new_hire_ind = 1. A new hire is counted in a
+      window if their hire date (hire_dt) falls inside that window's pay periods.
+
+  ninety_day_new_hire_turnover:
+    meaning: >
+      Among new hires in a given window, the portion whose term_dt is within 90 calendar days
+      of their hire_dt. Reported in basis points as the attrition rate over new-hire count,
+      NULL when there are no new hires in the window.
+
+  one_eighty_day_new_hire_turnover:
+    meaning: >
+      Among new hires in a given window, the portion whose term_dt is within 180 calendar
+      days of their hire_dt. Reported in basis points.
+
+  annual_turnover:
+    meaning: >
+      For a window of the last 26 pay periods, the number of distinct associates with a
+      turnover row (turn_filt_ind = 1) on the authoritative snapshot, divided by the active
+      headcount at the start of the window. Reported in basis points.
+
+  voluntary_vs_involuntary_split:
+    meaning: >
+      A turnover row with invol_exit_ind = 0 is VOLUNTARY; invol_exit_ind = 1 is INVOLUNTARY;
+      NULL invol_exit_ind on a turnover row is an UNKNOWN bucket, reported separately from
+      voluntary and involuntary.
+
+  active:
+    meaning: >
+      An authoritative snapshot row is active when status_cd = 'A'. NULL status_cd is
+      unknown, not active. 'L' (Leave), 'T' (Terminated), 'R' (Retired), 'U' (Unknown) are
+      not active.
+
+  headcount:
+    meaning: >
+      The distinct count of in-scope active associates at a pay period.
+
+  basis_points:
+    meaning: >
+      A rate expressed as an integer in ten-thousandths. 1.25% = 125 basis points; 50% = 5000.
+
+  deleted_at_defaults:
+    meaning: >
+      There is no deleted_at column in this suite. A terminated associate (status 'T') is
+      not a soft-delete and still appears on authoritative snapshots.

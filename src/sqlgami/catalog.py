@@ -136,19 +136,31 @@ class RequiredPredicate:
     """
 
     name: str
-    columns: tuple[str, ...]
+    columns: tuple[str, ...] = ()
     tables: tuple[str, ...] = ()  # empty means every table that has any of the columns
     match: str = "any"
     severity: str = "high"
     description: str = ""
+    # For ``or_chain``: alternative column sets, any one of which satisfies the rule when an OR
+    # chain covers all of it (a reporting hierarchy OR a functional one). ``columns`` is then
+    # the union, kept for callers that read it.
+    groups: tuple[tuple[str, ...], ...] = ()
 
     def __post_init__(self) -> None:
-        self.columns = tuple(self.columns)
+        self.groups = tuple(tuple(g) for g in self.groups)
         self.tables = tuple(self.tables)
+        if self.groups and not self.columns:
+            self.columns = tuple(dict.fromkeys(c for g in self.groups for c in g))
+        self.columns = tuple(self.columns)
         if self.match not in ("any", "all", "or_chain"):
             raise CatalogError(f"required predicate {self.name!r}: unknown match {self.match!r}")
+        if self.groups and self.match != "or_chain":
+            raise CatalogError(f"required predicate {self.name!r}: groups are only for match 'or_chain'")
         if not self.columns:
             raise CatalogError(f"required predicate {self.name!r} names no columns")
+
+    def column_groups(self) -> tuple[tuple[str, ...], ...]:
+        return self.groups or (self.columns,)
 
     def applies_to(self, table: "Table") -> bool:
         if not self.tables:
@@ -164,6 +176,7 @@ class RequiredPredicate:
             "match": self.match,
             "severity": self.severity,
             "description": self.description,
+            "groups": [list(g) for g in self.groups],
         }
 
     @classmethod

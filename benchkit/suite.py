@@ -130,6 +130,40 @@ class Suite:
             return "required"
         return "advisory"
 
+    def scorer_config(self, engine: str | None = None) -> dict[str, Any]:
+        """Keyword arguments for ``Scorer`` that the suite declares under ``sqlgami:`` in suite.yaml.
+
+        Table names are written as ``schema.table``; for an engine that flattens them (SQLite:
+        ``schema_table``) they are translated.
+        """
+        block = self.config.get("sqlgami") or {}
+        out: dict[str, Any] = {}
+
+        def name(table: str) -> str:
+            if engine != "sqlite":
+                return table
+            schema, _, bare = table.rpartition(".")
+            return f"{schema}_{bare}" if schema else bare  # SQLite has one namespace: schema_table
+        if self.tenant_column:
+            out["tenant_column"] = self.tenant_column
+        if self.soft_delete_column:
+            out["soft_delete_column"] = self.soft_delete_column
+            out["soft_delete_policy"] = self.soft_delete_policy
+        if block.get("snapshot_columns"):
+            out["snapshot_columns"] = {name(k): v for k, v in block["snapshot_columns"].items()}
+        if block.get("required_predicates"):
+            rules = []
+            for rule in block["required_predicates"]:
+                rule = dict(rule)
+                if rule.get("tables"):
+                    rule["tables"] = [name(t) for t in rule["tables"]]
+                rules.append(rule)
+            out["required_predicates"] = rules
+        for key in ("default_project", "allowed_functions"):
+            if block.get(key) is not None:
+                out[key] = block[key]
+        return out
+
     def schema_file(self, engine: str) -> Path:
         return self.path / "schema" / f"{engine}.sql"
 

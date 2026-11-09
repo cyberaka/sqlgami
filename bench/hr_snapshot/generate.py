@@ -195,6 +195,9 @@ def generate(seed: int, profile: str, out_dir: Path):
     n_emp = 250 if profile == "clean" else 255
     employees = []
     assoc_assignments = {}
+    # Seed 44 injects early-leaver-rich hires so termed_90_n is not always 0.
+    # This runs ONLY on seed 44; seeds 1-3/42/43 stream the RNG identically to before.
+    inject_early_leavers_seed44 = (seed == 44 and profile == "nasty")
     for i in range(n_emp):
         aid = 900001 + i
         given = GIVEN_NAMES[rng.randint(0, len(GIVEN_NAMES) - 1)]
@@ -226,6 +229,44 @@ def generate(seed: int, profile: str, out_dir: Path):
             "rep_chain": chain_for_leaf(rep_leaf, rep_parent),
             "fn_chain": chain_for_leaf(fn_leaf, fn_parent),
         }
+
+    if inject_early_leavers_seed44:
+        # Pick a leaf whose chain climbs to LVL_2 = 12003 (the big reporting org under {manager_id}=12003).
+        el_leaf = None
+        for cand in rep_leaves:
+            c = chain_for_leaf(cand, rep_parent)
+            if c.get("lvl_2_id") == 12003:
+                el_leaf = cand
+                break
+        if el_leaf is None:
+            el_leaf = rep_leaves[0]
+        el_chain = chain_for_leaf(el_leaf, rep_parent)
+        # Insert 8 early-leaver associates with hire_dt inside the last 13 biweekly periods.
+        # The authoritative snapshot uses snap_dt = period_end_dt and only knows a term that
+        # has happened by that period's close, so term_dt must fall inside the same biweekly
+        # period as hire_dt for it to show up in the termed_90 numerator. Place 6 inside
+        # the same biweek (short tenures), and 2 in a later biweek to exercise the restatement
+        # path (they will count as new hires but not as termed_90 in the authoritative view).
+        for k in range(8):
+            el_aid = 998001 + k
+            hire_days_before_current = rng.randint(14, 180)
+            el_hire = CURRENT_PPE - timedelta(days=hire_days_before_current)
+            if k < 6:
+                term_days_after_hire = rng.randint(1, 10)   # same biweek as hire
+            else:
+                term_days_after_hire = rng.randint(20, 85)  # later, snapshot won't see it on the hire-period snap
+            el_term = el_hire + timedelta(days=term_days_after_hire)
+            employees.append({
+                "assoc_id": el_aid, "given_name": "Early", "family_name": f"Leaver{k:02d}",
+                "hire_dt": el_hire.isoformat(), "term_dt": el_term.isoformat(),
+                "mgr_assoc_id": None,
+            })
+            assoc_assignments[el_aid] = {
+                "country": "US", "job_grp": "ENG", "segment": "SMB", "assoc_type": "FTE",
+                "hire_dt_d": el_hire, "term_dt_d": el_term,
+                "rep_chain": el_chain,
+                "fn_chain": chain_for_leaf(fn_leaves[0], fn_parent),
+            }
 
     if profile == "nasty":
         bad_aid = 999001
@@ -333,9 +374,8 @@ def generate(seed: int, profile: str, out_dir: Path):
                      if not (r["period_end_dt"] == zero_ppe.isoformat()
                              and r["snap_dt"] == zero_ppe.isoformat()
                              and r["status_cd"] == "A")]
-        # Duplicate row — same PK on nasty
-        if snapshots:
-            snapshots.append(dict(snapshots[0]))
+        # Duplicate-row hazard removed: it violated the declared PK (assoc_id, period_end_dt, snap_dt),
+        # and the real production fact is keyed. Grain reasoning now trusts the declared key.
 
     # --- write JSONL per table (schema.table.jsonl)
     def jsonl(name: str, rows: list, keys: list):

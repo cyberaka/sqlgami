@@ -95,6 +95,12 @@ CREATE TABLE hr.emp_period_snapshot (
     PRIMARY KEY (assoc_id, period_end_dt, snap_dt)
 ) PARTITION BY RANGE (period_end_dt);
 
+-- Range partitions cover 2024-H2 through 2027-H1 (data spans 52 biweekly PPEs ending 2026-06-20,
+-- so earliest period_end_dt is 2024-07-06; snap_dt can reach period_end_dt + 28 days).
+CREATE TABLE hr.emp_period_snapshot_2024_h2 PARTITION OF hr.emp_period_snapshot
+    FOR VALUES FROM ('2024-07-01') TO ('2025-01-01');
+CREATE TABLE hr.emp_period_snapshot_2025_h1 PARTITION OF hr.emp_period_snapshot
+    FOR VALUES FROM ('2025-01-01') TO ('2025-07-01');
 CREATE TABLE hr.emp_period_snapshot_2025_h2 PARTITION OF hr.emp_period_snapshot
     FOR VALUES FROM ('2025-07-01') TO ('2026-01-01');
 CREATE TABLE hr.emp_period_snapshot_2026_h1 PARTITION OF hr.emp_period_snapshot

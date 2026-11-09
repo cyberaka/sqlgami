@@ -536,15 +536,26 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
     for table in ctx.analysis.tables.values():
         if not rule.applies_to(table):
             continue
-        required = {catalog.column_key(c.name) for c in (catalog.column(table, n) for n in rule.columns) if c}
-        if not required:
+        # Any one group fully covered by one OR chain satisfies the rule.
+        groups = []
+        for names in rule.column_groups():
+            required = {catalog.column_key(c.name) for c in (catalog.column(table, n) for n in names) if c}
+            if required:
+                groups.append(required)
+        if not groups:
             continue
+        satisfied = False
         best: set[str] = set()
+        required = groups[0]
         for columns in chains.get(table.qualified_name, []):
-            hit = columns & required
-            if len(hit) > len(best):
-                best = hit
-        if best == required:
+            for group in groups:
+                hit = columns & group
+                if hit == group:
+                    satisfied = True
+                # Report against the group the chain comes closest to.
+                if len(hit) > len(best) or (len(hit) == len(best) and len(group) < len(required)):
+                    best, required = hit, group
+        if satisfied:
             continue
         if not best:
             yield ctx.finding(

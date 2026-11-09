@@ -192,6 +192,7 @@ def evaluate(
     max_samples: int | None = None,
     only_generators: list[str] | None = None,
     role: str = "confirm",
+    substitute: bool = False,
 ) -> tuple[list[Item], dict[str, Any]]:
     """Score every labelled statement for one engine. Returns the items and their metrics.
 
@@ -212,14 +213,15 @@ def evaluate(
     def scorer_for(question: Question) -> Scorer:
         scoped = question.tenant is not None
         if scoped not in scorers:
+            config = suite.scorer_config(engine)
+            if not scoped:
+                config.pop("tenant_column", None)
             scorers[scoped] = Scorer(
                 engine,
                 db=conn,
-                tenant_column=suite.tenant_column if scoped else None,
-                soft_delete_column=suite.soft_delete_column,
-                soft_delete_policy=suite.soft_delete_policy,
                 glossary=glossary,
                 options=Options(consistency_role=role, consistency_max_alternatives=24),
+                **config,
             )
         return scorers[scoped]
 
@@ -250,12 +252,13 @@ def evaluate(
         runs = runner.run(engine, seed, question.render(sql)).ok
         item = Item(item_id, question.id, kind, sql, bool(correct), runs, **extra)
         started = time.perf_counter()
-        # sqlgami gets the statement as written (a template stays a template) plus its values.
+        # sqlgami gets the statement as written (a template stays a template) plus its values,
+        # unless ``substitute`` asks for the filled-in SQL instead.
         report = scorer_for(question).score(
-            sql,
+            question.render(sql) if substitute else sql,
             question.question,
             mode=mode,
-            params=question.param_values() or None,
+            params=None if substitute else (question.param_values() or None),
             alternatives=alternatives_for(question, generator) if kind == "candidate" else None,
         )
         item.latency_ms = (time.perf_counter() - started) * 1000
