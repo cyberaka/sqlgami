@@ -194,9 +194,46 @@ def test_label_candidates(suite, tmp_path):
     out = evaluate.label_run(suite, run_dir)
     labels = [json.loads(line) for line in out.read_text().splitlines()]
     assert [l["correct"] for l in labels] == [True, False, False, None, None]
-    assert labels[0]["per_seed"] == {"clean-1": True, "clean-2": True, "clean-3": True, "nasty-42": True}
+    assert labels[0]["per_seed"] == {seed.label: True for seed in suite.seeds}
     assert labels[2]["runs"] is False and labels[1]["runs"] is True
     assert "no gold" in labels[3]["note"] and "unknown question" in labels[4]["note"]
+
+
+def test_audit_finds_gold_that_strong_generators_agree_against(suite, tmp_path):
+    from benchkit import audit as audit_mod
+
+    gold = suite.question("minisuite-q002").gold("duckdb")
+    other = gold.replace("'US'", "'DE'")  # two strong generators agree on this, against gold
+    rows = [
+        {"question_id": "minisuite-q002", "engine": "duckdb", "sql": other, "generator": "claude-opus", "sample": 0},
+        {"question_id": "minisuite-q002", "engine": "duckdb", "sql": other, "generator": "claude-haiku", "sample": 0},
+        {"question_id": "minisuite-q002", "engine": "duckdb", "sql": other, "generator": "hf:small", "sample": 0},
+        {"question_id": "minisuite-q002", "engine": "duckdb", "sql": gold, "generator": "claude-sonnet", "sample": 0},
+        {"question_id": "minisuite-q003", "engine": "duckdb", "sql": suite.question("minisuite-q003").gold("duckdb"), "generator": "claude-opus", "sample": 0},
+        {"question_id": "minisuite-q003", "engine": "duckdb", "sql": suite.question("minisuite-q003").gold("duckdb"), "generator": "claude-haiku", "sample": 0},
+    ]
+    path = tmp_path / "candidates.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    suspects = audit_mod.audit(suite, [path], ["duckdb"])
+    assert [s.question_id for s in suspects] == ["minisuite-q002"]
+    assert sorted(suspects[0].generators) == ["claude-haiku", "claude-opus"]
+    assert suspects[0].others_agreeing == ["hf:small"]
+    assert suspects[0].seeds_differing  # on at least one seed
+    # One strong generator alone is not an audit finding.
+    assert audit_mod.audit(suite, [path], ["duckdb"], strong=("opus",)) == []
+
+
+def test_labeller_matches_columns_by_name_before_position():
+    from benchkit import compare
+
+    gold = compare.Outcome(True, [(1, "a"), (2, "b")], ["id", "name"])
+    reordered = compare.Outcome(True, [("a", 1), ("b", 2)], ["name", "id"])
+    assert compare.same_outcome(gold, reordered)[0]
+    swapped_values = compare.Outcome(True, [("a", 1), ("b", 2)], ["id", "name"])
+    assert not compare.same_outcome(gold, swapped_values)[0]
+    unnamed = compare.Outcome(True, [("a", 1), ("b", 2)], ["x", "y"])
+    assert not compare.same_outcome(gold, unnamed)[0]  # different names: positional, so it differs
+    assert compare.same_rows([(True,), (False,)], [(1,), (0,)])[0]  # bool and 0/1 are equal
 
 
 def test_validator_warns_on_an_empty_suite_and_names_skipped_engines(tmp_path, monkeypatch):

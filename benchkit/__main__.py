@@ -26,6 +26,7 @@ from .evaluate import (
     read_candidates,
     write_run,
 )
+from .audit import DEFAULT_STRONG, audit
 from .suite import SuiteError, load_suite
 from .validate import validate
 
@@ -47,6 +48,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail on an empty suite and on engines the suite declares but this machine cannot check",
     )
+    p_validate.add_argument(
+        "--candidates",
+        action="append",
+        help="candidate files to audit the gold against (repeatable); see the audit command",
+    )
+    p_validate.add_argument("--strong", action="append", help="with --candidates: name markers of strong generators")
+
+    p_audit = sub.add_parser("audit", help="find gold that strong generators agree against")
+    p_audit.add_argument("suite")
+    p_audit.add_argument("candidates", nargs="+", help="candidate files (jsonl)")
+    p_audit.add_argument("--engine", action="append")
+    p_audit.add_argument(
+        "--strong",
+        action="append",
+        help="a marker naming a strong generator, matched inside the generator name (repeatable; default: claude)",
+    )
+    p_audit.add_argument("--min-agreeing", type=int, default=2, help="strong generators that must agree (default 2)")
 
     p_eval = sub.add_parser("evaluate", help="score the suite with sqlgami and print metrics")
     p_eval.add_argument("suite")
@@ -117,9 +135,24 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{engine} {seed.label}: {path}")
             return 0
 
+        if args.command == "audit":
+            strong = tuple(args.strong) if args.strong else DEFAULT_STRONG
+            suspects = audit(suite, [Path(p) for p in args.candidates], engines, strong, args.min_agreeing)
+            for suspect in suspects:
+                print(f"SUSPECT {suspect}")
+            print(f"{len(suspects)} question(s) where strong generators agree against gold")
+            return 1 if suspects else 0
+
         if args.command == "validate":
             result = validate(suite, args.engine, strict=args.strict)
             print(result.summary())
+            if args.candidates:
+                strong = tuple(args.strong) if args.strong else DEFAULT_STRONG
+                suspects = audit(suite, [Path(p) for p in args.candidates], engines, strong)
+                for suspect in suspects:
+                    print(f"SUSPECT {suspect}")
+                print(f"audit: {len(suspects)} question(s) where strong generators agree against gold")
+                return 0 if result.ok and not suspects else 1
             return 0 if result.ok else 1
 
         candidates = read_candidates(Path(args.candidates)) if args.candidates else None

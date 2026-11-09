@@ -464,6 +464,18 @@ uv run python -m benchkit evaluate saas_billing --engine duckdb --mode sample \
 `--verifiers NAME` (repeatable) limits which generators may act as
 alternatives, to measure a realistic setup.
 
+```
+uv run python -m benchkit audit saas_billing bench/.runs/<run-id>/candidates.jsonl
+```
+
+audits the gold itself: where two strong generators (by default, any whose
+name contains `claude`; `--strong` changes that) return the same result as
+each other on every seed and differ from gold, the gold or the wording is the
+suspect. `validate --candidates FILE` runs the same audit after the other
+checks. Results are compared positionally, except that when both sides name
+every column once with the same names, the columns are first lined up by
+name.
+
 SQLite and DuckDB databases are files. Postgres databases are built only when
 `SQLGAMI_BENCH_PG_DSN` names a server; one database per suite and seed is
 created there, named `sqlgami_bench_<suite>_<seed>`. `validate --strict` fails
