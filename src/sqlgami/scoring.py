@@ -45,7 +45,8 @@ BONUS_QUESTION_AGREES = 0.40  # the question was given and none of its checks ob
 BONUS_NOTHING_FOUND = 0.30  # no finding of any severity, and every check ran
 BONUS_ROWS_RETURNED = 0.15  # the query ran and returned something
 # The candidate is in the majority among independent alternatives: one, two, three or more agree.
-BONUS_CONSISTENT = (0.7, 1.2, 1.6)
+BONUS_CONSISTENT = (0.7, 1.2, 1.6)  # counted in distinct sources (models), not samples
+BONUS_SAME_SOURCE_REPEAT = 0.15
 
 HALF_WIDTH = {"static": 0.20, "dry": 0.17, "sample": 0.12}
 
@@ -132,11 +133,14 @@ def _clean_bonus(report: Report, depth: str, analysed: bool) -> float:
 def _consistency_bonus(report: Report) -> float:
     """Support from independently written queries that return the same result."""
     signal = report.signals.get("consistency") or {}
-    comparable, agreeing = signal.get("comparable") or 0, signal.get("agreeing") or 0
-    rival = signal.get("largest_disagreeing_cluster") or 0
-    if not comparable or agreeing * 2 < comparable or agreeing < rival:
+    sources, agreeing = signal.get("sources") or 0, signal.get("agreeing_sources") or 0
+    rival = signal.get("largest_disagreeing_cluster_sources") or 0
+    if not sources or not agreeing or agreeing * 2 < sources or agreeing < rival:
         return 0.0
-    return BONUS_CONSISTENT[min(agreeing, len(BONUS_CONSISTENT)) - 1]
+    bonus = BONUS_CONSISTENT[min(agreeing, len(BONUS_CONSISTENT)) - 1]
+    if agreeing == 1 and (signal.get("agreeing") or 0) >= 2:
+        bonus += BONUS_SAME_SOURCE_REPEAT  # several samples of one source agree: a little more
+    return bonus
 
 
 def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored:
@@ -239,8 +243,8 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
     agreement = report.signals.get("consistency") or {}
     if agreement.get("comparable"):
         parts.append(
-            f"{agreement.get('agreeing', 0)} of {agreement['comparable']} independent alternative queries "
-            "returned the same result"
+            f"{agreement.get('agreeing', 0)} of {agreement['comparable']} alternative queries, from "
+            f"{agreement.get('sources', 0)} independent source(s), returned the same result"
         )
     parts.append("calibrated on labelled data" if calibrated else "provisional heuristic, not calibrated")
     basis = "; ".join(parts)

@@ -49,10 +49,12 @@ class Alternative:
     rows: int | None = None
     detail: str | None = None
     cluster: int | None = None
+    source: str | None = None  # who wrote it: a model name, a prompt variant...
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "sql": self.sql,
+            "source": self.source,
             "status": self.status,
             "rows": self.rows,
             "detail": self.detail,
@@ -68,6 +70,10 @@ class Outcome:
     comparable: int = 0  # alternatives whose results could be compared
     agreeing: int = 0
     largest_other_cluster: int = 0  # size of the biggest group of alternatives that disagree with the candidate
+    # The same three counts, in distinct sources. Several samples from one model are one voice.
+    sources: int = 0
+    agreeing_sources: int = 0
+    largest_other_cluster_sources: int = 0
     findings: list[Finding] = field(default_factory=list)
 
     @property
@@ -80,6 +86,9 @@ class Outcome:
             "agreeing": self.agreeing,
             "agreement": None if self.agreement is None else round(self.agreement, 4),
             "largest_disagreeing_cluster": self.largest_other_cluster,
+            "sources": self.sources,
+            "agreeing_sources": self.agreeing_sources,
+            "largest_disagreeing_cluster_sources": self.largest_other_cluster_sources,
             "alternatives": [a.to_dict() for a in self.alternatives],
         }
 
@@ -174,17 +183,18 @@ def run(
 ) -> Outcome:
     """Run the candidate and each alternative, and compare what they return."""
     outcome = Outcome()
-    seen: set[str] = set()
-    unique: list[str] = []
+    seen: set[tuple[str, str | None]] = set()
+    unique: list[tuple[str, str | None]] = []
     own = " ".join(sql.split()).rstrip(";").lower()
-    for alt in alternatives:
-        if not isinstance(alt, str) or not alt.strip():
+    for item in alternatives:
+        alt, source = split_alternative(item)
+        if not alt:
             continue
         text = " ".join(alt.split()).rstrip(";").lower()
-        if text == own or text in seen:
-            continue  # the candidate again, or a repeat: no independent evidence
-        seen.add(text)
-        unique.append(alt)
+        if text == own or (text, source) in seen:
+            continue  # the candidate again, or a repeat from the same source: no new evidence
+        seen.add((text, source))
+        unique.append((alt, source))
     unique = unique[:max_alternatives]
     if not unique:
         outcome.reason = "no alternative differs from the candidate's own text"
@@ -201,8 +211,12 @@ def run(
 
     clusters: dict[tuple, int] = {}
     cluster_sizes: dict[int, int] = {}
-    for alt in unique:
-        entry = Alternative(sql=alt, status=INVALID)
+    cluster_sources: dict[int, set[str]] = {}
+    agreeing_sources: set[str] = set()
+    all_sources: set[str] = set()
+    for position, (alt, source) in enumerate(unique):
+        voice = source if source is not None else f"#{position}"  # unlabelled: each its own voice
+        entry = Alternative(sql=alt, status=INVALID, source=source)
         outcome.alternatives.append(entry)
         try:
             checked = A.analyse(alt, catalog, dialect)
@@ -244,17 +258,21 @@ def run(
             continue
         strict, loose = fingerprint(result.rows)
         outcome.comparable += 1
+        all_sources.add(voice)
         if strict == base_strict:
             entry.status = AGREES
             outcome.agreeing += 1
+            agreeing_sources.add(voice)
         elif loose == base_loose:
             entry.status = AGREES_REORDERED
             outcome.agreeing += 1
+            agreeing_sources.add(voice)
         else:
             entry.status = DIFFERS
             number = clusters.setdefault(loose, len(clusters) + 1)
             entry.cluster = number
             cluster_sizes[number] = cluster_sizes.get(number, 0) + 1
+            cluster_sources.setdefault(number, set()).add(voice)
             entry.detail = _difference(base.rows, result.rows)
 
     outcome.ran = outcome.comparable > 0
@@ -262,8 +280,51 @@ def run(
         outcome.reason = "no alternative could be run and compared"
         return outcome
     outcome.largest_other_cluster = max(cluster_sizes.values(), default=0)
+    outcome.sources = len(all_sources)
+    outcome.agreeing_sources = len(agreeing_sources)
+    outcome.largest_other_cluster_sources = max((len(v) for v in cluster_sources.values()), default=0)
     outcome.findings = _judge(outcome)
     return outcome
+
+
+def split_alternative(item: Any) -> tuple[str | None, str | None]:
+    """An alternative may be SQL text, ``(sql, source)``, or ``{"sql": ..., "source": ...}``."""
+    if isinstance(item, str):
+        return (item if item.strip() else None), None
+    if isinstance(item, dict):
+        sql, source = item.get("sql"), item.get("source")
+    elif isinstance(item, (tuple, list)) and len(item) == 2:
+        sql, source = item
+    else:
+        return None, None
+    if not isinstance(sql, str) or not sql.strip():
+        return None, None
+    return sql, (str(source) if source is not None else None)
+
+
+def combine(*generators: Generator, names: Sequence[str] | None = None) -> Generator:
+    """One generator out of several, tagging each alternative with which one wrote it.
+
+    Use it to draw alternatives from different models, so that their agreement
+    counts as agreement between independent voices.
+    """
+
+    def combined(question: str, schema: str, glossary: "str | None", k: int) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        for index, generator in enumerate(generators):
+            label = names[index] if names and index < len(names) else getattr(generator, "model", f"generator {index + 1}")
+            try:
+                produced = generator(question, schema, glossary, k) or []
+            except Exception:
+                logger.debug("one of the combined generators failed", exc_info=True)
+                continue
+            for item in produced:
+                sql, source = split_alternative(item)
+                if sql:
+                    found.append((sql, source or str(label)))
+        return found
+
+    return combined
 
 
 def _difference(base: Sequence[Sequence[Any]], other: Sequence[Sequence[Any]]) -> str:
@@ -275,17 +336,24 @@ def _difference(base: Sequence[Sequence[Any]], other: Sequence[Sequence[Any]]) -
 
 
 def _judge(outcome: Outcome) -> list[Finding]:
-    n, agree, rival = outcome.comparable, outcome.agreeing, outcome.largest_other_cluster
-    evidence = {"comparable": n, "agreeing": agree, "largest_disagreeing_cluster": rival}
-    if agree * 2 >= n and agree >= rival:
+    """Turn the counts into findings. Votes are counted in distinct sources."""
+    n, agree, rival = outcome.sources, outcome.agreeing_sources, outcome.largest_other_cluster_sources
+    evidence = {
+        "comparable": outcome.comparable,
+        "agreeing": outcome.agreeing,
+        "sources": n,
+        "agreeing_sources": agree,
+        "largest_disagreeing_cluster_sources": rival,
+    }
+    if agree and agree >= rival and agree * 2 >= n:
         return []  # the candidate is in the largest group: support, expressed through the score
     if rival >= 2 and rival > agree:
         return [
             Finding(
                 "consistency_disagreement",
                 Severity.HIGH,
-                f"{rival} of {n} independently written queries for this question return the same result as "
-                f"one another, and it is not what this query returns"
+                f"{rival} of {n} independent sources wrote queries for this question that return the same "
+                "result as one another, and it is not what this query returns"
                 + (f" ({agree} agree with this query)." if agree else "."),
                 "consistency",
                 suggestion="Compare this query with the alternatives listed under signals.consistency.",
@@ -293,12 +361,19 @@ def _judge(outcome: Outcome) -> list[Finding]:
             )
         ]
     if n == 1:
+        several = outcome.largest_other_cluster >= 2
         return [
             Finding(
                 "consistency_disagreement",
                 Severity.MEDIUM,
-                "The one independently written query for this question returns a different result. "
-                "One of the two is wrong, or the question can be read two ways.",
+                (
+                    f"{outcome.largest_other_cluster} queries from one other source agree with each other "
+                    "and return a different result. Samples from a single source share their mistakes, so "
+                    "this is a doubt, not a verdict."
+                    if several
+                    else "The one independently written query for this question returns a different result. "
+                    "One of the two is wrong, or the question can be read two ways."
+                ),
                 "consistency",
                 evidence=evidence,
             )
@@ -307,8 +382,8 @@ def _judge(outcome: Outcome) -> list[Finding]:
         Finding(
             "consistency_no_consensus",
             Severity.MEDIUM,
-            f"{n} independently written queries for this question were compared and there is no clear "
-            f"majority among their results ({agree} match this query). The question may be ambiguous.",
+            f"Queries from {n} independent sources were compared and there is no clear majority among their "
+            f"results ({agree} match this query). The question may be ambiguous.",
             "consistency",
             suggestion="Tighten the question, or review the alternatives listed under signals.consistency.",
             evidence=evidence,

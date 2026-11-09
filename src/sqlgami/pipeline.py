@@ -376,13 +376,14 @@ def _consistency_stage(
             logger.debug("generator failed", exc_info=True)
             _stage(report, name, StageStatus.SKIPPED, f"the generator failed ({type(exc).__name__})", clock.lap())
             return
-    rendered = []
-    for alt in alternatives:
-        if isinstance(alt, str) and params:
-            filled = template.prepare(alt, dialect, params).executable_sql
-            rendered.append(filled or alt)
-        else:
-            rendered.append(alt)
+    rendered: list[Any] = []
+    for item in alternatives:
+        alt, source = consistency.split_alternative(item)
+        if alt is None:
+            continue
+        if params:
+            alt = template.prepare(alt, dialect, params).executable_sql or alt
+        rendered.append((alt, source) if source is not None else alt)
     outcome = consistency.run(
         sql,
         rendered,

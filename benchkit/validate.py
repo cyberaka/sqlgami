@@ -48,6 +48,7 @@ class Validation:
     problems: list[Problem] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     skipped_engines: dict[str, str] = field(default_factory=dict)
+    complexity: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -55,6 +56,19 @@ class Validation:
 
     def add(self, level: str, where: str, message: str) -> None:
         self.problems.append(Problem(level, where, message))
+
+    def complexity_table(self) -> list[str]:
+        if not self.complexity:
+            return []
+        lines = ["gold SQL complexity by difficulty (median / max):"]
+        for level, row in self.complexity.items():
+            lines.append(
+                f"  {level:10} n={row['questions']:3}  chars {row['chars_median']}/{row['chars_max']}  "
+                f"joins {row['joins_median']}/{row['joins_max']}  CTEs {row['ctes_median']}/{row['ctes_max']}  "
+                f"depth {row['depth_median']}/{row['depth_max']}  windows {row['windows_median']}/{row['windows_max']}  "
+                f"production-grade {row['production_grade']}"
+            )
+        return lines
 
     def summary(self) -> str:
         errors = sum(1 for p in self.problems if p.level == ERROR)
@@ -66,6 +80,7 @@ class Validation:
         ]
         for engine, why in self.skipped_engines.items():
             lines.append(f"skipped: {engine} ({why})")
+        lines.extend(self.complexity_table())
         lines.extend(str(p) for p in self.problems)
         return "\n".join(lines)
 
@@ -109,11 +124,30 @@ class Runner:
         return result
 
     def is_correct(self, question: Question, engine: str, sql: str) -> bool | None:
-        """The test-suite label: correct only if it matches gold on every seed."""
+        """The test-suite label: correct if it matches gold, or an accepted alternative, on every seed."""
+        matched = self.matched_answer(question, engine, sql)
+        if matched is None:
+            return None
+        return matched != ""
+
+    def matched_answer(self, question: Question, engine: str, sql: str) -> str | None:
+        """Which accepted answer ``sql`` matches on every seed: its label, "" for none, None if unlabelled."""
         results = self.matches_gold(question, engine, sql)
         if not results:
             return None
-        return all(equal for equal, _ in results.values())
+        if all(equal for equal, _ in results.values()):
+            return "gold"
+        for label, accepted_sql in question.accepted(engine)[1:]:
+            same = True
+            for seed in self.suite.seeds:
+                reference = self.run(engine, seed, question.render(accepted_sql))
+                outcome = self.run(engine, seed, question.render(sql))
+                if not same_outcome(reference, outcome, question.ordered)[0]:
+                    same = False
+                    break
+            if same:
+                return label
+        return ""
 
     def close(self) -> None:
         for conn in self._conns.values():
@@ -147,6 +181,7 @@ def validate(
         if strict:
             result.add(ERROR, engine, f"declared in suite.yaml but not checked: {why}")
 
+    result.complexity = complexity_stats(suite)
     profiles = [s.profile for s in suite.seeds]
     if profiles.count("clean") < 3:
         result.add(ERROR, "suite.yaml", "fewer than three clean seeds")
@@ -184,6 +219,66 @@ def validate(
     finally:
         runner.close()
     return result
+
+
+# The bar for a "production-grade" question: long, many joins, several CTEs.
+PRODUCTION_CHARS = 1500
+PRODUCTION_JOINS = 5
+PRODUCTION_CTES = 3
+
+
+def sql_shape(sql: str, dialect: str) -> dict[str, int]:
+    """Size measures of one statement: length, joins, CTEs, nesting depth, window functions."""
+    import sqlglot
+    from sqlglot import exp
+
+    shape = {"chars": len(" ".join(sql.split())), "joins": 0, "ctes": 0, "depth": 0, "windows": 0}
+    try:
+        tree = sqlglot.parse_one(sql, dialect=dialect)
+    except Exception:
+        return shape
+    shape["joins"] = sum(1 for _ in tree.find_all(exp.Join))
+    shape["ctes"] = sum(1 for _ in tree.find_all(exp.CTE))
+    shape["windows"] = sum(1 for _ in tree.find_all(exp.Window))
+
+    def depth(node: Any) -> int:
+        deepest = 0
+        for child in node.iter_expressions():
+            deepest = max(deepest, depth(child))
+        return deepest + (1 if isinstance(node, exp.Select) else 0)
+
+    shape["depth"] = depth(tree)
+    return shape
+
+
+def complexity_stats(suite: Suite) -> dict[str, dict[str, Any]]:
+    """Per difficulty level: how big the gold SQL is, and how many questions meet the production bar."""
+    import statistics
+
+    dialects = {"sqlite": "sqlite", "duckdb": "duckdb", "postgres": "postgres", "bigquery": "bigquery"}
+    by_level: dict[str, list[dict[str, int]]] = {}
+    for question in suite.questions:
+        engine = next((e for e in ("postgres", "duckdb", "bigquery", "sqlite") if question.gold(e)), None)
+        if engine is None:
+            continue
+        by_level.setdefault(question.difficulty or "unknown", []).append(
+            sql_shape(question.gold(engine), dialects[engine])
+        )
+    stats: dict[str, dict[str, Any]] = {}
+    for level in sorted(by_level):
+        shapes = by_level[level]
+        row: dict[str, Any] = {"questions": len(shapes)}
+        for key in ("chars", "joins", "ctes", "depth", "windows"):
+            values = [shape[key] for shape in shapes]
+            row[f"{key}_median"] = int(statistics.median(values))
+            row[f"{key}_max"] = max(values)
+        row["production_grade"] = sum(
+            1
+            for shape in shapes
+            if shape["chars"] >= PRODUCTION_CHARS and shape["joins"] >= PRODUCTION_JOINS and shape["ctes"] >= PRODUCTION_CTES
+        )
+        stats[level] = row
+    return stats
 
 
 def _check_ids(suite: Suite, result: Validation) -> None:
@@ -258,6 +353,18 @@ def _check_question(suite: Suite, runner: Runner, question: Question, engines: l
             result.add(ERROR, f"{question.id} {engine}", "gold SQL returns no rows on any clean seed")
 
     _check_anchor(suite, runner, question, engines, result)
+    for engine in engines:
+        for label, accepted_sql in question.accepted(engine)[1:]:
+            for seed in suite.seeds:
+                outcome = runner.run(engine, seed, question.render(accepted_sql))
+                if not outcome.ok:
+                    result.add(ERROR, f"{question.id} {engine} {seed.label}", f"{label} fails to run: {outcome.error}")
+                    break
+            else:
+                if all(equal for equal, _ in runner.matches_gold(question, engine, accepted_sql).values()):
+                    result.add(WARNING, f"{question.id} {engine}", f"{label} returns the same as gold on every seed")
+    if question.gold_alternatives and question.answerable != "ambiguous":
+        result.add(WARNING, question.id, "has gold_alternatives but is not marked answerable: ambiguous")
 
     present = [e for e in engines if question.gold(e)]
     for seed in suite.seeds:

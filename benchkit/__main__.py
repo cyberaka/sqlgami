@@ -71,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     p_cal.add_argument("--engine", action="append")
     p_cal.add_argument("--out", required=True, help="where to write the calibration JSON")
 
+    p_eval.add_argument("--max-samples", type=int, help="with --consistency: use only samples 0..N-1 of each verifier")
+    p_eval.add_argument("--score-only", action="append", help="score only candidates from these generators (repeatable)")
+
     p_label = sub.add_parser("label", help="label candidate SQL as right or wrong by running it on every seed")
     p_label.add_argument("suite")
     p_label.add_argument("run", help="a run directory holding candidates.jsonl, or the file itself")
@@ -123,7 +126,15 @@ def main(argv: list[str] | None = None) -> int:
         for engine in engines:
             for mode in args.mode or ["static", "dry", "sample"]:
                 items, result = evaluate(
-                    suite, engine, mode, args.seed, candidates, consistency=args.consistency, verifiers=args.verifiers
+                    suite,
+                    engine,
+                    mode,
+                    args.seed,
+                    candidates,
+                    consistency=args.consistency,
+                    verifiers=args.verifiers,
+                    max_samples=args.max_samples,
+                    only_generators=args.score_only,
                 )
                 path = write_run(suite, engine, mode, items, result, run_id)
                 print(f"== {suite.name} / {engine} / {mode}")

@@ -48,9 +48,24 @@ class Question:
     check: dict[str, Any] | None = None
     # Values for templated gold: {name: {"type": ..., "value": ...}}
     params: dict[str, Any] | None = None
+    # Other accepted answers, for questions that can fairly be read more than one way:
+    # [{"note": str, "sql": {engine: sql}}]
+    gold_alternatives: list[dict[str, Any]] = field(default_factory=list)
 
     def gold(self, engine: str) -> str | None:
         return (self.gold_sql or {}).get(engine)
+
+    def accepted(self, engine: str) -> list[tuple[str, str]]:
+        """Every accepted answer for an engine as ``(label, sql)``; the first is the gold itself."""
+        found: list[tuple[str, str]] = []
+        gold = self.gold(engine)
+        if gold:
+            found.append(("gold", gold))
+        for index, alternative in enumerate(self.gold_alternatives or []):
+            sql = (alternative.get("sql") or {}).get(engine)
+            if sql:
+                found.append((f"alternative {index + 1}: {alternative.get('note', '')}".strip(": "), sql))
+        return found
 
     def param_values(self) -> dict[str, Any]:
         """Template values in the plain ``{name: value}`` form sqlgami accepts."""
@@ -180,6 +195,7 @@ def load_suite(name_or_path: str | Path) -> Suite:
                     expected_answer_shape=row.get("expected_answer_shape"),
                     check=row.get("check"),
                     params=row.get("params"),
+                    gold_alternatives=list(row.get("gold_alternatives") or []),
                 )
             )
         except KeyError as exc:

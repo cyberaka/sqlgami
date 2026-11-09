@@ -156,10 +156,10 @@ class HFGenerator:
         parts.append(f"Question: {question}")
         return [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]
 
-    def __call__(self, question: str, schema: str, glossary: str | None, k: int) -> Sequence[str]:
+    def __call__(self, question: str, schema: str, glossary: str | None, k: int) -> Sequence[tuple[str, str]]:
         headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
         messages = self._messages(question, schema, glossary)
-        found: list[str] = []
+        found: list[tuple[str, str]] = []
         for index in range(max(1, k)):
             payload = {
                 "model": self.model,
@@ -174,6 +174,6 @@ class HFGenerator:
             except (KeyError, IndexError, TypeError):
                 raise GeneratorError("the model provider returned an unexpected reply") from None
             sql = extract_sql(text if isinstance(text, str) else "")
-            if sql and sql not in found:
-                found.append(sql)
+            if sql and sql not in [f[0] for f in found]:
+                found.append((sql, self.model))  # tagged, so samples of one model count as one voice
         return found

@@ -189,6 +189,8 @@ def evaluate(
     include_planted: bool = True,
     consistency: bool = False,
     verifiers: list[str] | None = None,
+    max_samples: int | None = None,
+    only_generators: list[str] | None = None,
 ) -> tuple[list[Item], dict[str, Any]]:
     """Score every labelled statement for one engine. Returns the items and their metrics.
 
@@ -226,13 +228,15 @@ def evaluate(
         if row.get("engine") == engine and row.get("sql"):
             by_question.setdefault(row.get("question_id", ""), []).append(row)
 
-    def alternatives_for(question: Question, generator: str) -> list[str] | None:
+    def alternatives_for(question: Question, generator: str) -> list[tuple[str, str]] | None:
         if not consistency:
             return None
         return [
-            row["sql"]
+            (row["sql"], row.get("generator") or "")  # tagged by model: its samples are one voice
             for row in by_question.get(question.id, [])
-            if row.get("generator") != generator and (not verifiers or row.get("generator") in verifiers)
+            if row.get("generator") != generator
+            and (not verifiers or row.get("generator") in verifiers)
+            and (max_samples is None or int(row.get("sample") or 0) < max_samples)
         ]
 
     def add(item_id: str, question: Question, kind: str, sql: str, generator: str = "", **extra: Any) -> None:
@@ -263,8 +267,8 @@ def evaluate(
         item.failed_stage = next((st.name for st in report.stages if st.status.value == "failed"), "")
         item.generator = generator
         signal = report.signals.get("consistency") or {}
-        item.agreeing = signal.get("agreeing")
-        item.comparable = signal.get("comparable")
+        item.agreeing = signal.get("agreeing_sources")
+        item.comparable = signal.get("sources")
         items.append(item)
 
     try:
@@ -291,6 +295,8 @@ def evaluate(
                 continue
             question = suite.question(row.get("question_id", ""))
             if question is None or not row.get("sql"):
+                continue
+            if only_generators and row.get("generator") not in only_generators:
                 continue
             add(
                 f"cand-{index}:{row.get('generator', '')}:{row.get('sample', 0)}",
@@ -330,6 +336,7 @@ def label_run(suite: Suite, run: Path) -> Path:
                 "correct": None,
                 "runs": None,
                 "per_seed": {},
+                "matched": None,
                 "note": "",
             }
             question = suite.question(row.get("question_id") or "")
@@ -345,7 +352,9 @@ def label_run(suite: Suite, run: Path) -> Path:
             else:
                 matches = runner.matches_gold(question, engine, row["sql"])
                 entry["per_seed"] = {label: equal for label, (equal, _) in matches.items()}
-                entry["correct"] = all(entry["per_seed"].values())
+                matched = runner.matched_answer(question, engine, row["sql"])
+                entry["correct"] = bool(matched)
+                entry["matched"] = matched or None  # "gold", or which accepted alternative
                 entry["runs"] = all(runner.run(engine, seed, question.render(row["sql"])).ok for seed in suite.seeds)
                 reasons = [f"{label}: {why}" for label, (equal, why) in matches.items() if not equal]
                 entry["note"] = "; ".join(reasons[:2])

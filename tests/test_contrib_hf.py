@@ -91,7 +91,11 @@ def test_generator_in_full_mode(engine, db):
     )
     with Scorer(engine, db=db, generator=generator) as scorer:
         report = scorer.score(candidate, "Total order value per customer", mode="full")
-    assert report.signals["consistency"]["agreeing"] == 2 and report.score >= 0.9
+    signal = report.signals["consistency"]
+    # Two samples of one model that agree with the candidate: one voice, so support but not the top band.
+    assert signal["agreeing"] == 2 and signal["agreeing_sources"] == 1 and signal["sources"] == 1
+    assert {a["source"] for a in signal["alternatives"]} == {"meta-llama/Llama-3.3-70B-Instruct"}
+    assert report.verdict.value == "likely_right"
     assert len(seen) == 3 and seen[0]["temperature"] == 0.0 and seen[1]["temperature"] > 0
     assert seen[0]["model"] == "meta-llama/Llama-3.3-70B-Instruct"
     prompt = seen[0]["messages"][1]["content"]

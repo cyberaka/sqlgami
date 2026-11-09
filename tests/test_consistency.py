@@ -47,14 +47,14 @@ def test_agreement_lifts_the_score(scorer):
     assert statuses == ["agrees", "agrees", "agrees_columns_reordered"]
     assert not [f for f in backed.findings if f.stage == "consistency"]
     assert backed.score > alone.score and backed.score >= 0.9
-    assert "3 of 3 independent alternative queries" in backed.confidence.basis
+    assert "3 of 3 alternative queries, from 3 independent source(s)" in backed.confidence.basis
     assert alone.stage("consistency").status.value == "not_run"
 
 
 def test_alternatives_that_agree_with_each_other_but_not_the_candidate(scorer):
     report = scorer.sample(FANNED, QUESTION, alternatives=[RIGHT, SAME_1, SAME_2])
     finding = next(f for f in report.findings if f.code == "consistency_disagreement")
-    assert finding.severity == Severity.HIGH and finding.evidence["largest_disagreeing_cluster"] == 3
+    assert finding.severity == Severity.HIGH and finding.evidence["largest_disagreeing_cluster_sources"] == 3
     assert report.verdict.value == "likely_wrong"
     differing = [a for a in consistency(report)["alternatives"] if a["status"] == "differs"]
     assert len(differing) == 3 and len({a["cluster"] for a in differing}) == 1
@@ -136,6 +136,7 @@ def test_generator_is_called_only_in_full_mode(engine, db):
         assert not calls
         report = scorer.score(RIGHT, QUESTION, mode="full")
         assert consistency(report)["agreeing"] == 2 and report.score >= 0.9
+        assert consistency(report)["agreeing_sources"] == 2  # unlabelled alternatives are each their own voice
         assert len(calls) == 1 and calls[0][0] == QUESTION and calls[0][3] == 2
         assert "customers" in calls[0][1] and "PRIMARY KEY" in calls[0][1]
         assert scorer.score(RIGHT, mode="full").stage("consistency").status.value == "not_run"  # no question
@@ -157,3 +158,47 @@ def test_full_mode_without_a_generator_says_so(scorer):
     report = scorer.score(RIGHT, QUESTION, mode="full")
     stage = report.stage("consistency")
     assert stage.status.value == "not_run" and "no alternative queries" in stage.detail
+
+
+def test_samples_from_one_source_are_one_voice(scorer):
+    # Three samples of one model agree with each other and not with the candidate: a doubt, not a verdict.
+    one_model = scorer.sample(
+        FANNED, QUESTION, alternatives=[(RIGHT, "model-a"), (SAME_1, "model-a"), (SAME_2, "model-a")]
+    )
+    finding = next(f for f in one_model.findings if f.code == "consistency_disagreement")
+    assert finding.severity == Severity.MEDIUM and "one other source" in finding.message
+    assert consistency(one_model)["sources"] == 1 and consistency(one_model)["comparable"] == 3
+    assert one_model.verdict.value != "invalid"
+
+    # The same three queries from two different models: independent agreement, high severity.
+    two_models = scorer.sample(
+        FANNED, QUESTION, alternatives=[(RIGHT, "model-a"), (SAME_1, "model-b"), {"sql": SAME_2, "source": "model-a"}]
+    )
+    finding = next(f for f in two_models.findings if f.code == "consistency_disagreement")
+    assert finding.severity == Severity.HIGH and finding.evidence["largest_disagreeing_cluster_sources"] == 2
+
+    # Support counts the same way: three agreeing samples of one model lift less than two models.
+    same_source = scorer.sample(RIGHT, QUESTION, alternatives=[(SAME_1, "model-a"), (SAME_2, "model-a")])
+    two_sources = scorer.sample(RIGHT, QUESTION, alternatives=[(SAME_1, "model-a"), (SAME_2, "model-b")])
+    assert consistency(same_source)["agreeing_sources"] == 1 and consistency(two_sources)["agreeing_sources"] == 2
+    assert scorer.sample(RIGHT, QUESTION).score < same_source.score < two_sources.score
+
+
+def test_combined_generators_tag_their_alternatives(engine, db):
+    from sqlgami.consistency import combine
+
+    def model_a(question, schema, glossary, k):
+        return [SAME_1, SAME_1 + " ORDER BY c.name"][:k]
+
+    def model_b(question, schema, glossary, k):
+        return [SAME_2]
+
+    def broken(question, schema, glossary, k):
+        raise RuntimeError("down")
+
+    generator = combine(model_a, model_b, broken, names=["a", "b", "c"])
+    with Scorer(engine, db=db, generator=generator, options=Options(consistency_k=2)) as scorer:
+        report = scorer.score(RIGHT, QUESTION, mode="full")
+    signal = consistency(report)
+    assert signal["sources"] == 2 and signal["agreeing_sources"] == 2 and signal["comparable"] == 3
+    assert {a["source"] for a in signal["alternatives"]} == {"a", "b"}

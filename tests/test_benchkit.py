@@ -216,3 +216,47 @@ def test_validator_warns_on_an_empty_suite_and_names_skipped_engines(tmp_path, m
     assert "the suite has no questions" in text and "skipped: postgres" in text
     strict = validate.validate(broken, check_determinism=False, strict=True)
     assert not strict.ok
+
+
+def test_accepted_alternative_answers(suite, tmp_path):
+    def mutate(root):
+        def change(row):
+            if row["id"] == "minisuite-q002":
+                row["answerable"] = "ambiguous"
+                row["gold_alternatives"] = [
+                    {"note": "reading US as North America, which here includes DE by mistake",
+                     "sql": {"duckdb": "SELECT COUNT(*) FROM shop.customers WHERE country IN ('US', 'DE') AND deleted_at IS NULL",
+                             "sqlite": "SELECT COUNT(*) FROM shop_customers WHERE country IN ('US', 'DE') AND deleted_at IS NULL"}}
+                ]
+            return row
+
+        _rewrite(root / "questions.jsonl", change)
+        (root / "bugs.jsonl").write_text("")
+
+    alt_suite = load_suite(_broken_copy(tmp_path, mutate))
+    assert validate.validate(alt_suite, check_determinism=False).ok
+    rows = [
+        {"question_id": "minisuite-q002", "engine": "duckdb", "sql": "SELECT COUNT(*) FROM shop.customers WHERE country = 'US' AND deleted_at IS NULL"},
+        {"question_id": "minisuite-q002", "engine": "duckdb", "sql": "SELECT COUNT(id) FROM shop.live_customers_v WHERE country = 'US' OR country = 'DE'"},
+        {"question_id": "minisuite-q002", "engine": "duckdb", "sql": "SELECT COUNT(*) FROM shop.customers WHERE country = 'DE'"},
+    ]
+    run_dir = tmp_path / "run-alt"
+    run_dir.mkdir()
+    (run_dir / "candidates.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    labels = [json.loads(line) for line in evaluate.label_run(alt_suite, run_dir).read_text().splitlines()]
+    assert [l["correct"] for l in labels] == [True, True, False]
+    assert labels[0]["matched"] == "gold" and labels[1]["matched"].startswith("alternative 1") and labels[2]["matched"] is None
+
+
+def test_complexity_statistics(suite):
+    stats = validate.complexity_stats(suite)
+    assert set(stats) == {"simple", "moderate"}
+    assert stats["moderate"]["questions"] == 1 and stats["moderate"]["joins_max"] == 1
+    assert stats["simple"]["production_grade"] == 0
+    shape = validate.sql_shape(
+        "WITH a AS (SELECT 1 AS x), b AS (SELECT x FROM a) SELECT ROW_NUMBER() OVER (ORDER BY b.x) "
+        "FROM b JOIN a ON a.x = b.x WHERE b.x IN (SELECT x FROM a)",
+        "duckdb",
+    )
+    assert (shape["joins"], shape["ctes"], shape["windows"]) == (1, 2, 1) and shape["depth"] >= 2
+    assert "gold SQL complexity by difficulty" in validate.validate(suite, check_determinism=False).summary()
