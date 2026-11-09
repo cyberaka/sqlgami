@@ -469,13 +469,6 @@ FALSE_ALARMS = [
     # fan_out
     (
         'fan_out',
-        'anti_join',
-        "SELECT SUM(o.total) FROM orders o LEFT JOIN payments p ON p.order_id = o.id WHERE p.id IS NULL",
-        {},
-        "WHERE p.id IS NULL keeps only orders with no payment, so no order row is repeated (shop data: 95.5, same as NOT EXISTS)",
-    ),
-    (
-        'fan_out',
         'view_grouped_by_pk_plus',
         "SELECT SUM(o.total) FROM orders o JOIN order_totals t ON t.order_id = o.id",
         {},
@@ -619,13 +612,6 @@ FALSE_ALARMS = [
         "the whole composite key is pinned, so there is at most one row",
     ),
     # history_rows
-    (
-        'history_rows',
-        'validity_window_not_history',
-        "SELECT COUNT(*) FROM coupons",
-        {'ddl': 'extra'},
-        "coupons has one row per coupon (primary key and unique code); valid_until is when the coupon expires, not a version marker",
-    ),
     (
         'history_rows',
         'pk_lookup',
@@ -1427,6 +1413,19 @@ STILL_FIRES = [
 ]
 
 STILL_QUIET = [
+    # fixed false alarms, kept as regressions
+    (
+        'fan_out',
+        'anti_join',
+        "SELECT SUM(o.total) FROM orders o LEFT JOIN payments p ON p.order_id = o.id WHERE p.id IS NULL",
+        {},
+    ),
+    (
+        'history_rows',
+        'validity_window_not_history',
+        "SELECT COUNT(*) FROM coupons",
+        {'ddl': 'extra'},
+    ),
     # fan_out
     (
         'fan_out',
