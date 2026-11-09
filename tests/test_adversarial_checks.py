@@ -122,63 +122,6 @@ MISSED = [
         {},
         "the correlated EXISTS is false when o.id is NULL",
     ),
-    # not_in_nullable
-    (
-        'not_in_nullable',
-        'union_subquery',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers UNION SELECT customer_id FROM profiles)",
-        {},
-        "both UNION branches read nullable columns; a set operation in the subquery is skipped",
-    ),
-    (
-        'not_in_nullable',
-        'neq_all',
-        "SELECT name FROM customers WHERE id <> ALL (SELECT referrer_id FROM customers)",
-        {'dialects': ('duckdb', 'postgres')},
-        "<> ALL (subquery) is NOT IN by another name",
-    ),
-    (
-        'not_in_nullable',
-        'expression_projection',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id + 0 FROM customers)",
-        {},
-        "referrer_id + 0 is still NULL where referrer_id is (shop data: returns no rows; NOT EXISTS returns 3)",
-    ),
-    (
-        'not_in_nullable',
-        'aggregate_projection',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT MAX(referrer_id) FROM customers GROUP BY country)",
-        {},
-        "MAX(referrer_id) is NULL for a group with no referrers",
-    ),
-    (
-        'not_in_nullable',
-        'column_in_list',
-        "SELECT name FROM customers WHERE id NOT IN (1, referrer_id)",
-        {},
-        "a nullable column in the IN list makes NOT IN unknown for those rows",
-    ),
-    (
-        'not_in_nullable',
-        'row_value',
-        "SELECT name FROM customers WHERE (id, tenant_id) NOT IN (SELECT referrer_id, tenant_id FROM customers)",
-        {},
-        "a row-value NOT IN is skipped although one projected column is nullable",
-    ),
-    (
-        'not_in_nullable',
-        'case_projection',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT CASE WHEN country = 'US' THEN id END FROM customers)",
-        {},
-        "a CASE without ELSE yields NULL",
-    ),
-    (
-        'not_in_nullable',
-        'window_projection',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT LAG(id) OVER (ORDER BY id) FROM customers)",
-        {},
-        "LAG() yields NULL for the first row",
-    ),
     # missing_group_by
     (
         'missing_group_by',
@@ -324,36 +267,6 @@ MISSED = [
         "GROUP BY total removes the repeats but also merges different orders with the same total",
     ),
     # cartesian_join
-    # null_comparison
-    (
-        'null_comparison',
-        'case_when_null',
-        "SELECT name, CASE country WHEN NULL THEN 'unknown' ELSE country END FROM customers",
-        {},
-        "CASE x WHEN NULL compares with = and never matches",
-    ),
-    (
-        'null_comparison',
-        'in_null_list',
-        "SELECT name FROM customers WHERE country IN (NULL)",
-        {},
-        "IN (NULL) is never true",
-    ),
-    # type_mismatch
-    (
-        'type_mismatch',
-        'sqlite_int_vs_timestamp_text',
-        "SELECT id FROM orders WHERE created_at > 20240101",
-        {'dialects': ('sqlite',)},
-        "SQLite compares the integer with timestamp text by storage class, so every row matches (shop data: 5 of 5); DuckDB and Postgres reject it",
-    ),
-    (
-        'type_mismatch',
-        'join_through_expression',
-        "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.name || ''",
-        {},
-        "an integer key is compared with text; Postgres and DuckDB reject it and SQLite matches nothing",
-    ),
     # date_boundary
     (
         'date_boundary',
@@ -361,21 +274,6 @@ MISSED = [
         "SELECT id FROM orders WHERE created_at <= '2024-01-31 23:59:59'",
         {},
         "<= '... 23:59:59' leaves out the last fractional second of the day",
-    ),
-    # filter_value
-    (
-        'filter_value',
-        'lower_vs_upper_literal',
-        "SELECT * FROM customers WHERE LOWER(country) = 'US'",
-        {'values': True},
-        "LOWER(country) can never equal the upper-case 'US'",
-    ),
-    (
-        'filter_value',
-        'like_no_wildcard',
-        "SELECT * FROM customers WHERE country LIKE 'usa'",
-        {'values': True},
-        "LIKE with no wildcard is an equality test against a value the column never holds",
     ),
     # avg_of_avg
     (
@@ -432,77 +330,6 @@ FALSE_ALARMS = [
         "SELECT c.name, i.sku FROM customers c LEFT JOIN (orders o JOIN items i ON i.order_id = o.id) ON o.customer_id = c.id",
         {},
         "the inner join is inside the parentheses on the nullable side; every customer is still returned (shop data: 4 of 4)",
-    ),
-    # not_in_nullable
-    (
-        'not_in_nullable',
-        'guard_greater_than',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id > 0)",
-        {},
-        "referrer_id > 0 already excludes NULL",
-    ),
-    (
-        'not_in_nullable',
-        'guard_inner_join_on_column',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT c2.referrer_id FROM customers c2 JOIN customers r ON r.id = c2.referrer_id)",
-        {},
-        "the inner join on referrer_id already excludes NULL",
-    ),
-    (
-        'not_in_nullable',
-        'guard_in_list',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id IN (1, 2, 3))",
-        {},
-        "referrer_id IN (...) already excludes NULL",
-    ),
-    (
-        'not_in_nullable',
-        'guard_inside_cte',
-        "WITH r AS (SELECT referrer_id FROM customers WHERE referrer_id IS NOT NULL) SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM r)",
-        {},
-        "the IS NOT NULL guard is inside the CTE the subquery reads",
-    ),
-    (
-        'not_in_nullable',
-        'guard_inside_derived',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT x.referrer_id FROM (SELECT referrer_id FROM customers WHERE referrer_id IS NOT NULL) x)",
-        {},
-        "the IS NOT NULL guard is inside the derived table the subquery reads",
-    ),
-    (
-        'not_in_nullable',
-        'guard_inside_cte_star',
-        "WITH r AS (SELECT * FROM customers WHERE referrer_id IS NOT NULL) SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM r)",
-        {},
-        "the IS NOT NULL guard is inside a SELECT * CTE",
-    ),
-    (
-        'not_in_nullable',
-        'guard_equals_literal',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id = 1)",
-        {},
-        "referrer_id = 1 already excludes NULL",
-    ),
-    (
-        'not_in_nullable',
-        'guard_between',
-        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id BETWEEN 1 AND 10)",
-        {},
-        "BETWEEN already excludes NULL",
-    ),
-    (
-        'not_in_nullable',
-        'guard_correlated_eq',
-        "SELECT c.name FROM customers c WHERE c.id NOT IN (SELECT c2.referrer_id FROM customers c2 WHERE c2.referrer_id = c.id)",
-        {},
-        "the correlated equality already excludes NULL",
-    ),
-    (
-        'not_in_nullable',
-        'guard_join_to_not_null_column',
-        "SELECT sku FROM items WHERE order_id NOT IN (SELECT pr.customer_id FROM profiles pr JOIN payments p ON p.order_id = pr.customer_id)",
-        {},
-        "the inner join on the projected column already excludes NULL",
     ),
     # missing_group_by
     (
@@ -565,36 +392,6 @@ FALSE_ALARMS = [
     ),
     # distinct_masking
     # cartesian_join
-    # null_comparison
-    (
-        'null_comparison',
-        'surname_null',
-        "SELECT id FROM customers WHERE name = 'Null'",
-        {},
-        "'Null' is a real surname and a legitimate text value",
-    ),
-    # type_mismatch
-    (
-        'type_mismatch',
-        'sqlite_month_prefix_bound',
-        "SELECT id FROM orders WHERE created_at >= '2024-01' AND created_at < '2024-02'",
-        {'dialects': ('sqlite',)},
-        "'2024-01' is a valid lower bound for text timestamps in SQLite (shop data: same rows as '2024-01-01')",
-    ),
-    (
-        'type_mismatch',
-        'postgres_special_date_input',
-        "SELECT id FROM orders WHERE created_at < 'now'",
-        {'dialects': ('postgres',)},
-        "'now' is a documented Postgres timestamp input",
-    ),
-    (
-        'type_mismatch',
-        'postgres_infinity',
-        "SELECT id FROM orders WHERE created_at < 'infinity'",
-        {'dialects': ('postgres',)},
-        "'infinity' is a documented Postgres timestamp input",
-    ),
     # integer_division
     (
         'integer_division',
@@ -610,14 +407,6 @@ FALSE_ALARMS = [
         "SELECT id FROM orders WHERE created_at >= '2024-01-30' AND created_at < '2024-01-31'",
         {},
         ">= the 30th and < the 31st is the correct half-open range for one day",
-    ),
-    # filter_value
-    (
-        'filter_value',
-        'in_list_partly_present',
-        "SELECT * FROM customers WHERE country IN ('US', 'CA')",
-        {'values': True},
-        "'US' is stored, so the IN list does match rows; the message says it matches none",
     ),
     # avg_of_avg
     (
@@ -1362,6 +1151,151 @@ STILL_FIRES = [
         "SELECT c.name, o.total FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id",
         {'hints': {'soft_delete_column': 'deleted_at'}},
     ),
+    (
+        'not_in_nullable',
+        'union_subquery',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers UNION SELECT customer_id FROM profiles)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'neq_all',
+        "SELECT name FROM customers WHERE id <> ALL (SELECT referrer_id FROM customers)",
+        {'dialects': ('duckdb', 'postgres')},
+    ),
+    (
+        'not_in_nullable',
+        'expression_projection',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id + 0 FROM customers)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'aggregate_projection',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT MAX(referrer_id) FROM customers GROUP BY country)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'column_in_list',
+        "SELECT name FROM customers WHERE id NOT IN (1, referrer_id)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'row_value',
+        "SELECT name FROM customers WHERE (id, tenant_id) NOT IN (SELECT referrer_id, tenant_id FROM customers)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'case_projection',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT CASE WHEN country = 'US' THEN id END FROM customers)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'window_projection',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT LAG(id) OVER (ORDER BY id) FROM customers)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_on_nullable_column',
+        "SELECT name FROM customers WHERE country NOT IN ('US', 'DE')",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_or_is_null_on_other_column',
+        "SELECT name FROM customers WHERE country NOT IN ('US', 'DE') OR referrer_id IS NULL",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_on_outer_joined_column',
+        "SELECT c.name FROM customers c LEFT JOIN orders o ON o.customer_id = c.id AND o.tenant_id NOT IN (1, 2) WHERE o.tenant_id NOT IN (3, 4)",
+        {},
+    ),
+    (
+        'null_comparison',
+        'case_when_null',
+        "SELECT name, CASE country WHEN NULL THEN 'unknown' ELSE country END FROM customers",
+        {},
+    ),
+    (
+        'null_comparison',
+        'in_null_list',
+        "SELECT name FROM customers WHERE country IN (NULL)",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_int_vs_timestamp_text',
+        "SELECT id FROM orders WHERE created_at > 20240101",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'join_through_expression',
+        "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.name || ''",
+        # Not SQLite: it converts between numbers and text where it can instead of rejecting.
+        {'dialects': ('duckdb', 'postgres')},
+    ),
+    (
+        'filter_value',
+        'lower_vs_upper_literal',
+        "SELECT * FROM customers WHERE LOWER(country) = 'US'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'like_no_wildcard',
+        "SELECT * FROM customers WHERE country LIKE 'usa'",
+        {'values': True},
+    ),
+    (
+        'null_comparison',
+        'in_list_with_null',
+        "SELECT name FROM customers WHERE country IN ('US', NULL)",
+        {},
+    ),
+    (
+        'null_comparison',
+        'text_null_placeholder',
+        "SELECT id FROM customers WHERE country = 'NULL'",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_equality_with_month',
+        "SELECT id FROM orders WHERE created_at = '2024-01'",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'duckdb_rejects_now',
+        "SELECT id FROM orders WHERE created_at < 'now'",
+        {'dialects': ('duckdb',)},
+    ),
+    (
+        'filter_value',
+        'in_list_with_misspelling',
+        "SELECT * FROM customers WHERE country IN ('usa', 'DE')",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'upper_vs_lower_literal',
+        "SELECT * FROM customers WHERE UPPER(country) = 'us'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'in_list_nothing_stored',
+        "SELECT * FROM customers WHERE country IN ('CA', 'MX')",
+        {'values': True},
+    ),
 ]
 
 STILL_QUIET = [
@@ -1905,6 +1839,210 @@ STILL_QUIET = [
         'using_join_filtered',
         "SELECT COUNT(*) FROM customers c JOIN orders o USING (tenant_id) WHERE c.deleted_at IS NULL",
         {'hints': {'soft_delete_column': 'deleted_at'}},
+    ),
+    (
+        'not_in_nullable',
+        'guard_greater_than',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id > 0)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_inner_join_on_column',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT c2.referrer_id FROM customers c2 JOIN customers r ON r.id = c2.referrer_id)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_in_list',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id IN (1, 2, 3))",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_inside_cte',
+        "WITH r AS (SELECT referrer_id FROM customers WHERE referrer_id IS NOT NULL) SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM r)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_inside_derived',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT x.referrer_id FROM (SELECT referrer_id FROM customers WHERE referrer_id IS NOT NULL) x)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_inside_cte_star',
+        "WITH r AS (SELECT * FROM customers WHERE referrer_id IS NOT NULL) SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM r)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_equals_literal',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id = 1)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_between',
+        "SELECT name FROM customers WHERE id NOT IN (SELECT referrer_id FROM customers WHERE referrer_id BETWEEN 1 AND 10)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_correlated_eq',
+        "SELECT c.name FROM customers c WHERE c.id NOT IN (SELECT c2.referrer_id FROM customers c2 WHERE c2.referrer_id = c.id)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'guard_join_to_not_null_column',
+        "SELECT sku FROM items WHERE order_id NOT IN (SELECT pr.customer_id FROM profiles pr JOIN payments p ON p.order_id = pr.customer_id)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_or_is_null',
+        "SELECT name FROM customers WHERE country NOT IN ('US', 'DE') OR country IS NULL",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_or_is_null_parenthesised',
+        "SELECT name FROM customers WHERE (country NOT IN ('US', 'DE') OR country IS NULL) AND tenant_id = 1",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_is_null_first',
+        "SELECT name FROM customers WHERE country IS NULL OR country NOT IN ('US', 'DE')",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_on_not_null_column',
+        "SELECT id FROM customers WHERE name NOT IN ('Ada', 'Bo')",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_on_primary_key',
+        "SELECT name FROM customers WHERE id NOT IN (1, 2)",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_with_is_not_null',
+        "SELECT name FROM customers WHERE country IS NOT NULL AND country NOT IN ('US', 'DE')",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_with_other_filter_on_column',
+        "SELECT name FROM customers WHERE country LIKE 'U%' AND country NOT IN ('US')",
+        {},
+    ),
+    (
+        'not_in_nullable',
+        'literal_list_on_coalesced_column',
+        "SELECT name FROM customers WHERE COALESCE(country, '') NOT IN ('US', 'DE')",
+        {},
+    ),
+    (
+        'null_comparison',
+        'surname_null',
+        "SELECT id FROM customers WHERE name = 'Null'",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_month_prefix_bound',
+        "SELECT id FROM orders WHERE created_at >= '2024-01' AND created_at < '2024-02'",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'postgres_special_date_input',
+        "SELECT id FROM orders WHERE created_at < 'now'",
+        {'dialects': ('postgres',)},
+    ),
+    (
+        'type_mismatch',
+        'postgres_infinity',
+        "SELECT id FROM orders WHERE created_at < 'infinity'",
+        {'dialects': ('postgres',)},
+    ),
+    (
+        'filter_value',
+        'in_list_partly_present',
+        "SELECT * FROM customers WHERE country IN ('US', 'CA')",
+        {'values': True},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_epoch_seconds',
+        "SELECT id FROM orders WHERE created_at > 1704067200",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_year_bound',
+        "SELECT id FROM orders WHERE created_at >= '2024' AND created_at < '2025'",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'text_column_text_expression',
+        "SELECT c.id FROM customers c WHERE c.name = c.country || '-x'",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'number_column_number_expression',
+        "SELECT o.id FROM orders o WHERE o.total = o.id * 2",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'number_column_cast_expression',
+        "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = CAST(c.name || '' AS INTEGER)",
+        {'dialects': ('duckdb', 'postgres')},
+    ),
+    (
+        'filter_value',
+        'lower_vs_lower_literal',
+        "SELECT * FROM customers WHERE LOWER(country) = 'us'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'like_with_wildcard',
+        "SELECT * FROM customers WHERE country LIKE 'U%'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'like_exact_stored_value',
+        "SELECT * FROM customers WHERE country LIKE 'US'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'in_list_all_stored',
+        "SELECT * FROM customers WHERE country IN ('US', 'DE')",
+        {'values': True},
+    ),
+    (
+        'null_comparison',
+        'case_when_is_null',
+        "SELECT name, CASE WHEN country IS NULL THEN 'unknown' ELSE country END FROM customers",
+        {},
+    ),
+    (
+        'null_comparison',
+        'in_list_without_null',
+        "SELECT name FROM customers WHERE country IN ('US', 'DE')",
+        {},
     ),
 ]
 
