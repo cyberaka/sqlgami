@@ -29,6 +29,78 @@ rules:
     form "X that have …" or "X with at least one …" return only
     matching X. Gold SQL follows this rule even when the question text
     does not spell it out.
+  fx_conversion: >
+    When a question needs an FX conversion, the anchor date is the
+    transaction date (invoice.issued_at date, payment.paid_at date, or
+    a month's first day when the measure is aggregated to a month).
+    The rate used is the row in billing.exchange_rates with the
+    greatest rate_date on or before the anchor date, matching
+    from_ccy = the source currency and to_ccy = the target currency.
+    If no such row exists, the conversion rate is treated as
+    1.0 (rate_e8 = 100000000). rate_e8 is scale 10^8 so
+    target = source_cents * rate_e8 / 10^8. Gold computes the
+    conversion per invoice (or per transaction) and truncates to
+    integer cents via FLOOR, then sums; never sum first and divide
+    (that would introduce rounding noise against the per-row engine
+    semantics).
+  refund_credit_promo_currency: >
+    Refunds, credit_transactions and promotion_applications have no
+    explicit currency_code column. For FX-conversion purposes assume
+    they are denominated in the SAME currency as the invoice they are
+    attached to; for refunds not attached to a specific invoice, assume
+    USD. Converted to USD using the same fx_conversion rule above.
+  rounding_default: >
+    Monetary conversions and divisions use FLOOR to integer at the
+    innermost possible point (per-row, before aggregation). Ratios are
+    expressed as integer per-mille (×1000, floor). "Average" questions
+    say explicitly whether to round and at which stage. Gold never
+    returns a floating-point value where an integer is sensible.
+  days_difference: >
+    "Days to pay", "days to resolve" and similar are expressed as
+    DATE_DIFF in days — the count of day boundaries crossed between
+    two timestamps in UTC. "Within N days" means the difference ≤ N.
+    A payment timestamped on the same calendar day as issued_at has
+    days_to_pay = 0. Dates and timestamps are compared in UTC
+    (the session is pinned to UTC). "Within 7 days" does NOT mean a
+    rolling 8-day window — it means difference ≤ 7.
+  usd_to_usd_passthrough: >
+    FX conversions where both from_ccy and to_ccy are USD do NOT look
+    up any rate; the value passes through at 1:1.
+  refund_credit_bucket_date: >
+    When a question aggregates refunds, credit transactions or
+    promotion applications into a monthly or periodic bucket, use the
+    row's OWN date column (refunds.created_at, credit_transactions.
+    created_at, promotion_applications.applied_at), NOT the attached
+    invoice's issued_at. The question will say explicitly when the
+    invoice's month is the bucket.
+  prev_before_window: >
+    For a tenant/period's first appearance in the reporting window,
+    the "previous period" value is NULL. Gold does not try to look up
+    rows outside the window to fill prev_*. LAG/self-join on
+    (previous month) therefore naturally returns NULL for the first
+    row per partition.
+  paid_vs_partial: >
+    A question that says "paid invoices" means status='paid' only. A
+    question that says "paid or partial" means status IN ('paid',
+    'partial'). "Revenue" in the glossary term includes both unless
+    the question specifies.
+  zero_denominator: >
+    When a ratio has a zero denominator, the result is NULL (not 0,
+    and not an engine divide-by-zero error). Gold uses NULLIF or a
+    guard in the HAVING / WHERE clause to express this.
+  current_address: >
+    A tenant can have at most one current address at a time (the SCD2
+    structure enforces one row with effective_to IS NULL per address_id
+    + tenant). If a tenant happens to have multiple current rows, the
+    gold uses the row with the greatest address_id as the winner. Gold
+    never joins through the whole addresses table for "current".
+  active_subscription_status: >
+    "Active" in English questions means ended_at IS NULL AND
+    deleted_at IS NULL unless the question or glossary term explicitly
+    adds a status filter. The broader glossary term active_subscription
+    (which adds status IN ('active','past_due') and
+    ended_at > as_of) applies only when the question says
+    "active per the glossary" or uses the active_subscriptions_v view.
 
 terms:
   active_subscription: >
