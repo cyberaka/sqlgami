@@ -153,3 +153,24 @@ def test_scaled_numbers_count_as_used(scorer):
     # A question in whole units against a column stored in cents.
     report = scorer.sample("SELECT COUNT(*) FROM orders WHERE total * 100 > 6000", "How many orders are over 60?")
     assert not report.has("number_unused"), report.summary()
+
+
+def test_wording_that_must_not_trip_the_question_checks(scorer):
+    cases = [
+        # a column name is not a mention of a stored value ('open' and 'paid' are order statuses)
+        ("SELECT COUNT(*) FROM orders WHERE order_date IS NOT NULL", "How many orders have a paid_at or order_date that IS NOT NULL?"),
+        # a value named in order to exclude it
+        ("SELECT COUNT(*) FROM orders WHERE status = 'paid'", "How many orders have status='paid' (only 'paid', not 'open')?"),
+        # "at least one" is a bound, not a superlative or a ranking
+        ("SELECT COUNT(DISTINCT customer_id) FROM orders", "How many customers have at least one order?"),
+        # asides in parentheses and zero-count wording are not negations
+        ("SELECT c.id, COUNT(o.id) FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.id",
+         "For every customer, count their orders. Customers with no orders appear with 0."),
+        ("SELECT name FROM customers ORDER BY name", "List customer names (this table has no archive flag), sorted."),
+        ("SELECT country FROM customers UNION SELECT status FROM orders", "Return countries and statuses together with no duplicates."),
+        ("SELECT COUNT(*) FROM customers WHERE deleted_at IS NULL", "How many customers have not been deleted?"),
+    ]
+    for sql, question in cases:
+        report = scorer.sample(sql, question)
+        noise = [f.code for f in report.findings if f.stage == "question"]
+        assert not noise, f"{question}\n{report.summary()}"

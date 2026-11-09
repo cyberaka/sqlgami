@@ -22,6 +22,9 @@ from .report import Finding, Severity
 
 STAGE = "question"
 
+_NEGATED_BEFORE = re.compile(r"\b(not|no|non|excluding|except|without|exclude|other than|never)\W*$", re.IGNORECASE)
+_PARENTHETICAL = re.compile(r"\([^()]*\)")
+
 _GENERIC_VALUES = {"all", "none", "other", "true", "false", "yes", "no", "null", "n/a", "na", "unknown", "any"}
 
 _NUMBER_WORDS = {
@@ -151,11 +154,13 @@ class _Asked:
             # 'US', 'IN', 'NO': only a capitalised whole word counts, or "in" would match everywhere.
             if not raw.isupper() or text is not None:
                 return False
-            return re.search(rf"(?<![A-Za-z0-9]){re.escape(raw)}(?![A-Za-z0-9])", self.text) is not None
+            return re.search(rf"(?<![A-Za-z0-9_]){re.escape(raw)}(?![A-Za-z0-9_])", self.text) is not None
         folded = raw.lower()
         forms = {folded, folded.replace("_", " "), folded.replace("-", " "), folded.replace("_", "-")}
         for form in forms:
-            if re.search(rf"(?<![a-z0-9]){re.escape(form)}(?:s|es|d|ed)?(?![a-z0-9])", haystack):
+            for match in re.finditer(rf"(?<![a-z0-9_]){re.escape(form)}(?:s|es|d|ed)?(?![a-z0-9_])", haystack):
+                if text is None and _NEGATED_BEFORE.search(haystack[max(0, match.start() - 14): match.start()]):
+                    continue  # "not 'partial'", "excluding refunded": named in order to rule it out
                 return True
         return False
 
@@ -428,7 +433,11 @@ def _top_n(asked: _Asked) -> list[Finding]:
                     limit=limit,
                 )
             )
-    words = {m.group(1).lower() for m in _SUPERLATIVE.finditer(asked.text)}
+    words = {
+        m.group(1).lower()
+        for m in _SUPERLATIVE.finditer(asked.text)
+        if not asked.text[max(0, m.start() - 3): m.start()].lower().endswith("at ")
+    }
     desc_words = {w for w in words if re.fullmatch(_DESC_WORDS, w)}
     asc_words = {w for w in words if re.fullmatch(_ASC_WORDS, w)}
     select = asked.tree
@@ -545,6 +554,8 @@ def _numbers(asked: _Asked) -> list[Finding]:
             continue
         if asked.top_n is not None and value == asked.top_n:
             continue
+        if value == 0:
+            continue
         if any(value * scale in numeric for scale in _SCALES) or value / 100 in numeric:
             continue
         if re.search(rf"(?<!\d){re.escape(raw)}(?!\d)", literal_text):
@@ -594,7 +605,12 @@ def _grouping(asked: _Asked) -> list[Finding]:
 _NO_RELATED = re.compile(
     r"\b(?:have|has|had|with|having|contain|contains|containing)\s+no\b|\bnever\b|\bwithout\b|"
     r"\bno\s+(?:associated|matching|corresponding|related|linked)\b|"
-    r"\b(?:do|does|did)\s*(?:not|n't)\s+have\b|\bnot\s+(?:have|having)\b|\bhave\s+not\b|\bhas\s+not\b",
+    r"\b(?:do|does|did)\s*(?:not|n't)\s+have\b|\bnot\s+(?:have|having)\b",
+    re.IGNORECASE,
+)
+_NOT_A_NEGATION = re.compile(
+    r"\b(?:with|has|have)\s+no\s+(?:duplicates?|ties|particular|specific)\b|\bwithout\s+duplicates?\b|"
+    r"\b(?:appear|appears|included|shown|listed|returned)\b[^.]*\b(?:0|zero)\b|\b(?:0|zero)\s+(?:when|if|for)\b",
     re.IGNORECASE,
 )
 
@@ -631,13 +647,19 @@ def _has_anti_pattern(asked: _Asked) -> bool:
 
 
 def _negation(asked: _Asked) -> list[Finding]:
-    related = _NO_RELATED.search(asked.text)
+    # Asides in parentheses explain; they are not part of what is being asked for.
+    main_text = " ".join(_PARENTHETICAL.sub(" ", asked.text).split())
+    related = _NO_RELATED.search(main_text)
+    if related is not None and _NOT_A_NEGATION.search(main_text):
+        related = None
+        if not _NEGATION.search(_NOT_A_NEGATION.sub(" ", main_text)):
+            return []
     if related is not None:
         if _has_anti_pattern(asked):
             return []
         # "no ended_at", "no email": a missing value, which IS NULL answers.
         if asked.has(exp.Is):
-            tail = asked.lower[related.end(): related.end() + 40]
+            tail = main_text.lower()[related.end(): related.end() + 40]
             column_names = {c.name.lower() for t in asked.ctx.analysis.tables.values() for c in t.columns}
             words = re.findall(r"[a-z_]+", tail)
             if any(w in column_names or w.replace(" ", "_") in column_names for w in words[:3]):
@@ -651,7 +673,7 @@ def _negation(asked: _Asked) -> list[Finding]:
                 phrase=related.group(0).strip(),
             )
         ]
-    match = _NEGATION.search(asked.text)
+    match = _NEGATION.search(main_text)
     if match is None:
         return []
     if asked.has(exp.Not, exp.NEQ, exp.Except, exp.Is):
