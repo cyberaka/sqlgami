@@ -114,6 +114,7 @@ Static checks, each reported as a finding with a severity:
 | `filter_value` | a filter on a value the column never holds, such as `'usa'` for `'US'` |
 | `missing_tenant_filter` | a multi-tenant table read without a tenant filter (needs `tenant_column`) |
 | `soft_deleted_rows` | a soft-delete marker that is never looked at (needs `soft_delete_column`) |
+| `history_rows` | a table that keeps old versions of rows (`effective_to`, `valid_to`, `is_current`) read without choosing a version |
 | `natural_join` | `NATURAL JOIN` |
 
 When you pass the question, sqlgami also compares it with the SQL. These checks

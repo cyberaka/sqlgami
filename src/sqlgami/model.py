@@ -223,7 +223,7 @@ class SelectModel:
         self.restricted: set[ColRef] = set()
         self.links: list[frozenset[str]] = []
         self._parent: dict[ColRef, ColRef] = {}
-        self._mult: dict[str, Multiplication] = {}
+        self._mult: dict[tuple[str, bool], Multiplication] = {}
         self._key_info: dict[str, KeyInfo] = {}
         self._build_sources()
         self._build_predicates()
@@ -474,31 +474,54 @@ class SelectModel:
                     keys.append(key)
         return keys
 
-    def bound_columns(self, alias: str, visited: set[str]) -> set[str]:
-        """Columns of ``alias`` pinned to one value per row of the ``visited`` sources."""
+    def group_refs(self) -> set[ColRef]:
+        """Columns named directly in GROUP BY. Within one group each has a single value."""
+        refs: set[ColRef] = set()
+        group = self.group
+        if group is not None:
+            for expr in group.expressions:
+                inner = strip(expr)
+                if isinstance(inner, exp.Column) and inner.table in self.sources:
+                    refs.add((inner.table, inner.name))
+        return refs
+
+    def bound_columns(self, alias: str, visited: set[str], per_group: bool = False) -> set[str]:
+        """Columns of ``alias`` pinned to one value per row of the ``visited`` sources.
+
+        With ``per_group`` the question is asked inside one GROUP BY group, where
+        grouped columns are constant too.
+        """
+        fixed: set[ColRef] = set(self.bound)
+        if per_group:
+            fixed |= self.group_refs()
         columns: set[str] = set()
         candidates = {ref for ref in self._parent if ref[0] == alias}
-        candidates |= {ref for ref in self.bound if ref[0] == alias}
+        candidates |= {ref for ref in fixed if ref[0] == alias}
         for ref in candidates:
-            if ref in self.bound:
+            if ref in fixed:
                 columns.add(ref[1])
                 continue
             for member in self.class_members(ref):
-                if member in self.bound or (member[0] != alias and member[0] in visited):
+                if member in fixed or (member[0] != alias and member[0] in visited):
                     columns.add(ref[1])
                     break
         return columns
 
-    def joins_at_most_one(self, alias: str, visited: set[str]) -> bool:
+    def joins_at_most_one(self, alias: str, visited: set[str], per_group: bool = False) -> bool:
         info = self.key_info(alias)
         if not info.keys:
             return False
-        bound = self.bound_columns(alias, visited)
+        bound = self.bound_columns(alias, visited, per_group)
         return any(key <= bound for key in info.keys)
 
-    def multiplied(self, alias: str) -> Multiplication:
-        """Whether the other sources can repeat rows of ``alias`` in the join result."""
-        cached = self._mult.get(alias)
+    def multiplied(self, alias: str, per_group: bool = False) -> Multiplication:
+        """Whether the other sources can repeat rows of ``alias`` in the join result.
+
+        ``per_group`` asks the same about the rows inside a single GROUP BY group,
+        which is what matters to an aggregate.
+        """
+        cache_key = (alias, per_group)
+        cached = self._mult.get(cache_key)
         if cached is not None:
             return cached
         visited = {alias}
@@ -506,7 +529,7 @@ class SelectModel:
         while changed:
             changed = False
             for other in self.sources:
-                if other not in visited and self.joins_at_most_one(other, visited):
+                if other not in visited and self.joins_at_most_one(other, visited, per_group):
                     visited.add(other)
                     changed = True
         result = Multiplication()
@@ -527,7 +550,7 @@ class SelectModel:
                 result.state = YES
             elif result.state != YES:
                 result.state = MAYBE
-        self._mult[alias] = result
+        self._mult[cache_key] = result
         return result
 
     def _reachable(self, alias: str) -> set[str]:

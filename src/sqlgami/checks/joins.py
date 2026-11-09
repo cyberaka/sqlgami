@@ -69,7 +69,7 @@ def _repeat_state(model: SelectModel, aliases: Iterable[str]) -> tuple[str, list
     repeated: the joined rows are then at that source's grain.
     """
     aliases = list(aliases)
-    states = {alias: model.multiplied(alias) for alias in aliases}
+    states = {alias: model.multiplied(alias, per_group=True) for alias in aliases}
     if not states or any(m.state == NO for m in states.values()):
         return NO, [], []
     culprits: list[str] = []
@@ -92,7 +92,7 @@ def _uniqueness_probes(
             return  # cannot probe a derived source; leave the finding as it is
     for culprit in culprits:
         source = model.sources[culprit]
-        columns = sorted(model.bound_columns(culprit, visited | (set(model.sources) - {culprit})))
+        columns = sorted(model.bound_columns(culprit, visited | (set(model.sources) - {culprit}), per_group=True))
         if not columns:
             return
         ctx.probes.append(Probe(PROBE_UNIQUE, source.table, tuple(columns), finding))

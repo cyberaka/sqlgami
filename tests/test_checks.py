@@ -434,3 +434,58 @@ def test_soft_delete():
         "WITH live AS (SELECT * FROM customers WHERE deleted_at IS NULL) SELECT COUNT(*) FROM live"
     ).has("soft_deleted_rows")
     assert not scorer.explain("SELECT COUNT(*) FROM orders").has("soft_deleted_rows")
+
+
+# ------------------------------------------------- grouping, history, as-of
+
+MEMBERS_DDL = """
+CREATE TABLE users (user_id INT PRIMARY KEY, email TEXT NOT NULL, deleted_at TIMESTAMP);
+CREATE TABLE memberships (user_id INT NOT NULL, tenant_id INT NOT NULL, role TEXT, left_at TIMESTAMP,
+                          PRIMARY KEY (user_id, tenant_id));
+CREATE TABLE tax_rates (tax_rate_id INT PRIMARY KEY, jurisdiction_id INT NOT NULL, pct INT NOT NULL,
+                        effective_from DATE NOT NULL, effective_to DATE);
+CREATE TABLE jurisdictions (jurisdiction_id INT PRIMARY KEY, code TEXT NOT NULL);
+CREATE VIEW current_rates_v AS SELECT tax_rate_id, jurisdiction_id, pct FROM tax_rates WHERE effective_to IS NULL;
+"""
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_fan_out_is_judged_inside_each_group(dialect):
+    scorer = Scorer(dialect, catalog=Catalog.from_ddl(MEMBERS_DDL, dialect))
+    # A user belongs to many tenants, but only once to each: per tenant, no user repeats.
+    per_tenant = scorer.explain(
+        "SELECT m.tenant_id, COUNT(u.user_id) FROM memberships m JOIN users u ON u.user_id = m.user_id "
+        "GROUP BY m.tenant_id"
+    )
+    assert not per_tenant.has("fan_out"), per_tenant.summary()
+    overall = scorer.explain(
+        "SELECT COUNT(u.user_id) FROM users u JOIN memberships m ON m.user_id = u.user_id"
+    )
+    assert overall.has("fan_out"), overall.summary()
+    by_role = scorer.explain(
+        "SELECT m.role, COUNT(u.user_id) FROM users u JOIN memberships m ON m.user_id = u.user_id GROUP BY m.role"
+    )
+    assert by_role.has("fan_out"), by_role.summary()
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_history_table_read_without_choosing_a_version(dialect):
+    scorer = Scorer(dialect, catalog=Catalog.from_ddl(MEMBERS_DDL, dialect))
+    naive = scorer.explain(
+        "SELECT j.code, r.pct FROM jurisdictions j JOIN tax_rates r ON r.jurisdiction_id = j.jurisdiction_id"
+    )
+    finding = next(f for f in naive.findings if f.code == "history_rows")
+    assert finding.evidence["marker"] == "effective_to"
+    for sql in (
+        "SELECT j.code, r.pct FROM jurisdictions j JOIN tax_rates r ON r.jurisdiction_id = j.jurisdiction_id "
+        "WHERE r.effective_to IS NULL",
+        "SELECT j.code, r.pct FROM jurisdictions j JOIN current_rates_v r ON r.jurisdiction_id = j.jurisdiction_id",
+        "SELECT pct FROM tax_rates WHERE effective_from <= '2026-03-01' "
+        "AND (effective_to IS NULL OR effective_to > '2026-03-01')",
+        "SELECT pct FROM (SELECT pct, ROW_NUMBER() OVER (PARTITION BY jurisdiction_id ORDER BY effective_from DESC) rn "
+        "FROM tax_rates) x WHERE rn = 1",
+        "SELECT code FROM jurisdictions",
+    ):
+        report = scorer.explain(sql)
+        assert not report.has("history_rows"), sql + "\n" + report.summary()
+        assert not report.has("date_boundary"), sql + "\n" + report.summary()

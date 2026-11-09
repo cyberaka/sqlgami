@@ -325,7 +325,7 @@ def _count_grain(asked: _Asked) -> list[Finding]:
     if best is None:
         return []
     alias = best[1]
-    multiplied = root.multiplied(alias)
+    multiplied = root.multiplied(alias, per_group=True)
     if multiplied.state == NO:
         return []
     # Grouping by the entity's own key gives one row per entity; then the count is of something else.

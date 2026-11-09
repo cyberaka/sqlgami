@@ -403,6 +403,10 @@ def _temporal_kind(ctx: CheckContext, model: SelectModel, column: exp.Column) ->
     return None
 
 
+# Columns that mark when something stops. "end > date" is an as-of test, not the start of a range.
+_END_COLUMN = re.compile(r"(_to|_until|_end|^end_|ended_|expires|expiry|expired|due_|_due|closed_|left_at|revoked)", re.IGNORECASE)
+
+
 def _last_day_of_month(day: _dt.date) -> bool:
     return (day + _dt.timedelta(days=1)).month != day.month
 
@@ -506,7 +510,7 @@ def date_boundary(ctx: CheckContext) -> Iterable[Finding]:
                         suggestion=f"Use < '{next_day}'.",
                         bound=text,
                     )
-                elif op == ">" and day.day == 1 and kind == T.DATE:
+                elif op == ">" and day.day == 1 and kind == T.DATE and not _END_COLUMN.search(column.name):
                     yield ctx.finding(
                         "date_boundary",
                         Severity.MEDIUM,

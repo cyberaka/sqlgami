@@ -21,9 +21,11 @@ MENTIONED = "mentioned"  # the column must at least be looked at
 
 
 class _Tracer:
-    def __init__(self, ctx: CheckContext, column_name: str, mode: str) -> None:
+    def __init__(self, ctx: CheckContext, column_name: str | tuple[str, ...], mode: str) -> None:
         self.ctx = ctx
-        self.column_name = column_name
+        # Several names mean "any one of these": the first that a table has is reported,
+        # and covering any of them satisfies the check.
+        self.column_names: tuple[str, ...] = (column_name,) if isinstance(column_name, str) else tuple(column_name)
         self.mode = mode
         self.misses: dict[int, tuple[SelectModel, str, Table, bool]] = {}
         self.satisfied: set[int] = set()
@@ -60,12 +62,14 @@ class _Tracer:
 
         for alias, source in model.sources.items():
             if source.kind == "table" and source.table is not None:
-                column = self.ctx.catalog.column(source.table, self.column_name)
-                if column is None:
+                present = [
+                    c for c in (self.ctx.catalog.column(source.table, n) for n in self.column_names) if c is not None
+                ]
+                if not present:
                     continue
-                ref = (alias, self.ctx.catalog.storage_key(column.name))
+                refs = [(alias, self.ctx.catalog.storage_key(c.name)) for c in present]
                 node_id = id(source.node)
-                if ref in covered:
+                if any(ref in covered for ref in refs):
                     self.satisfied.add(node_id)
                 else:
                     self.misses.setdefault(
@@ -181,4 +185,34 @@ def soft_deleted_rows(ctx: CheckContext) -> Iterable[Finding]:
             suggestion=f"Filter on {alias}.{column} unless deleted rows are wanted.",
             table=table.qualified_name,
             alias=alias,
+        )
+
+
+# Columns that say which version of a row is in force. A table with one of the first group
+# keeps history: several rows per thing, one current.
+_VERSION_END = ("effective_to", "valid_to", "valid_until", "effective_until", "effective_end", "valid_end", "superseded_at")
+_VERSION_FLAGS = ("is_current", "current_flag", "is_latest", "is_active_version")
+_VERSION_START = ("effective_from", "valid_from", "effective_start", "valid_start")
+
+
+@check("history_rows", description="A table that keeps old versions of rows is read without choosing a version.")
+def history_rows(ctx: CheckContext) -> Iterable[Finding]:
+    markers = _VERSION_END + _VERSION_FLAGS
+    for model, alias, table, _ in _Tracer(ctx, markers + _VERSION_START, MENTIONED).run():
+        marker = next((ctx.catalog.column(table, n) for n in markers if ctx.catalog.column(table, n) is not None), None)
+        if marker is None:
+            continue  # only a start date: not clearly a history table
+        source = model.sources[alias]
+        yield ctx.finding(
+            "history_rows",
+            Severity.MEDIUM,
+            (
+                f"{source.label} keeps every past version of a row ({marker.name} marks when a "
+                "version stops applying), and the query never looks at that column, so old "
+                "versions are read alongside the current one."
+            ),
+            suggestion=f"Filter {alias}.{marker.name} IS NULL for current rows, or pick the version in force on a date.",
+            table=table.qualified_name,
+            alias=alias,
+            marker=marker.name,
         )

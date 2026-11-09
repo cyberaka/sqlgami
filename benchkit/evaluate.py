@@ -150,6 +150,8 @@ def evaluate(
     runner = Runner(suite, [engine])
     conn = build.connect(suite, engine, seed)
     scorers: dict[bool, Scorer] = {}
+    glossary_file = suite.path / "glossary.yaml"
+    glossary = glossary_file.read_text(encoding="utf-8") if glossary_file.exists() else None
 
     def scorer_for(question: Question) -> Scorer:
         scoped = question.tenant is not None
@@ -159,6 +161,7 @@ def evaluate(
                 db=conn,
                 tenant_column=suite.tenant_column if scoped else None,
                 soft_delete_column=suite.soft_delete_column,
+                glossary=glossary,
             )
         return scorers[scoped]
 
