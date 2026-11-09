@@ -490,6 +490,8 @@ def inner_join_drops_rows(ctx: CheckContext) -> Iterable[Finding]:
         suggestion="Use a LEFT JOIN (with COALESCE for sums) if every row should appear.",
         entity=entity,
         other=other,
+        entity_table=model.sources[entity].table.name if model.sources[entity].table is not None else entity,
+        limited=model.select.args.get("limit") is not None,
         counts_only=all(isinstance(a, exp.Count) for a in aggregates),
     )
     query = _unmatched_probe(model, entity, other)
@@ -506,3 +508,47 @@ def inner_join_drops_rows(ctx: CheckContext) -> Iterable[Finding]:
             )
         )
     yield finding
+
+
+# ------------------------------------------------------- order among ties
+
+_ORDER_SENSITIVE = tuple(
+    getattr(exp, name)
+    for name in ("RowNumber", "Sum", "Count", "Avg", "FirstValue", "LastValue", "Lag", "Lead", "NthValue", "Ntile")
+    if hasattr(exp, name)
+)
+
+
+@check("window_order_ties", description="A window's ORDER BY does not settle the order of tied rows.")
+def window_order_ties(ctx: CheckContext) -> Iterable[Finding]:
+    """``ROW_NUMBER() OVER (PARTITION BY t ORDER BY issued_at)``: rows with the same issued_at get arbitrary numbers."""
+    for model in ctx.cache.models():
+        for projection in model.select.expressions:
+            for window in walk_own(projection):
+                if not isinstance(window, exp.Window) or not isinstance(window.this, _ORDER_SENSITIVE):
+                    continue
+                order = window.args.get("order")
+                if order is None or not order.expressions:
+                    continue
+                fixed: dict[str, set[str]] = {}
+                complex_key = False
+                for part in list(window.args.get("partition_by") or []) + [o.this for o in order.expressions]:
+                    inner = strip(part)
+                    if isinstance(inner, exp.Column) and inner.table in model.sources:
+                        fixed.setdefault(inner.table, set()).add(inner.name)
+                    else:
+                        complex_key = True
+                if complex_key or len(model.sources) != 1:
+                    continue
+                alias = next(iter(model.sources))
+                info = model.key_info(alias)
+                if not info.certain or any(key <= fixed.get(alias, set()) for key in info.keys):
+                    continue
+                yield ctx.finding(
+                    "window_order_ties",
+                    Severity.LOW,
+                    f"{ctx.snippet(window, 120)} orders by columns that can repeat within a partition, so rows "
+                    "that tie are numbered or accumulated in an arbitrary order that can change between runs.",
+                    window,
+                    suggestion="Add a unique column, such as the key, as the last ORDER BY term.",
+                )

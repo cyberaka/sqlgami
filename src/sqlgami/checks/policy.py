@@ -18,7 +18,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import Scope
 
 from ..catalog import Column, RequiredPredicate, Table
-from ..model import ColRef, SelectModel, strip, walk_own
+from ..model import NO, ColRef, SelectModel, strip, walk_own
 from ..report import Finding, Severity
 from .base import CheckContext, check
 
@@ -36,6 +36,7 @@ class Miss:
     indirect: bool = False  # joined to something that is filtered, but not on a key
     bridge: bool = False  # only passed through on the way to another table
     in_view: bool = False  # the table is read inside a view body, not by the query's author
+    counted: bool = True  # its rows are what the query counts or lists (not a parent it merely joins to)
 
 
 def inside_view(node: exp.Expression) -> bool:
@@ -126,6 +127,7 @@ class _Tracer:
                         indirect=self._loosely_linked(model, alias, anchored),
                         bridge=self._is_bridge(model, alias),
                         in_view=inside_view(source.node),
+                        counted=len(model.sources) == 1 or model.multiplied(alias).state == NO,
                     ),
                 )
             elif source.kind == "derived" and source.scope is not None:
@@ -485,8 +487,10 @@ def soft_deleted_rows(ctx: CheckContext) -> Iterable[Finding]:
             continue  # the view's author decided what the view shows
         source = miss.model.sources[miss.alias]
         required = ctx.catalog.soft_delete_policy == "required"
-        if miss.bridge:
-            severity = Severity.MEDIUM if required else Severity.LOW
+        if miss.bridge or not miss.counted:
+            # A parent or pass-through table: whether its own deletion matters is a convention
+            # that differs between organisations, so this stays a low-key note.
+            severity = Severity.LOW
         else:
             severity = Severity.HIGH if required else Severity.MEDIUM
         yield ctx.finding(
@@ -496,12 +500,19 @@ def soft_deleted_rows(ctx: CheckContext) -> Iterable[Finding]:
                 f"{source.label} marks deleted rows with {column}, and the query never looks "
                 "at that column, so deleted rows are counted along with live ones."
                 + (" Here the table is only passed through on the way to another one." if miss.bridge else "")
+                + (
+                    " Here it is a parent of the rows being counted, not what is counted."
+                    if not miss.counted and not miss.bridge
+                    else ""
+                )
                 + (" Policy here is that deleted rows are excluded unless asked for." if required else "")
             ),
             suggestion=f"Filter on {miss.alias}.{column} unless deleted rows are wanted.",
             table=miss.table.qualified_name,
             alias=miss.alias,
             bridge=miss.bridge,
+            counted=miss.counted,
+            table_name=miss.table.name,
             policy=ctx.catalog.soft_delete_policy,
         )
 

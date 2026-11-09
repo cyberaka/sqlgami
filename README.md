@@ -128,6 +128,7 @@ Static checks, each reported as a finding with a severity:
 | `self_comparison`, `empty_string_comparison` | `x <> x`; `x = ''` where missing values are NULL |
 | `date_arithmetic` | a bare number added to a date where the engine does not define that |
 | `json_path` | a JSON path no row has (found in `sample` mode) |
+| `window_order_ties` | `ROW_NUMBER()` or a running total ordered by columns that can tie |
 
 When you pass the question, sqlgami also compares it with the SQL. These checks
 are word-and-structure matching with no language model involved:
@@ -146,6 +147,8 @@ are word-and-structure matching with no language model involved:
 | `comparison_operator` | "greater than 50" written as `>= 50`, "at least" as `>`, and so on |
 | `question_flag_unused` | "active plans" where the table has an `is_active` column the SQL ignores |
 | `pattern_match_missing` | "starts with" answered by an exact comparison |
+| `order_missing` | sorted output asked for, no `ORDER BY` |
+| `output_columns` | "Return id and name" answered with a different number of columns |
 
 The question also firms up earlier findings: a missing soft-delete filter is
 raised when the question says "non-deleted" and dropped when it asks about

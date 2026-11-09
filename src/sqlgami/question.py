@@ -92,6 +92,8 @@ def run_question_checks(ctx: CheckContext, question: str, glossary: str | None =
         _comparison_words,
         _flags_named_but_unused,
         _pattern_match,
+        _sorting,
+        _output_columns,
     ):
         try:
             findings.extend(check(asked) or [])
@@ -442,7 +444,14 @@ def _top_n(asked: _Asked) -> list[Finding]:
     asc_words = {w for w in words if re.fullmatch(_ASC_WORDS, w)}
     select = asked.tree
     order = select.args.get("order") if isinstance(select, exp.Query) else None
-    if order is not None and limit is not None and order.expressions and bool(desc_words) != bool(asc_words):
+    answered_by_aggregate = (desc_words and asked.has(exp.Max, exp.ArgMax)) or (asc_words and asked.has(exp.Min, exp.ArgMin))
+    if (
+        order is not None
+        and limit is not None
+        and order.expressions
+        and bool(desc_words) != bool(asc_words)
+        and not answered_by_aggregate
+    ):
         first = order.expressions[0]
         is_desc = bool(first.args.get("desc"))
         wants_desc = bool(desc_words)
@@ -649,6 +658,7 @@ def _has_anti_pattern(asked: _Asked) -> bool:
 def _negation(asked: _Asked) -> list[Finding]:
     # Asides in parentheses explain; they are not part of what is being asked for.
     main_text = " ".join(_PARENTHETICAL.sub(" ", asked.text).split())
+    main_text = re.sub(r"\b(?:is\s+)?not\s+null\b", " ", main_text, flags=re.IGNORECASE)
     related = _NO_RELATED.search(main_text)
     if related is not None and _NOT_A_NEGATION.search(main_text):
         related = None
@@ -907,6 +917,91 @@ def _pattern_match(asked: _Asked) -> list[Finding]:
     ]
 
 
+# ------------------------------------------------------- order and columns
+
+_SORT_WORDS = re.compile(
+    r"\b(sort(?:ed)?\s+(?:by|on|alphabetically|ascending|descending|in)|order(?:ed)?\s+by|"
+    r"in\s+(?:ascending|descending|alphabetical|chronological|reverse)\s+order|sorted\b)",
+    re.IGNORECASE,
+)
+_RETURN_LIST = re.compile(r"(?:^|[.;?)]\s+)(?:return|returns|output|show)\s+(?:only\s+|just\s+)?([^.;?]+)", re.IGNORECASE)
+# "List display_name of every plan ...", "List all plans with their code and display_name"
+_LIST_OF = re.compile(r"^\s*(?:list|show|give)\s+(?:the\s+)?([\w`,\s]+?)\s+(?:of|for)\s+(?:every|each|all)\b", re.IGNORECASE)
+_WITH_THEIR = re.compile(r"^\s*(?:list|show|give|return)\b[^.;?]*?\bwith\s+(?:their|its)\s+([^.;?]+)", re.IGNORECASE)
+_LIST_SPLIT = re.compile(r"\s*,\s*(?:and\s+)?|\s+and\s+")
+_LIST_STOP = re.compile(r"\b(sorted|sort|ordered|order by|where|for|per|grouped|break|with ties|as integer|rounded)\b", re.IGNORECASE)
+
+
+def _sorting(asked: _Asked) -> list[Finding]:
+    match = _SORT_WORDS.search(asked.text)
+    if match is None:
+        return []
+    root = asked.tree
+    if not isinstance(root, exp.Query) or root.args.get("order") is not None:
+        return []
+    if asked.root is not None and asked.root.group is None and asked.root.own_aggregates():
+        return []  # a single row has no order
+    return [
+        asked.finding(
+            "order_missing",
+            Severity.HIGH,
+            f"The question asks for sorted output (\"{match.group(0)}\"), but the query has no ORDER BY, "
+            "so the rows come back in whatever order the engine produces.",
+            suggestion="Add the ORDER BY the question asks for.",
+            phrase=match.group(0),
+        )
+    ]
+
+
+def _listed_outputs(text: str, column_names: set[str] | None = None) -> int | None:
+    """How many output columns a sentence such as 'Return tenant_id and the invoice count.' lists."""
+    match = _RETURN_LIST.search(text) or _LIST_OF.search(text) or _WITH_THEIR.search(text)
+    if match is None:
+        return None
+    listed = match.group(1)
+    stop = _LIST_STOP.search(listed)
+    if stop:
+        listed = listed[: stop.start()]
+    listed = _PARENTHETICAL.sub(" ", listed).strip(" ,")
+    if not listed:
+        return None
+    items = [item.strip() for item in _LIST_SPLIT.split(listed) if item.strip()]
+    if not items or any(len(item.split()) > 7 for item in items):
+        return None  # not a plain list of columns
+    if match.re is not _RETURN_LIST:
+        # The looser phrasings only count when every item is the name of a real column.
+        known = column_names or set()
+        for item in items:
+            name = re.sub(r"^(?:the|their|its)\s+", "", item.lower()).strip("`\"' ").replace(" ", "_")
+            if name not in known:
+                return None
+    return len(items)
+
+
+def _output_columns(asked: _Asked) -> list[Finding]:
+    column_names = {c.name.lower() for t in asked.ctx.analysis.tables.values() for c in t.columns}
+    wanted = _listed_outputs(asked.text, column_names)
+    root = asked.tree
+    if wanted is None or not isinstance(root, exp.Query):
+        return []
+    select = root
+    if not isinstance(select, exp.Select) or select.is_star:
+        return []  # a UNION can merge several listed things into one column
+    returned = len(select.expressions)
+    if returned == wanted:
+        return []
+    return [
+        asked.finding(
+            "output_columns",
+            Severity.MEDIUM,
+            f"The question lists {wanted} thing{'s' if wanted != 1 else ''} to return, but the query "
+            f"returns {returned} column{'s' if returned != 1 else ''}.",
+            wanted=wanted,
+            returned=returned,
+        )
+    ]
+
+
 # ----------------------------------------------- findings the question firms up
 
 _NOT_DELETED = re.compile(
@@ -916,7 +1011,7 @@ _NOT_DELETED = re.compile(
 )
 _WANTS_DELETED = re.compile(r"\b(including\s+(?:soft[- ])?deleted|deleted\s+\w+|were deleted|was deleted|soft[- ]deleted)\b", re.IGNORECASE)
 _CURRENT = re.compile(r"\b(current|currently|latest|present|in force|as of now|today's)\b", re.IGNORECASE)
-_EVERY = re.compile(r"\b(for every|for each|every|each|for all|all)\b", re.IGNORECASE)
+_EVERY = re.compile(r"\b(for every|for each|every|each|for all)\b", re.IGNORECASE)
 _DISTINCT_WORDS = re.compile(r"\b(distinct|unique|different|de-?duplicated|without duplicates|no duplicates)\b", re.IGNORECASE)
 _LISTING = re.compile(r"^\s*(list|which|show|return|give|name|find|what are)\b", re.IGNORECASE)
 
@@ -930,15 +1025,25 @@ def adjust_findings(findings: list[Finding], question: str) -> None:
     text = " ".join((question or "").split())
     if not text:
         return
-    asks_not_deleted = bool(_NOT_DELETED.search(text))
+    lowered = text.lower()
+    not_deleted = list(_NOT_DELETED.finditer(text))
+    asks_not_deleted = bool(not_deleted)
     asks_deleted = bool(_WANTS_DELETED.search(text)) and not asks_not_deleted
+    # "non-deleted tenants": which things the question wants live. Empty when it names none.
+    named_live = " ".join(lowered[m.end(): m.end() + 30] for m in not_deleted)
+    names_a_noun = any(re.match(r"\s*[a-z_]{3,}", lowered[m.end():]) for m in not_deleted) and not all(
+        re.match(r"\s*($|[?.,;)])", lowered[m.end():]) for m in not_deleted
+    )
     for finding in list(findings):
         if finding.code == "soft_deleted_rows":
             if asks_deleted:
                 findings.remove(finding)
             elif asks_not_deleted and not finding.evidence.get("bridge"):
-                finding.severity = Severity.HIGH
-                finding.message += " The question explicitly asks for rows that are not deleted."
+                table_name = str(finding.evidence.get("table_name") or "")
+                named = _entity_position(named_live, table_name) is not None if table_name else False
+                if named or (finding.evidence.get("counted") and not names_a_noun):
+                    finding.severity = Severity.HIGH
+                    finding.message += " The question explicitly asks for rows that are not deleted."
         elif finding.code == "history_rows" and _CURRENT.search(text):
             finding.severity = Severity.HIGH
             finding.message += " The question asks for the current state."
@@ -948,7 +1053,13 @@ def adjust_findings(findings: list[Finding], question: str) -> None:
                 finding.message += " The question asks for distinct values."
             elif _LISTING.search(text) and finding.severity == Severity.LOW:
                 finding.severity = Severity.MEDIUM
-        elif finding.code == "inner_join_drops_rows" and _EVERY.search(text):
+        elif finding.code == "inner_join_drops_rows":
+            if finding.evidence.get("limited"):
+                continue  # a top-N query: things with nothing to count would rank last anyway
+            every = [m for m in _EVERY.finditer(text)]
+            entity_table = str(finding.evidence.get("entity_table") or "")
+            if not any(_entity_position(lowered[m.end(): m.end() + 40], entity_table) is not None for m in every):
+                continue  # "every" is not said of the thing that would go missing
             check = finding.evidence.get("data_check")
             if check == "unmatched":
                 # A count of zero is an answer the question asked for; a missing sum is more arguable.

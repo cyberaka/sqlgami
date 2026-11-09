@@ -432,11 +432,20 @@ def test_soft_delete_policy_levels(engine, db):
         assert next(f for f in report.findings if f.code == "soft_deleted_rows").severity == Severity.HIGH
         assert report.score <= 0.4
         assert not required.sample("SELECT COUNT(*) FROM customers WHERE deleted_at IS NULL").has("soft_deleted_rows")
-        # A table only passed through on the way to another is a lesser matter.
+        # A parent or pass-through table is a lesser matter: the rule is about the rows being counted.
         bridge = required.sample(
             "SELECT o.id, o.total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.total > 0 ORDER BY o.id"
         )
-        assert next(f for f in bridge.findings if f.code == "soft_deleted_rows").severity == Severity.MEDIUM
+        assert next(f for f in bridge.findings if f.code == "soft_deleted_rows").severity == Severity.LOW
+        parent = required.sample(
+            "SELECT c.id, COUNT(o.id) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id ORDER BY c.id"
+        )
+        assert next(f for f in parent.findings if f.code == "soft_deleted_rows").severity == Severity.LOW
+        named = required.sample(
+            "SELECT c.id, COUNT(o.id) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id ORDER BY c.id",
+            "For each non-deleted customer, how many orders do they have?",
+        )
+        assert next(f for f in named.findings if f.code == "soft_deleted_rows").severity == Severity.HIGH
 
 
 def test_validity_dates_alone_do_not_make_a_history_table():
@@ -460,3 +469,45 @@ def test_filters_inside_a_view_are_the_view_authors_business():
     s = Scorer("postgres", catalog=ddl, soft_delete_column="deleted_at", soft_delete_policy="required")
     assert not s.explain("SELECT name FROM login_names_v ORDER BY id").has("soft_deleted_rows")
     assert s.explain("SELECT u.name FROM users u ORDER BY u.id").has("soft_deleted_rows")
+
+
+def test_sorting_and_listed_outputs(scorer):
+    unsorted = scorer.sample("SELECT name FROM customers", "List customer names, sorted alphabetically.")
+    assert next(f for f in unsorted.findings if f.code == "order_missing").severity == Severity.HIGH
+    assert not scorer.sample("SELECT name FROM customers ORDER BY name", "List customer names, sorted alphabetically.").has("order_missing")
+    assert not scorer.sample("SELECT COUNT(*) FROM customers", "Count customers. Sort by name.").has("order_missing")
+
+    extra = scorer.sample("SELECT id, name, country FROM customers ORDER BY id", "Return id and name. Sort by id.")
+    finding = next(f for f in extra.findings if f.code == "output_columns")
+    assert (finding.evidence["wanted"], finding.evidence["returned"]) == (2, 3)
+    for question, sql, wanted in (
+        ("Which customers are in the US? Return name, sorted by name.", "SELECT id, name FROM customers ORDER BY name", 1),
+        ("List name of every customer in the US, sorted by name.", "SELECT name, country FROM customers ORDER BY name", 1),
+        ("List all customers with their name and country, sorted by name.", "SELECT id, name, country FROM customers ORDER BY name", 2),
+    ):
+        finding = next(f for f in scorer.sample(sql, question).findings if f.code == "output_columns")
+        assert finding.evidence["wanted"] == wanted, question
+    for question, sql in (
+        ("Return id and name. Sort by id.", "SELECT id, name FROM customers ORDER BY id"),
+        ("List all customers with their name and country, sorted by name.", "SELECT name, country FROM customers ORDER BY name"),
+        ("List the customers of every tenant that have an order", "SELECT c.name, c.tenant_id FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) ORDER BY 1"),
+        ("Return id, name, and country, sorted by id.", "SELECT id, name, country FROM customers ORDER BY id"),
+        ("Return the customer name.", "SELECT name FROM customers ORDER BY name"),
+        ("How many customers are there?", "SELECT COUNT(*), MAX(id) FROM customers"),
+    ):
+        assert not scorer.sample(sql, question).has("output_columns"), question
+
+
+def test_row_numbers_among_ties(scorer):
+    loose = scorer.sample("SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY status) AS seq FROM orders ORDER BY id")
+    assert next(f for f in loose.findings if f.code == "window_order_ties").severity == Severity.LOW
+    tight = scorer.sample("SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY status, id) AS seq FROM orders ORDER BY id")
+    assert not tight.has("window_order_ties")
+
+
+def test_top_n_query_is_not_blamed_for_dropping_empty_groups(scorer):
+    report = scorer.sample(
+        "SELECT c.name FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name ORDER BY COUNT(*) DESC, c.name LIMIT 1",
+        "Across all tenants, which customer has the most orders?",
+    )
+    assert not report.findings_at_least(Severity.MEDIUM), report.summary()
