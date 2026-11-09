@@ -147,3 +147,51 @@ scales:
   pct_e6:  "percentage = pct_e6 / 1e6"
   unit_price_e4: "unit price in cents = unit_price_e4 / 1e4"
   money_cents: "minor units (per currency's minor_unit_scale)"
+
+# ---- Gold-writing rules (added 2026-11-10 after 3b + dev adjudication) ----
+gold_writing_rules:
+  exact_columns:
+    rule: >
+      Gold returns EXACTLY the columns the question asks for, in the requested order.
+      No helper columns, no "nice to have" columns, no debug columns. If the question
+      doesn't specify an order, add one explicit ORDER BY to make output deterministic
+      and state the sort in the question.
+    rationale: >
+      The validator compares columns by position; an unrequested column shifts every
+      later column and the whole row mismatches. An extra join to fetch an unrequested
+      column can also fan out rows.
+  no_gratuitous_deleted_filters:
+    rule: >
+      Do NOT add deleted_at IS NULL filters on auxiliary tables unless the question
+      explicitly asks for them. soft_delete_default is NOT transitive — the default
+      applies to the primary entity in scope, not to every joined table.
+    rationale: >
+      Dropping rows because a joined dimension is soft-deleted (e.g. an inner join
+      to tenants WHERE t.deleted_at IS NULL) silently drops disputes/events/invoices
+      the question asked for in full.
+  zero_rows:
+    rule: >
+      When the question says "for each X and each Y", or "for every" something, return
+      the full Cartesian grid with zero-value fill where the data is absent. Default
+      to zero rows per zero_rows_default; never let an INNER JOIN prune the grid.
+    rationale: >
+      Missing zero rows reads as "no data" when it means "zero activity", breaking
+      downstream aggregation and visualization.
+  no_filter_in_left_join_on:
+    rule: >
+      A filter expression on columns of the RIGHT side of a LEFT JOIN must go in
+      the WHERE clause (wrapped with "IS NULL" handling) or in a subquery — never
+      in the ON clause, where it does not filter at all.
+    rationale: >
+      "LEFT JOIN t ON t.deleted_at IS NULL" keeps every row from the left with t.*
+      as NULL, so the deleted_at filter is a no-op; the authoring intent was to
+      exclude deleted t rows.
+  gold_and_equivalent_must_differ:
+    rule: >
+      When writing an equivalent, deliberately pick a different structural approach
+      (correlated subquery vs window, EXCEPT vs NOT IN, CTE vs inline). An equivalent
+      authored with the same interpretation as the gold cannot catch a wrong
+      interpretation in the gold.
+    rationale: >
+      This is how the 3b and dev adjudication rounds ended up shipping co-wrong gold
+      and equivalents.

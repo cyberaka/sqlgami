@@ -26,14 +26,10 @@ def _unparen(node: exp.Expression) -> exp.Expression:
     return node
 
 
-def _is_scalar_extreme(node: exp.Expression, dialect: str) -> bool:
-    """SQLite's MAX(a, b) and MIN(a, b): with several arguments they return the greater or lesser one."""
-    return dialect == "sqlite" and isinstance(node, (exp.Max, exp.Min)) and bool(node.expressions)
-
-
 def _aggregates(model: SelectModel, dialect: str) -> list[exp.AggFunc]:
-    """The SELECT's own aggregate calls, leaving out SQLite's scalar MAX and MIN."""
-    return [a for a in model.own_aggregates() if not _is_scalar_extreme(a, dialect)]
+    """The SELECT's own aggregate calls. (SQLite's scalar MAX(a, b) and MIN(a, b) are rewritten to
+    GREATEST and LEAST during analysis, so they never appear here.)"""
+    return model.own_aggregates()
 
 
 def _determining_keys(model: SelectModel, alias: str, dialect: str) -> list[frozenset[str]]:
@@ -111,7 +107,7 @@ def _ungrouped_columns(model: SelectModel, dialect: str) -> list[exp.Column]:
             for column in _outer_references(model, node):
                 judge(column)
             return
-        if isinstance(node, exp.AggFunc) and not is_window_function(node) and not _is_scalar_extreme(node, dialect):
+        if isinstance(node, exp.AggFunc) and not is_window_function(node):
             return
         if isinstance(node, (exp.Filter, exp.WithinGroup)) and isinstance(node.this, exp.AggFunc):
             if not is_window_function(node.this):

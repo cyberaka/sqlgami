@@ -1,9 +1,12 @@
 """Run SQL on a bench database and compare result sets across seeds and engines.
 
-Comparison ignores column names always, and row order unless the question asks
-for an order. Values are brought to a common form first, because engines hand
-back the same data differently: SQLite returns a timestamp as text and a
-boolean as 0/1, DuckDB returns a ``datetime`` and ``True``.
+Comparison is positional, and ignores row order unless the question asks for an
+order. When both results use the same set of column names, the columns are
+first put in the same order by name, so a candidate that lists the right
+columns in another order is not wrong. Values are brought to a common form
+first, because engines hand back the same data differently: SQLite returns a
+timestamp as text and a boolean as 0/1, DuckDB returns a ``datetime`` and
+``True``.
 """
 
 from __future__ import annotations
@@ -112,12 +115,36 @@ def _cells_equal(a: Any, b: Any) -> bool:
     return a == b
 
 
-def same_rows(a: Sequence[tuple], b: Sequence[tuple], ordered: bool = False) -> tuple[bool, str]:
+def column_order_by_name(a_columns: Sequence[str] | None, b_columns: Sequence[str] | None) -> list[int] | None:
+    """The one permutation of ``b``'s columns that lines their names up with ``a``'s, or ``None``.
+
+    Only when both sides name every column once and use the same set of names.
+    """
+    if not a_columns or not b_columns or len(a_columns) != len(b_columns):
+        return None
+    left = [str(c).lower() for c in a_columns]
+    right = [str(c).lower() for c in b_columns]
+    if len(set(left)) != len(left) or len(set(right)) != len(right) or set(left) != set(right):
+        return None
+    order = [right.index(name) for name in left]
+    return None if order == list(range(len(order))) else order
+
+
+def same_rows(
+    a: Sequence[tuple],
+    b: Sequence[tuple],
+    ordered: bool = False,
+    a_columns: Sequence[str] | None = None,
+    b_columns: Sequence[str] | None = None,
+) -> tuple[bool, str]:
     """Whether two result sets hold the same data. Returns ``(equal, reason)``."""
     if len(a) != len(b):
         return False, f"{len(a)} rows against {len(b)}"
     left = [tuple(canonical(v) for v in row) for row in a]
     right = [tuple(canonical(v) for v in row) for row in b]
+    order = column_order_by_name(a_columns, b_columns)
+    if order is not None:
+        right = [tuple(row[i] for i in order) for row in right]
     if left and right and len(left[0]) != len(right[0]):
         return False, f"{len(left[0])} columns against {len(right[0])}"
     if not ordered:
@@ -137,4 +164,4 @@ def same_outcome(a: Outcome, b: Outcome, ordered: bool = False) -> tuple[bool, s
         if not a.ok and not b.ok:
             return False, "both fail to run"
         return False, f"one fails to run: {a.error or b.error}"
-    return same_rows(a.rows, b.rows, ordered)
+    return same_rows(a.rows, b.rows, ordered, a.columns, b.columns)

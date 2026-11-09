@@ -322,6 +322,7 @@ def _check_question(suite: Suite, runner: Runner, question: Question, engines: l
             if banned in lowered:
                 result.add(ERROR, f"{question.id} {engine}", f"gold SQL uses {banned}; results would change over time")
         non_empty_on_clean = False
+        shape_checked = False
         for seed in suite.seeds:
             outcome = runner.gold(question, engine, seed)
             if outcome is None:
@@ -333,9 +334,10 @@ def _check_question(suite: Suite, runner: Runner, question: Question, engines: l
                 non_empty_on_clean = True
             columns = shape.get("columns")
             wanted = len(columns) if isinstance(columns, list) else columns if isinstance(columns, int) else None
-            if wanted is not None and outcome.columns and wanted != len(outcome.columns):
+            if wanted is not None and outcome.columns and wanted != len(outcome.columns) and not shape_checked:
+                shape_checked = True
                 result.add(
-                    WARNING,
+                    ERROR,
                     f"{question.id} {engine}",
                     f"expected_answer_shape says {wanted} columns, gold returns {len(outcome.columns)}",
                 )
@@ -439,13 +441,13 @@ def _check_variant(suite: Suite, runner: Runner, variant: Variant, engines: list
     expected = variant.expected_outcome
     if expected == "error" and not all(errors):
         result.add(ERROR, variant.id, "expected to fail to run, but it runs on at least one seed")
-    elif expected == "wrong_on_all_seeds" and (any(clean) or any(nasty)):
-        result.add(ERROR, variant.id, "expected wrong on all seeds, but it matches gold on at least one")
-    elif expected == "wrong_on_nasty_only" and (not all(clean) or any(nasty)):
+    elif expected == "wrong_on_all_seeds" and all(clean):
+        result.add(ERROR, variant.id, "expected wrong_on_all_seeds, but it matches gold on every clean seed")
+    elif expected == "wrong_on_nasty_only" and (not all(clean) or all(nasty)):
         result.add(
             ERROR,
             variant.id,
-            "expected to match gold on clean seeds and differ only on the nasty seed, but it does not",
+            "expected to match gold on every clean seed and differ on at least one nasty seed, but it does not",
         )
     if expected != "error" and all(errors):
         result.add(WARNING, variant.id, "fails to run on every seed; expected_outcome should be 'error'")

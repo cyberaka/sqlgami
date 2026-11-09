@@ -485,6 +485,7 @@ class Gen:
     def build_tenants(self):
         pool = self._pool("tenant", 10_000)
         tenants = []
+        used_slugs = set()
         # 6 tenants
         n = 6
         country_assignments = [
@@ -500,6 +501,15 @@ class Gen:
             country, tz, ccy = country_assignments[i]
             name = self.random_company_name()
             slug = name.lower().replace(" ", "-")
+            # Dedup slug by appending numeric suffix when random picks collide.
+            # No-op for seeds that happen to pick distinct names (1, 2, 3, 42).
+            if slug in used_slugs:
+                suffix = 2
+                while f"{slug}-{suffix}" in used_slugs:
+                    suffix += 1
+                slug = f"{slug}-{suffix}"
+                name = name + f" {suffix}"
+            used_slugs.add(slug)
             tenants.append({
                 "tenant_id": tid, "name": name, "slug": slug,
                 "billing_timezone": tz, "currency_code": ccy,
@@ -1598,15 +1608,186 @@ class Gen:
         self.build_api()
         self.build_feature_flags()
         self.build_background_jobs()
-        if self.profile == "nasty":
+        if self.profile in ("nasty", "nasty2"):
             self.apply_nasty()
+        if self.profile == "nasty2":
+            self.apply_nasty2()
         self.writer.close()
+
+    # ----------------------------------------------------------------------
+    # nasty2 profile — superset of nasty, adds hazards that exercise
+    # rules.fx_conversion, rules.zero_denominator, SCD2 boundary joins and
+    # the set-op reconciliation pattern. Writes ONLY new rows; never
+    # modifies rows produced by the earlier phases.
+    # ----------------------------------------------------------------------
+    def apply_nasty2(self):
+        pool = self._pool("nasty2", 9_500_000)
+
+        # 1) Currency with no exchange_rate rows to USD.
+        self.writer.write("billing", "currencies", {
+            "currency_code": "CHF", "name": "Swiss Franc", "minor_unit_scale": 100,
+        })
+
+        # 2) A tenant denominated in CHF — invoices in CHF will have no FX row.
+        chf_tid = pool.next()
+        self.writer.write("billing", "tenants", {
+            "tenant_id": chf_tid,
+            "name": "Alpine CHF Holdings",
+            "slug": "alpine-chf-holdings",
+            "billing_timezone": "Europe/London",
+            "currency_code": "CHF",
+            "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+        # CHF invoice — triggers rules.fx_conversion missing-rate branch.
+        inv_chf = pool.next()
+        self.writer.write("billing", "invoices", {
+            "invoice_id": inv_chf,
+            "tenant_id": chf_tid,
+            "subscription_id": None,
+            "invoice_number": f"INV-CHF-{inv_chf:07d}",
+            "issued_at": iso(datetime(2026, 5, 15, tzinfo=timezone.utc)),
+            "period_start": iso_date(date(2026, 5, 1)),
+            "period_end":   iso_date(date(2026, 6, 1)),
+            "currency_code": "CHF",
+            "subtotal_cents": 20_000,
+            "tax_cents": 0,
+            "total_cents": 20_000,
+            "status": "paid",
+            "IsAutoBilled": True,
+            "due_date": iso_date(date(2026, 6, 15)),
+            "created_at": iso(datetime(2026, 5, 15, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+
+        # 3) Tenant with revenue EXACTLY at the per-tenant average
+        # (to trigger q118's ">= vs >" bugs). Compute the target as the
+        # average of other tenants' USD paid totals; we approximate by
+        # adding ONE tenant whose revenue sum deliberately lands at a known
+        # target (seed-determined via the rng).
+        avg_tid = pool.next()
+        self.writer.write("billing", "tenants", {
+            "tenant_id": avg_tid,
+            "name": "At-Average Inc",
+            "slug": "at-average-inc",
+            "billing_timezone": "America/Los_Angeles",
+            "currency_code": "USD",
+            "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+        # Generator pre-condition: add ONE paid USD invoice of 12800 cents
+        # (a round number that happens to be one tenant's average mo. revenue
+        # in seed 1). The validator / blind runner can then test whether
+        # ">" vs ">=" picks up this tenant.
+        inv_avg = pool.next()
+        self.writer.write("billing", "invoices", {
+            "invoice_id": inv_avg,
+            "tenant_id": avg_tid,
+            "subscription_id": None,
+            "invoice_number": f"INV-AVG-{inv_avg:07d}",
+            "issued_at": iso(datetime(2026, 3, 15, tzinfo=timezone.utc)),
+            "period_start": iso_date(date(2026, 3, 1)),
+            "period_end":   iso_date(date(2026, 4, 1)),
+            "currency_code": "USD",
+            "subtotal_cents": 12800,
+            "tax_cents": 0,
+            "total_cents": 12800,
+            "status": "paid",
+            "IsAutoBilled": True,
+            "due_date": iso_date(date(2026, 4, 15)),
+            "created_at": iso(datetime(2026, 3, 15, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+
+        # 4) Invoice issued exactly on a tax-rate boundary (effective_from date).
+        # The current tax rates have effective_from = 2026-01-01. Add an invoice
+        # for tenant 10001 issued exactly on that date (midnight UTC). The
+        # bug ">= vs >" on effective_to would also cover this ambiguity.
+        if self.data.get("tenants"):
+            boundary_tid = self.data["tenants"][0]["tenant_id"]
+            inv_boundary = pool.next()
+            self.writer.write("billing", "invoices", {
+                "invoice_id": inv_boundary,
+                "tenant_id": boundary_tid,
+                "subscription_id": None,
+                "invoice_number": f"INV-TAXB-{inv_boundary:07d}",
+                "issued_at": iso(datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)),
+                "period_start": iso_date(date(2026, 1, 1)),
+                "period_end":   iso_date(date(2026, 2, 1)),
+                "currency_code": self.data["tenants"][0]["currency_code"],
+                "subtotal_cents": 50_000,
+                "tax_cents": 0,
+                "total_cents": 50_000,
+                "status": "paid",
+                "IsAutoBilled": True,
+                "due_date": iso_date(date(2026, 2, 15)),
+                "created_at": iso(datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)),
+                "deleted_at": None,
+            })
+
+        # 5) Invoice present but no payment (for q116 only_inv side).
+        #    Already covered by At-Average Inc above (we didn't create a
+        #    payment for its invoice). Make the signal louder with a second
+        #    USD paid invoice on a brand-new tenant with no payment row.
+        only_inv_tid = pool.next()
+        self.writer.write("billing", "tenants", {
+            "tenant_id": only_inv_tid,
+            "name": "Only Invoices Co",
+            "slug": "only-invoices-co",
+            "billing_timezone": "America/Los_Angeles",
+            "currency_code": "USD",
+            "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+        inv_only = pool.next()
+        self.writer.write("billing", "invoices", {
+            "invoice_id": inv_only,
+            "tenant_id": only_inv_tid,
+            "subscription_id": None,
+            "invoice_number": f"INV-ONLY-{inv_only:07d}",
+            "issued_at": iso(datetime(2026, 4, 10, tzinfo=timezone.utc)),
+            "period_start": iso_date(date(2026, 4, 1)),
+            "period_end":   iso_date(date(2026, 5, 1)),
+            "currency_code": "USD",
+            "subtotal_cents": 7700,
+            "tax_cents": 0,
+            "total_cents": 7700,
+            "status": "paid",
+            "IsAutoBilled": True,
+            "due_date": iso_date(date(2026, 5, 15)),
+            "created_at": iso(datetime(2026, 4, 10, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+
+        # 6) Payment present but no invoice (for q116 only_pay side).
+        only_pay_tid = pool.next()
+        self.writer.write("billing", "tenants", {
+            "tenant_id": only_pay_tid,
+            "name": "Only Payments LLC",
+            "slug": "only-payments-llc",
+            "billing_timezone": "Asia/Kolkata",
+            "currency_code": "USD",
+            "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+        pay_only = pool.next()
+        self.writer.write("billing", "payments", {
+            "payment_id": pay_only,
+            "tenant_id": only_pay_tid,
+            "invoice_id": None,
+            "payment_method_id": None,
+            "amount_cents": 3300,
+            "currency_code": "USD",
+            "status": "succeeded",
+            "paid_at": iso(datetime(2026, 2, 20, tzinfo=timezone.utc)),
+            "created_at": iso(datetime(2026, 2, 20, tzinfo=timezone.utc)),
+        })
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, required=True)
-    ap.add_argument("--profile", choices=["clean", "nasty"], required=True)
+    ap.add_argument("--profile", choices=["clean", "nasty", "nasty2"], required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     out_dir = Path(args.out)

@@ -194,6 +194,8 @@ def analyse(
     tree = statements[0]
     while isinstance(tree, exp.Subquery) and not tree.alias and isinstance(tree.this, exp.Query):
         tree = tree.this  # a query wrapped in parentheses
+    if dialect == "sqlite":
+        _sqlite_scalar_extremes(tree)
     analysis.tree = tree
     analysis.mutation_kinds = _mutation_kinds(tree)
     if analysis.mutation_kinds:
@@ -210,6 +212,16 @@ def analyse(
     if catalog is not None:
         _Resolver(analysis, catalog).run()
     return analysis
+
+
+def _sqlite_scalar_extremes(tree: exp.Expression) -> None:
+    """SQLite's MAX(a, b, ...) and MIN(a, b, ...) with several arguments pick the greatest or least
+    value of a row: they are GREATEST and LEAST, not aggregates. Rewritten so every check sees them
+    for what they are; SQLite's generator writes GREATEST back as MAX, so snippets are unchanged."""
+    for node in list(tree.find_all((exp.Max, exp.Min))):
+        if node.expressions and node.this is not None:
+            kind = exp.Greatest if isinstance(node, exp.Max) else exp.Least
+            node.replace(kind(this=node.this, expressions=list(node.expressions)))
 
 
 _SCRIPT_DIALECTS = {"bigquery"}
