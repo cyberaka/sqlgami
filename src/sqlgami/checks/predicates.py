@@ -139,7 +139,9 @@ def null_comparison(ctx: CheckContext) -> Iterable[Finding]:
                     isinstance(column_side, exp.Column)
                     and isinstance(other, exp.Literal)
                     and other.is_string
-                    and other.name.strip().upper() == "NULL"
+                    # 'Null' in mixed case is a real surname; the placeholder is written in one case.
+                    and other.name.strip() in ("NULL", "null")
+                    and not _stored_value(ctx, model, column_side, other.name)
                 ):
                     yield ctx.finding(
                         "null_comparison",
@@ -152,6 +154,50 @@ def null_comparison(ctx: CheckContext) -> Iterable[Finding]:
                         suggestion="Use IS NULL or IS NOT NULL if missing values are meant.",
                     )
                     break
+
+        # CASE x WHEN NULL compares with =, so that branch is never taken.
+        for node in own_nodes(model, (exp.Case,)):
+            if node.this is None:
+                continue
+            for branch in node.args.get("ifs") or []:
+                if isinstance(unparen(branch.this), exp.Null):
+                    yield ctx.finding(
+                        "null_comparison",
+                        Severity.HIGH,
+                        (
+                            f"{ctx.snippet(node)} has a WHEN NULL branch. CASE compares with =, "
+                            "which is never true for NULL, so that branch is never taken."
+                        ),
+                        node,
+                        suggestion=f"Write CASE WHEN {ctx.snippet(node.this)} IS NULL THEN ... instead.",
+                    )
+                    break
+
+        # x IN (..., NULL): the NULL in the list never matches anything.
+        for node in own_nodes(model, (exp.In,)):
+            if node.args.get("query") is not None or isinstance(node.parent, exp.Not):
+                continue  # NOT IN with a NULL is not_in_nullable's finding
+            values = [unparen(v) for v in node.expressions]
+            if not any(isinstance(v, exp.Null) for v in values):
+                continue
+            only_null = all(isinstance(v, exp.Null) for v in values)
+            yield ctx.finding(
+                "null_comparison",
+                Severity.HIGH if only_null else Severity.MEDIUM,
+                (
+                    f"{ctx.snippet(node)} has NULL in its list. IN compares with =, which is "
+                    "never true for NULL, so "
+                    + ("the condition matches no rows." if only_null else "rows holding NULL are not matched.")
+                ),
+                node,
+                suggestion="Test IS NULL separately, joined with OR.",
+            )
+
+
+def _stored_value(ctx: CheckContext, model: SelectModel, column: exp.Expression, literal: str) -> bool:
+    """True when the catalog lists ``literal`` among the values the column actually holds."""
+    info = column_info(ctx, model, column)
+    return info is not None and info[1].values is not None and literal in [str(v) for v in info[1].values]
 
 
 def _query_scope(model: SelectModel, query: exp.Expression) -> Scope | None:
@@ -560,6 +606,17 @@ _ISO_DATE_RE = re.compile(
 )
 _LOOSE_DATE_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}([ T].*)?$")
 _BOOL_WORDS = {"true", "false", "t", "f", "yes", "no", "y", "n", "1", "0", "on", "off"}
+# Words these engines accept as a date or timestamp.
+_SPECIAL_TEMPORAL = {
+    "postgres": {"epoch", "infinity", "-infinity", "now", "today", "tomorrow", "yesterday"},
+    "redshift": {"epoch", "infinity", "-infinity", "now", "today", "tomorrow", "yesterday"},
+    "duckdb": {"epoch", "infinity", "-infinity"},
+}
+# SQLite compares stored timestamp text with a literal as text, so a year or year-month
+# works as the bound of a range.
+_PREFIX_BOUND_RE = re.compile(r"^\d{4}(-\d{2})?$")
+# A date written as a bare number, e.g. 20240131.
+_NUMERIC_DATE_RE = re.compile(r"^(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$")
 
 
 def _has_cast(node: exp.Expression) -> bool:
@@ -619,14 +676,35 @@ def type_mismatch(ctx: CheckContext) -> Iterable[Finding]:
                 oriented = _oriented(left, right, operator)
                 if oriented is None:
                     continue
-                column, other, _ = oriented
+                column, other, op = oriented
                 if isinstance(other, exp.Neg):
                     other = other.this
-                if not isinstance(other, exp.Literal):
-                    continue
                 if column_info(ctx, model, column) is None:
                     continue  # a computed column: its inferred type is too uncertain to judge on
                 fcol = family(ctx, model, column)
+                if not isinstance(other, exp.Literal):
+                    # A column against a computed value of the other kind, e.g. id = name || ''.
+                    # SQLite converts between the two where it can, so it is left alone there.
+                    fother = family(ctx, model, other)
+                    if (
+                        dialect != "sqlite"
+                        and {fcol, fother} == {T.NUMERIC, T.TEXT}
+                        and not isinstance(other, (exp.Null, exp.Placeholder, exp.Parameter, exp.Subquery))
+                        and not any(isinstance(n, (exp.Cast, exp.TryCast)) for n in walk_own(other))
+                    ):
+                        yield ctx.finding(
+                            "type_mismatch",
+                            Severity.HIGH if dialect == "postgres" else Severity.MEDIUM,
+                            (
+                                f"{ctx.snippet(node)} compares a {fcol} column with a {fother} value. "
+                                "The engine either rejects this or converts one side implicitly."
+                            ),
+                            node,
+                            suggestion="Check that these are the intended columns; cast one side if so.",
+                            left=fcol,
+                            right=fother,
+                        )
+                    continue
                 text = other.name
                 problem: tuple[Severity, str] | None = None
                 if other.is_string:
@@ -636,7 +714,12 @@ def type_mismatch(ctx: CheckContext) -> Iterable[Finding]:
                             f"a number column with the text {other.sql()}, which is not a number",
                         )
                     elif fcol in T.TEMPORAL and not _ISO_DATE_RE.match(text.strip()):
-                        if dialect == "sqlite" or not re.search(r"\d", text):
+                        word = text.strip().lower()
+                        if word in _SPECIAL_TEMPORAL.get(dialect, ()):
+                            pass  # 'now', 'infinity' and the like are valid input here
+                        elif dialect == "sqlite" and op in ("<", "<=", ">", ">=") and _PREFIX_BOUND_RE.match(word):
+                            pass  # '2024-01' is a sound range bound for text timestamps
+                        elif dialect == "sqlite" or not re.search(r"\d", text):
                             problem = (
                                 Severity.HIGH if dialect == "sqlite" else Severity.MEDIUM,
                                 f"a {fcol} column with {other.sql()}, which is not a date in "
@@ -657,6 +740,14 @@ def type_mismatch(ctx: CheckContext) -> Iterable[Finding]:
                             small = False
                         if small or dialect != "sqlite":
                             problem = (Severity.HIGH, f"a {fcol} column with the number {text}")
+                        elif _NUMERIC_DATE_RE.match(text):
+                            # Too large to be a day count and not an epoch time: a date without quotes.
+                            problem = (
+                                Severity.HIGH,
+                                f"a {fcol} column with the number {text}, which looks like a date "
+                                "written without quotes. SQLite orders every number before any "
+                                "timestamp text, so the comparison does not look at the date",
+                            )
                 if problem is None:
                     continue
                 severity, what = problem
@@ -877,17 +968,21 @@ def value_finding(
     near: list[str],
     negated: bool,
     stage: str,
+    partial: bool = False,
 ) -> Finding:
+    """``partial``: other values in the same IN list are stored, so the list as a whole still matches."""
     where = f"{table.name}.{column.name}"
     hint = f" The closest stored value is {near[0]!r}." if near else ""
+    if partial:
+        effect = " The other listed values still match, so the condition returns fewer rows than intended."
+    elif negated:
+        effect = " The condition therefore excludes nothing."
+    else:
+        effect = " The condition therefore matches no rows."
     return Finding(
         code="filter_value",
-        severity=Severity.MEDIUM if negated else Severity.HIGH,
-        message=(
-            f"The filter uses {literal!r}, but {where} never holds that value."
-            + hint
-            + (" The condition therefore excludes nothing." if negated else " The condition therefore matches no rows.")
-        ),
+        severity=Severity.MEDIUM if negated or partial else Severity.HIGH,
+        message=f"The filter uses {literal!r}, but {where} never holds that value." + hint + effect,
         stage=stage,
         snippet=ctx_snippet,
         suggestion=(f"Use {near[0]!r}." if near else "Check how this value is stored in the column."),
@@ -895,15 +990,68 @@ def value_finding(
     )
 
 
+def _case_folded_mismatch(left: exp.Expression, right: exp.Expression) -> tuple[str, exp.Literal] | None:
+    """``LOWER(x) = 'US'``: a case-folded value against a literal in the other case."""
+    a, b = unparen(left), unparen(right)
+    for folded, other in ((a, b), (b, a)):
+        if not isinstance(folded, (exp.Lower, exp.Upper)):
+            continue
+        if not (isinstance(other, exp.Literal) and other.is_string):
+            continue
+        if isinstance(folded, exp.Lower) and other.name != other.name.lower():
+            return "lower-case", other
+        if isinstance(folded, exp.Upper) and other.name != other.name.upper():
+            return "upper-case", other
+    return None
+
+
+def _any_listed_value_stored(ctx: CheckContext, model: SelectModel, node: exp.In) -> bool:
+    column = unparen(node.this)
+    info = column_info(ctx, model, column) if isinstance(column, exp.Column) else None
+    if info is None or info[1].values is None:
+        return False
+    for value in node.expressions:
+        value = unparen(value)
+        if isinstance(value, exp.Literal) and value.is_string and judge_value(info[1].values, value.name)[0]:
+            return True
+    return False
+
+
 @check("filter_value", description="A filter uses a value the column never holds.")
 def filter_value(ctx: CheckContext) -> Iterable[Finding]:
     seen: set[tuple[str, str, str]] = set()
     for model in ctx.cache.models():
-        for node in own_nodes(model, _EQUALITY + (exp.In,)):
+        for node in own_nodes(model, _EQUALITY + (exp.In, exp.Like)):
             negated = isinstance(node, exp.NEQ) or (
-                isinstance(node, exp.In) and isinstance(node.parent, exp.Not)
+                isinstance(node, (exp.In, exp.Like)) and isinstance(node.parent, exp.Not)
             )
-            for left, right, operator in _comparison_pairs(node):
+            pairs = _comparison_pairs(node)
+            if isinstance(node, exp.Like):
+                pattern = unparen(node.expression)
+                if not (isinstance(pattern, exp.Literal) and pattern.is_string) or re.search(r"[%_\\]", pattern.name):
+                    continue
+                pairs = [(node.this, node.expression, "=")]  # LIKE with no wildcard is an equality test
+            # When part of an IN list is stored, the list still matches; see below.
+            some_listed_value_is_stored = isinstance(node, exp.In) and not negated and _any_listed_value_stored(
+                ctx, model, node
+            )
+            for left, right, operator in pairs:
+                folded = _case_folded_mismatch(left, right)
+                if folded is not None:
+                    function, literal = folded
+                    yield ctx.finding(
+                        "filter_value",
+                        Severity.MEDIUM if negated else Severity.HIGH,
+                        (
+                            f"{ctx.snippet(node)} compares {function} text with {literal.sql()}, "
+                            f"which is not all {function}. The two can never be equal, so the "
+                            + ("condition excludes nothing." if negated else "condition matches no rows.")
+                        ),
+                        node,
+                        suggestion=f"Write the literal in {function} as well.",
+                        literal=literal.name,
+                    )
+                    continue
                 oriented = _oriented(left, right, operator)
                 if oriented is None:
                     continue
@@ -925,10 +1073,17 @@ def filter_value(ctx: CheckContext) -> Iterable[Finding]:
                 seen.add(key)
                 if col.values is not None:
                     present, near = judge_value(col.values, other.name)
-                    if not present:
-                        yield value_finding(
-                            ctx.snippet(node), table, col, other.name, near, negated, "static"
-                        )
+                    if present:
+                        continue
+                    if some_listed_value_is_stored:
+                        # 'US' in ('US', 'CA') does match. Only a listed value that looks like a
+                        # misspelling of a stored one is worth reporting.
+                        if near:
+                            yield value_finding(
+                                ctx.snippet(node), table, col, other.name, near, negated, "static", partial=True
+                            )
+                        continue
+                    yield value_finding(ctx.snippet(node), table, col, other.name, near, negated, "static")
                 else:
                     ctx.probes.append(
                         Probe(

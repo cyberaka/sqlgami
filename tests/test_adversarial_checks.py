@@ -267,36 +267,6 @@ MISSED = [
         "GROUP BY total removes the repeats but also merges different orders with the same total",
     ),
     # cartesian_join
-    # null_comparison
-    (
-        'null_comparison',
-        'case_when_null',
-        "SELECT name, CASE country WHEN NULL THEN 'unknown' ELSE country END FROM customers",
-        {},
-        "CASE x WHEN NULL compares with = and never matches",
-    ),
-    (
-        'null_comparison',
-        'in_null_list',
-        "SELECT name FROM customers WHERE country IN (NULL)",
-        {},
-        "IN (NULL) is never true",
-    ),
-    # type_mismatch
-    (
-        'type_mismatch',
-        'sqlite_int_vs_timestamp_text',
-        "SELECT id FROM orders WHERE created_at > 20240101",
-        {'dialects': ('sqlite',)},
-        "SQLite compares the integer with timestamp text by storage class, so every row matches (shop data: 5 of 5); DuckDB and Postgres reject it",
-    ),
-    (
-        'type_mismatch',
-        'join_through_expression',
-        "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.name || ''",
-        {},
-        "an integer key is compared with text; Postgres and DuckDB reject it and SQLite matches nothing",
-    ),
     # date_boundary
     (
         'date_boundary',
@@ -304,21 +274,6 @@ MISSED = [
         "SELECT id FROM orders WHERE created_at <= '2024-01-31 23:59:59'",
         {},
         "<= '... 23:59:59' leaves out the last fractional second of the day",
-    ),
-    # filter_value
-    (
-        'filter_value',
-        'lower_vs_upper_literal',
-        "SELECT * FROM customers WHERE LOWER(country) = 'US'",
-        {'values': True},
-        "LOWER(country) can never equal the upper-case 'US'",
-    ),
-    (
-        'filter_value',
-        'like_no_wildcard',
-        "SELECT * FROM customers WHERE country LIKE 'usa'",
-        {'values': True},
-        "LIKE with no wildcard is an equality test against a value the column never holds",
     ),
     # avg_of_avg
     (
@@ -437,36 +392,6 @@ FALSE_ALARMS = [
     ),
     # distinct_masking
     # cartesian_join
-    # null_comparison
-    (
-        'null_comparison',
-        'surname_null',
-        "SELECT id FROM customers WHERE name = 'Null'",
-        {},
-        "'Null' is a real surname and a legitimate text value",
-    ),
-    # type_mismatch
-    (
-        'type_mismatch',
-        'sqlite_month_prefix_bound',
-        "SELECT id FROM orders WHERE created_at >= '2024-01' AND created_at < '2024-02'",
-        {'dialects': ('sqlite',)},
-        "'2024-01' is a valid lower bound for text timestamps in SQLite (shop data: same rows as '2024-01-01')",
-    ),
-    (
-        'type_mismatch',
-        'postgres_special_date_input',
-        "SELECT id FROM orders WHERE created_at < 'now'",
-        {'dialects': ('postgres',)},
-        "'now' is a documented Postgres timestamp input",
-    ),
-    (
-        'type_mismatch',
-        'postgres_infinity',
-        "SELECT id FROM orders WHERE created_at < 'infinity'",
-        {'dialects': ('postgres',)},
-        "'infinity' is a documented Postgres timestamp input",
-    ),
     # integer_division
     (
         'integer_division',
@@ -482,14 +407,6 @@ FALSE_ALARMS = [
         "SELECT id FROM orders WHERE created_at >= '2024-01-30' AND created_at < '2024-01-31'",
         {},
         ">= the 30th and < the 31st is the correct half-open range for one day",
-    ),
-    # filter_value
-    (
-        'filter_value',
-        'in_list_partly_present',
-        "SELECT * FROM customers WHERE country IN ('US', 'CA')",
-        {'values': True},
-        "'US' is stored, so the IN list does match rows; the message says it matches none",
     ),
     # avg_of_avg
     (
@@ -1300,6 +1217,85 @@ STILL_FIRES = [
         "SELECT c.name FROM customers c LEFT JOIN orders o ON o.customer_id = c.id AND o.tenant_id NOT IN (1, 2) WHERE o.tenant_id NOT IN (3, 4)",
         {},
     ),
+    (
+        'null_comparison',
+        'case_when_null',
+        "SELECT name, CASE country WHEN NULL THEN 'unknown' ELSE country END FROM customers",
+        {},
+    ),
+    (
+        'null_comparison',
+        'in_null_list',
+        "SELECT name FROM customers WHERE country IN (NULL)",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_int_vs_timestamp_text',
+        "SELECT id FROM orders WHERE created_at > 20240101",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'join_through_expression',
+        "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.name || ''",
+        # Not SQLite: it converts between numbers and text where it can instead of rejecting.
+        {'dialects': ('duckdb', 'postgres')},
+    ),
+    (
+        'filter_value',
+        'lower_vs_upper_literal',
+        "SELECT * FROM customers WHERE LOWER(country) = 'US'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'like_no_wildcard',
+        "SELECT * FROM customers WHERE country LIKE 'usa'",
+        {'values': True},
+    ),
+    (
+        'null_comparison',
+        'in_list_with_null',
+        "SELECT name FROM customers WHERE country IN ('US', NULL)",
+        {},
+    ),
+    (
+        'null_comparison',
+        'text_null_placeholder',
+        "SELECT id FROM customers WHERE country = 'NULL'",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_equality_with_month',
+        "SELECT id FROM orders WHERE created_at = '2024-01'",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'duckdb_rejects_now',
+        "SELECT id FROM orders WHERE created_at < 'now'",
+        {'dialects': ('duckdb',)},
+    ),
+    (
+        'filter_value',
+        'in_list_with_misspelling',
+        "SELECT * FROM customers WHERE country IN ('usa', 'DE')",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'upper_vs_lower_literal',
+        "SELECT * FROM customers WHERE UPPER(country) = 'us'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'in_list_nothing_stored',
+        "SELECT * FROM customers WHERE country IN ('CA', 'MX')",
+        {'values': True},
+    ),
 ]
 
 STILL_QUIET = [
@@ -1950,6 +1946,102 @@ STILL_QUIET = [
         'not_in_nullable',
         'literal_list_on_coalesced_column',
         "SELECT name FROM customers WHERE COALESCE(country, '') NOT IN ('US', 'DE')",
+        {},
+    ),
+    (
+        'null_comparison',
+        'surname_null',
+        "SELECT id FROM customers WHERE name = 'Null'",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_month_prefix_bound',
+        "SELECT id FROM orders WHERE created_at >= '2024-01' AND created_at < '2024-02'",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'postgres_special_date_input',
+        "SELECT id FROM orders WHERE created_at < 'now'",
+        {'dialects': ('postgres',)},
+    ),
+    (
+        'type_mismatch',
+        'postgres_infinity',
+        "SELECT id FROM orders WHERE created_at < 'infinity'",
+        {'dialects': ('postgres',)},
+    ),
+    (
+        'filter_value',
+        'in_list_partly_present',
+        "SELECT * FROM customers WHERE country IN ('US', 'CA')",
+        {'values': True},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_epoch_seconds',
+        "SELECT id FROM orders WHERE created_at > 1704067200",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'sqlite_year_bound',
+        "SELECT id FROM orders WHERE created_at >= '2024' AND created_at < '2025'",
+        {'dialects': ('sqlite',)},
+    ),
+    (
+        'type_mismatch',
+        'text_column_text_expression',
+        "SELECT c.id FROM customers c WHERE c.name = c.country || '-x'",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'number_column_number_expression',
+        "SELECT o.id FROM orders o WHERE o.total = o.id * 2",
+        {},
+    ),
+    (
+        'type_mismatch',
+        'number_column_cast_expression',
+        "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = CAST(c.name || '' AS INTEGER)",
+        {'dialects': ('duckdb', 'postgres')},
+    ),
+    (
+        'filter_value',
+        'lower_vs_lower_literal',
+        "SELECT * FROM customers WHERE LOWER(country) = 'us'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'like_with_wildcard',
+        "SELECT * FROM customers WHERE country LIKE 'U%'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'like_exact_stored_value',
+        "SELECT * FROM customers WHERE country LIKE 'US'",
+        {'values': True},
+    ),
+    (
+        'filter_value',
+        'in_list_all_stored',
+        "SELECT * FROM customers WHERE country IN ('US', 'DE')",
+        {'values': True},
+    ),
+    (
+        'null_comparison',
+        'case_when_is_null',
+        "SELECT name, CASE WHEN country IS NULL THEN 'unknown' ELSE country END FROM customers",
+        {},
+    ),
+    (
+        'null_comparison',
+        'in_list_without_null',
+        "SELECT name FROM customers WHERE country IN ('US', 'DE')",
         {},
     ),
 ]
