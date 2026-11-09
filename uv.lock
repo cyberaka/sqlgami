@@ -1056,7 +1056,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
     { name = "sqlglot", specifier = ">=27,<29" },
 ]
-provides-extras = ["duckdb", "postgres", "bigquery"]
+provides-extras = ["duckdb", "postgres", "bigquery", "hf"]
 
 [package.metadata.requires-dev]
 dev = [

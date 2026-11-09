@@ -44,6 +44,8 @@ STACK_DISCOUNT = 0.6  # each further medium or low finding counts for this much 
 BONUS_QUESTION_AGREES = 0.40  # the question was given and none of its checks objected
 BONUS_NOTHING_FOUND = 0.30  # no finding of any severity, and every check ran
 BONUS_ROWS_RETURNED = 0.15  # the query ran and returned something
+# The candidate is in the majority among independent alternatives: one, two, three or more agree.
+BONUS_CONSISTENT = (0.7, 1.2, 1.6)
 
 HALF_WIDTH = {"static": 0.20, "dry": 0.17, "sample": 0.12}
 
@@ -123,7 +125,18 @@ def _clean_bonus(report: Report, depth: str, analysed: bool) -> float:
         bonus += BONUS_NOTHING_FOUND
     if report.signals.get("rows_returned"):
         bonus += BONUS_ROWS_RETURNED
+    bonus += _consistency_bonus(report)
     return bonus
+
+
+def _consistency_bonus(report: Report) -> float:
+    """Support from independently written queries that return the same result."""
+    signal = report.signals.get("consistency") or {}
+    comparable, agreeing = signal.get("comparable") or 0, signal.get("agreeing") or 0
+    rival = signal.get("largest_disagreeing_cluster") or 0
+    if not comparable or agreeing * 2 < comparable or agreeing < rival:
+        return 0.0
+    return BONUS_CONSISTENT[min(agreeing, len(BONUS_CONSISTENT)) - 1]
 
 
 def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored:
@@ -223,6 +236,12 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
     sample = report.stage("sample")
     if sample is not None and sample.status == StageStatus.SKIPPED and report.mode in ("sample", "full"):
         parts.append("unverified beyond static and dry-run checks")
+    agreement = report.signals.get("consistency") or {}
+    if agreement.get("comparable"):
+        parts.append(
+            f"{agreement.get('agreeing', 0)} of {agreement['comparable']} independent alternative queries "
+            "returned the same result"
+        )
     parts.append("calibrated on labelled data" if calibrated else "provisional heuristic, not calibrated")
     basis = "; ".join(parts)
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Sequence
 
 from .catalog import Catalog, RequiredPredicate
 from .engines import dialect_for, get_adapter
@@ -48,6 +48,10 @@ class Scorer:
         access control. See :class:`sqlgami.RequiredPredicate`.
     snapshot_columns:
         ``{table: column}`` for periodic snapshot tables.
+    generator:
+        Optional function ``(question, schema_text, glossary, k) -> list of SQL`` that
+        writes alternative queries for the consistency stage in ``full`` mode. sqlgami
+        ships no model and calls none unless you pass this.
     glossary:
         Business definitions, as text or a ``{term: meaning}`` dictionary. Values
         named here are not reported as filters the question never asked for.
@@ -75,6 +79,7 @@ class Scorer:
         required_predicates: list | None = None,
         snapshot_columns: dict[str, str] | None = None,
         default_project: str | None = None,
+        generator: Any = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -128,6 +133,7 @@ class Scorer:
 
             calibrator = IsotonicCalibrator.load(calibrator)
         self.calibrator = calibrator
+        self.generator = generator
         if isinstance(glossary, dict):
             glossary = "\n".join(f"{term}: {meaning}" for term, meaning in glossary.items())
         self.glossary: str | None = glossary
@@ -154,8 +160,15 @@ class Scorer:
         mode: str | None = None,
         cost_ceiling: float | None = None,
         params: dict[str, Any] | None = None,
+        alternatives: Sequence[str] | None = None,
     ) -> Report:
         """Check ``sql`` and return a :class:`Report`.
+
+        ``alternatives`` are other queries written for the same question (by
+        another model, another prompt, or other samples). When given, and the
+        query can be run, each is run read-only and its result compared with the
+        candidate's. In ``full`` mode a ``generator`` passed to the scorer is
+        asked for them instead.
 
         ``sql`` may be a template with ``{name}`` placeholders. Pass ``params``
         to give their values; the SQL is then filled in the way ``str.format``
@@ -184,6 +197,8 @@ class Scorer:
             calibrator=self.calibrator,
             glossary=self.glossary,
             params=params,
+            alternatives=alternatives,
+            generator=self.generator,
         )
 
     def explain(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None) -> Report:
@@ -200,9 +215,16 @@ class Scorer:
         question: str | None = None,
         cost_ceiling: float | None = None,
         params: dict[str, Any] | None = None,
+        alternatives: Sequence[str] | None = None,
     ) -> Report:
-        """Also runs the query read-only, if its estimated cost is under the ceiling."""
-        return self.score(sql, question, mode="sample", cost_ceiling=cost_ceiling, params=params)
+        """Also runs the query read-only, if its estimated cost is under the ceiling.
+
+        Pass ``alternatives`` to compare its result with other queries written for the
+        same question.
+        """
+        return self.score(
+            sql, question, mode="sample", cost_ceiling=cost_ceiling, params=params, alternatives=alternatives
+        )
 
     # ----------------------------------------------------------- lifecycle
 

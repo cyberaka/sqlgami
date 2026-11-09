@@ -12,11 +12,12 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from sqlglot import exp
 
 from . import analysis as A
+from . import consistency
 from . import template
 from . import types as T
 from .catalog import Catalog, Table
@@ -56,6 +57,11 @@ class Options:
     profile_values: bool = True
     max_profile_columns: int = 40
     max_profile_values: int = 40
+    # Consistency stage: how many alternatives to ask a generator for, how many to run at most,
+    # and the largest result that is compared.
+    consistency_k: int = 3
+    consistency_max_alternatives: int = 8
+    consistency_rows: int = 5000
 
 
 class _Clock:
@@ -82,10 +88,12 @@ def run(
     calibrator: Calibrator | None = None,
     glossary: str | None = None,
     params: dict[str, Any] | None = None,
+    alternatives: Sequence[str] | None = None,
+    generator: Any = None,
 ) -> Report:
     options = options or Options()
     report = Report(engine=engine, mode=mode, sql=sql, question=question)
-    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params)
+    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator)
     report.findings = _dedupe(report.findings)
     scored = score_report(report, calibrator)
     report.confidence = scored.confidence
@@ -131,6 +139,8 @@ def _run(
     glossary: str | None,
     options: Options,
     params: dict[str, Any] | None = None,
+    alternatives: Sequence[str] | None = None,
+    generator: Any = None,
 ) -> None:
     clock = _Clock()
 
@@ -152,12 +162,12 @@ def _run(
             Finding("parse_error", Severity.ERROR, f"The statement does not parse: {analysis.parse_error}", "parse")
         )
         _stage(report, "parse", StageStatus.FAILED, analysis.parse_error, elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "question"), "the statement does not parse")
+        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "question"), "the statement does not parse")
         return
     if analysis.kind == A.EMPTY:
         report.findings.append(Finding("empty_statement", Severity.ERROR, "There is no statement to check.", "parse"))
         _stage(report, "parse", StageStatus.FAILED, "empty input", elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "question"), "empty input")
+        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "question"), "empty input")
         return
     _stage(report, "parse", StageStatus.PASSED, None, elapsed)
 
@@ -200,7 +210,7 @@ def _run(
     if problem is not None:
         report.findings.append(problem)
         _stage(report, "statement", StageStatus.FAILED, problem.message, clock.lap())
-        _not_run(report, ("schema", "static", "dry_run", "sample", "question"), "the statement is not a plain read-only query")
+        _not_run(report, ("schema", "static", "dry_run", "sample", "consistency", "question"), "the statement is not a plain read-only query")
         return
     _stage(report, "statement", StageStatus.PASSED, None, clock.lap())
     report.findings.extend(prepared.findings)
@@ -313,7 +323,89 @@ def _run(
         _database_stages(
             report, prepared.executable_sql or sql, mode, adapter, analysis, ctx, schema_findings, options, clock
         )
+    _consistency_stage(
+        report,
+        prepared.executable_sql or sql,
+        dialect,
+        mode,
+        catalog,
+        adapter,
+        question,
+        glossary,
+        options,
+        alternatives,
+        generator,
+        params,
+    )
     _question_stage(report, ctx, adapter, question, glossary, mode, options)
+
+
+def _consistency_stage(
+    report: Report,
+    sql: str,
+    dialect: str,
+    mode: str,
+    catalog: Catalog | None,
+    adapter: Adapter | None,
+    question: str | None,
+    glossary: str | None,
+    options: Options,
+    alternatives: Sequence[str] | None,
+    generator: Any,
+    params: dict[str, Any] | None,
+) -> None:
+    """Compare the candidate's result with independently written queries for the same question."""
+    name = "consistency"
+    if alternatives is None and (generator is None or mode != "full"):
+        why = "no alternative queries were supplied" if mode == "full" else f"mode is {mode}"
+        _stage(report, name, StageStatus.NOT_RUN, why)
+        return
+    sample = report.stage("sample")
+    if adapter is None or sample is None or sample.status != StageStatus.PASSED:
+        _stage(report, name, StageStatus.NOT_RUN, "the query itself was not run")
+        return
+    clock = _Clock()
+    if alternatives is None:
+        if not question or not question.strip():
+            _stage(report, name, StageStatus.NOT_RUN, "a generator needs the question")
+            return
+        try:
+            schema_text = consistency.describe_schema(catalog, report.tables) if catalog is not None else ""
+            alternatives = list(generator(question, schema_text, glossary, options.consistency_k) or [])
+        except Exception as exc:  # the generator is the host's code; its failure is not ours to raise
+            logger.debug("generator failed", exc_info=True)
+            _stage(report, name, StageStatus.SKIPPED, f"the generator failed ({type(exc).__name__})", clock.lap())
+            return
+    rendered = []
+    for alt in alternatives:
+        if isinstance(alt, str) and params:
+            filled = template.prepare(alt, dialect, params).executable_sql
+            rendered.append(filled or alt)
+        else:
+            rendered.append(alt)
+    outcome = consistency.run(
+        sql,
+        rendered,
+        dialect=dialect,
+        catalog=catalog,
+        adapter=adapter,
+        max_rows=options.consistency_rows,
+        timeout_s=options.timeout_s,
+        cost_ceiling=options.cost_ceiling,
+        max_alternatives=options.consistency_max_alternatives,
+    )
+    report.signals["consistency"] = outcome.to_dict()
+    if not outcome.ran:
+        _stage(report, name, StageStatus.SKIPPED, outcome.reason, clock.lap())
+        return
+    report.findings.extend(outcome.findings)
+    _stage(
+        report,
+        name,
+        StageStatus.PASSED,
+        f"{outcome.agreeing} of {outcome.comparable} alternative(s) return the same result",
+        clock.lap(),
+    )
 
 
 def _question_stage(

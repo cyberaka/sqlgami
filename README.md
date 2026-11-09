@@ -76,7 +76,7 @@ INDEX`), a dictionary, or a `Catalog` object.
 | `static` | parse, read-only check, schema resolution, static checks | schema lookups only, and only if you passed a connection |
 | `dry` | the above, plus the engine's own planner (`EXPLAIN`) | yes, without running the query |
 | `sample` | the above, plus one read-only run of the query and small probe queries that test findings against the data | yes |
-| `full` | reserved for the optional LLM-backed checks | yes |
+| `full` | the above, plus the consistency stage using a generator you supply | yes |
 
 The default is `dry` when you pass a connection and `static` when you do not.
 `scorer.explain()`, `scorer.dry_run()` and `scorer.sample()` pick a mode
@@ -197,11 +197,69 @@ if the column really holds NULLs. Filter values are looked up in the column.
 ```
 
 Stages, in order, are `parse`, `statement`, `schema`, `static`, `dry_run`,
-`sample` and `question`.
+`sample`, `consistency` and `question`.
 
 Verdicts are `invalid`, `likely_wrong`, `uncertain`, `likely_right` and
 `unverified`. A check that could not run is listed under `checks_not_run`
 rather than counted as passed.
+
+### Agreement between independent queries
+
+The static checks judge a query by its shape. For complex SQL that is not
+enough: on a held-out set of harder questions they barely separated wrong
+queries that run from right ones. What does separate them is the answer.
+If several independently written queries for the same question return the
+same data, they are very likely right; if they agree with one another and not
+with the candidate, the candidate is very likely wrong.
+
+Give sqlgami the other attempts, and it runs each one read-only under the same
+limits as the candidate and compares the result sets:
+
+```python
+report = scorer.sample(sql, question, alternatives=[other_sql_1, other_sql_2, other_sql_3])
+report.signals["consistency"]   # how many could be compared, how many agree, each alternative's status
+```
+
+Or pass a function that writes them, and use `full` mode:
+
+```python
+def generator(question, schema_text, glossary, k):
+    return [...]          # k SQL strings from the model of your choice
+
+scorer = Scorer("postgres", db=conn, generator=generator)
+report = scorer.score(sql, question, mode="full")
+```
+
+| Outcome | Effect |
+|---|---|
+| the candidate matches most alternatives | the score rises into the upper band (0.9 and above is only reachable this way) |
+| the alternatives match each other, not the candidate | `consistency_disagreement`, high severity |
+| one alternative, and it differs | `consistency_disagreement`, medium severity |
+| nothing matches anything | `consistency_no_consensus`: the question is probably ambiguous |
+
+Alternatives that are not single read-only queries, that name things that do
+not exist, or that reach outside the database are never run. Result sets are
+compared without regard to row order, and a match that differs only in column
+order still counts.
+
+The value of this signal depends on how independent and how capable the
+alternatives are. Samples from the same model and prompt as the candidate tend
+to share its mistakes; a different model, or a different prompt, is better.
+
+sqlgami ships no model and calls none on its own. `sqlgami.contrib.hf` is an
+optional generator for Hugging Face Inference, using only the standard
+library:
+
+```python
+from sqlgami.contrib.hf import HFGenerator
+
+generator = HFGenerator("meta-llama/Llama-3.3-70B-Instruct", dialect="postgres")  # token from HF_TOKEN
+```
+
+It has no default model, accepts only models from an allowlist of families
+(see `ALLOWED_PREFIXES` in the module), and never logs or prints the token.
+Using it sends your question, a description of your schema and your glossary
+to the provider.
 
 ### Policies
 
@@ -347,7 +405,12 @@ uv run python -m benchkit build saas_billing       # generate data, build SQLite
 uv run python -m benchkit validate saas_billing    # check gold, bugs and equivalents against each other
 uv run python -m benchkit evaluate saas_billing    # score everything with sqlgami, print metrics
 uv run python -m benchkit label saas_billing bench/.runs/<run-id>   # label candidates.jsonl by execution
+uv run python -m benchkit evaluate saas_billing --engine duckdb --mode sample \
+    --candidates bench/.runs/<run-id>/candidates.jsonl --consistency   # other generators' SQL as alternatives
 ```
+
+`--verifiers NAME` (repeatable) limits which generators may act as
+alternatives, to measure a realistic setup.
 
 SQLite and DuckDB databases are files. Postgres databases are built only when
 `SQLGAMI_BENCH_PG_DSN` names a server; one database per suite and seed is

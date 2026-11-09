@@ -20,6 +20,8 @@ postgres = [
     "psycopg[binary]>=3.2",
 ]
 bigquery = ["google-cloud-bigquery>=3.25"]
+# The Hugging Face generator for the consistency stage uses only the standard library.
+hf = []
 
 [project.scripts]
 sqlgami = "sqlgami.cli:main"

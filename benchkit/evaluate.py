@@ -40,6 +40,8 @@ class Item:
     question: str = ""
     cap_reason: str = ""
     failed_stage: str = ""
+    agreeing: int | None = None  # consistency stage: alternatives that returned the same result
+    comparable: int | None = None
 
 
 def auroc(scores: list[float], labels: list[bool]) -> float | None:
@@ -185,8 +187,16 @@ def evaluate(
     seed_label: str | None = None,
     candidates: list[dict[str, Any]] | None = None,
     include_planted: bool = True,
+    consistency: bool = False,
+    verifiers: list[str] | None = None,
 ) -> tuple[list[Item], dict[str, Any]]:
-    """Score every labelled statement for one engine. Returns the items and their metrics."""
+    """Score every labelled statement for one engine. Returns the items and their metrics.
+
+    With ``consistency``, each candidate is also compared with the other generators'
+    candidates for the same question, standing in for alternatives a host would
+    generate. ``verifiers`` limits which generators may act as alternatives, to
+    measure a realistic setup (weaker models checking stronger ones, or the reverse).
+    """
     seed = next((s for s in suite.seeds if s.label == seed_label), None) if seed_label else None
     if seed is None:
         seed = (suite.nasty_seeds() or suite.seeds)[-1]
@@ -211,7 +221,21 @@ def evaluate(
 
     items: list[Item] = []
 
-    def add(item_id: str, question: Question, kind: str, sql: str, **extra: Any) -> None:
+    by_question: dict[str, list[dict[str, Any]]] = {}
+    for row in candidates or []:
+        if row.get("engine") == engine and row.get("sql"):
+            by_question.setdefault(row.get("question_id", ""), []).append(row)
+
+    def alternatives_for(question: Question, generator: str) -> list[str] | None:
+        if not consistency:
+            return None
+        return [
+            row["sql"]
+            for row in by_question.get(question.id, [])
+            if row.get("generator") != generator and (not verifiers or row.get("generator") in verifiers)
+        ]
+
+    def add(item_id: str, question: Question, kind: str, sql: str, generator: str = "", **extra: Any) -> None:
         if not question.gold(engine):
             return
         correct = True if kind == "gold" else runner.is_correct(question, engine, sql)
@@ -221,7 +245,13 @@ def evaluate(
         item = Item(item_id, question.id, kind, sql, bool(correct), runs, **extra)
         started = time.perf_counter()
         # sqlgami gets the statement as written (a template stays a template) plus its values.
-        report = scorer_for(question).score(sql, question.question, mode=mode, params=question.param_values() or None)
+        report = scorer_for(question).score(
+            sql,
+            question.question,
+            mode=mode,
+            params=question.param_values() or None,
+            alternatives=alternatives_for(question, generator) if kind == "candidate" else None,
+        )
         item.latency_ms = (time.perf_counter() - started) * 1000
         item.score = report.score
         item.verdict = report.verdict.value
@@ -231,6 +261,10 @@ def evaluate(
         item.question = question.question
         item.cap_reason = report.confidence.cap_reason or ""
         item.failed_stage = next((st.name for st in report.stages if st.status.value == "failed"), "")
+        item.generator = generator
+        signal = report.signals.get("consistency") or {}
+        item.agreeing = signal.get("agreeing")
+        item.comparable = signal.get("comparable")
         items.append(item)
 
     try:
@@ -258,9 +292,13 @@ def evaluate(
             question = suite.question(row.get("question_id", ""))
             if question is None or not row.get("sql"):
                 continue
-            add(f"cand-{index}:{row.get('generator', '')}:{row.get('sample', 0)}", question, "candidate", row["sql"])
-            if items and items[-1].id.startswith(f"cand-{index}:"):
-                items[-1].generator = row.get("generator", "")
+            add(
+                f"cand-{index}:{row.get('generator', '')}:{row.get('sample', 0)}",
+                question,
+                "candidate",
+                row["sql"],
+                generator=row.get("generator", ""),
+            )
     finally:
         for scorer in scorers.values():
             scorer.close()

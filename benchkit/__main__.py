@@ -55,6 +55,16 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--seed", help="seed label to score against, e.g. nasty-42")
     p_eval.add_argument("--candidates", help="path to a candidates.jsonl file")
     p_eval.add_argument("--run-id", help="name of the directory under bench/.runs/")
+    p_eval.add_argument(
+        "--consistency",
+        action="store_true",
+        help="compare each candidate with the other generators' candidates for the same question",
+    )
+    p_eval.add_argument(
+        "--verifiers",
+        action="append",
+        help="with --consistency: only these generators act as alternatives (repeatable)",
+    )
 
     p_cal = sub.add_parser("calibrate", help="fit a calibration file from the suite's labelled SQL")
     p_cal.add_argument("suite", nargs="+", help="one or more suites to fit on together")
@@ -112,7 +122,9 @@ def main(argv: list[str] | None = None) -> int:
         run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         for engine in engines:
             for mode in args.mode or ["static", "dry", "sample"]:
-                items, result = evaluate(suite, engine, mode, args.seed, candidates)
+                items, result = evaluate(
+                    suite, engine, mode, args.seed, candidates, consistency=args.consistency, verifiers=args.verifiers
+                )
                 path = write_run(suite, engine, mode, items, result, run_id)
                 print(f"== {suite.name} / {engine} / {mode}")
                 print(format_metrics(result))
