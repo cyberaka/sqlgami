@@ -1094,5 +1094,10 @@ def filter_value(ctx: CheckContext) -> Iterable[Finding]:
                             literal=other.name,
                             operator="<>" if negated else "=",
                             snippet=ctx.snippet(node),
+                            siblings=tuple(
+                                v.name
+                                for v in (node.expressions if isinstance(node, exp.In) and not negated else [])
+                                if isinstance(v, exp.Literal) and v.is_string and v.name != other.name
+                            ),
                         )
                     )

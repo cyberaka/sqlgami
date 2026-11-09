@@ -254,6 +254,18 @@ def test_filter_value_grounding(scorer):
     assert finding.severity == Severity.MEDIUM
 
 
+def test_in_list_with_some_values_absent(scorer):
+    # 'US' is stored and 'FR' is not: the list still matches, and 'FR' is not a misspelling of anything.
+    fine = scorer.sample("SELECT COUNT(*) FROM customers WHERE country IN ('US', 'FR')")
+    assert not fine.has("filter_value"), fine.summary()
+    # 'us' looks like a misspelling of a stored value: worth saying, but the list still matches.
+    near = scorer.sample("SELECT COUNT(*) FROM customers WHERE country IN ('DE', 'us')")
+    finding = next(f for f in near.findings if f.code == "filter_value")
+    assert finding.severity == Severity.MEDIUM and finding.evidence["nearest"] == ["US"]
+    nothing = scorer.sample("SELECT COUNT(*) FROM customers WHERE country IN ('FR', 'ES')")
+    assert next(f for f in nothing.findings if f.code == "filter_value").severity == Severity.HIGH
+
+
 def test_filter_value_on_high_cardinality_column(engine, db):
     from sqlgami import Options
 

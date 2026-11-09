@@ -38,6 +38,8 @@ class Probe:
     # Each outcome is (new severity or None to leave it, text appended to the message, data_check tag).
     query: Any = None
     min_rows: int = 1  # "rows" means at least this many came back
+    # For PROBE_VALUE on one value of an IN list: the other values listed with it.
+    siblings: tuple[str, ...] = ()
     on_rows: tuple[Severity | None, str, str] | None = None
     on_empty: tuple[Severity | None, str, str] | None = None
 

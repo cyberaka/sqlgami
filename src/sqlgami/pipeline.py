@@ -890,7 +890,29 @@ def _probe_value(report: Report, ctx: CheckContext, adapter: Adapter, probe: Pro
             probe.finding.message += " Checked against the data: no row holds this value, so the test matches nothing."
         return
     if not present:
-        report.findings.append(value_finding(probe.snippet, table, column, literal, near, negated, "sample"))
+        partial = False
+        for sibling in probe.siblings:
+            # Another value in the same IN list is stored, so the list as a whole still matches.
+            if column.values is not None:
+                partial = judge_value(column.values, sibling)[0]
+            else:
+                partial = bool(
+                    adapter.query(
+                        exp.select(exp.Literal.number(1))
+                        .from_(ref)
+                        .where(exp.EQ(this=_column(column.name), expression=exp.Literal.string(sibling)))
+                        .limit(1),
+                        max_rows=1,
+                        timeout_s=options.probe_timeout_s,
+                    )
+                )
+            if partial:
+                break
+        if partial and not near:
+            return  # an unremarkable value that simply has no rows; the list still matches
+        report.findings.append(
+            value_finding(probe.snippet, table, column, literal, near, negated, "sample", partial=partial)
+        )
 
 
 _TEXT_DATE_SHAPE = re.compile(r"^\d{4}-\d{2}-\d{2}")
