@@ -40,8 +40,26 @@ def test_lookup_cte_unique_on_the_data_is_dismissed_by_a_probe(scorer):
     assert "fan_out" in _codes(static, Severity.LOW)  # statically unknown, so it is raised...
     sampled = scorer.sample(sql)
     finding = _finding(sampled, "fan_out")
-    assert finding is not None and finding.severity == Severity.INFO  # ...and dismissed by the data
-    assert finding.evidence.get("data_check") == "unique"
+    # ...and the data has no duplicates. Three rows prove little, so it stays a low note that says so.
+    assert finding is not None and finding.severity == Severity.LOW
+    assert finding.evidence.get("data_check") == "unique_observed" and finding.evidence.get("rows_probed") == 3
+    assert "too few" in finding.message
+
+
+def test_observed_uniqueness_over_enough_rows_is_a_low_note(engine, db):
+    # A lookup with 200 rows, unique in the data, no key declared: LOW, with the count, not INFO.
+    db.execute("CREATE TABLE tags (customer_id INTEGER, tag TEXT)")
+    db.executemany("INSERT INTO tags VALUES (?, ?)", [(i, f"t{i}") for i in range(200)]) if engine == "sqlite" else [
+        db.execute(f"INSERT INTO tags VALUES ({i}, 't{i}')") for i in range(200)
+    ]
+    if hasattr(db, "commit"):
+        db.commit()
+    with Scorer(engine, db=db) as scorer:
+        report = scorer.sample("SELECT SUM(o.total) FROM orders o JOIN tags t ON t.customer_id = o.customer_id")
+    finding = _finding(report, "fan_out")
+    assert finding is not None and finding.severity == Severity.LOW
+    assert finding.evidence["data_check"] == "unique_observed" and finding.evidence["rows_probed"] == 200
+    assert "No key guarantees" in finding.message
 
 
 def test_lookup_cte_with_duplicates_on_the_data_is_confirmed(scorer):

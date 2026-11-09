@@ -42,6 +42,9 @@ logger = logging.getLogger("sqlgami")
 
 MODES = ("static", "dry", "sample", "full")
 
+# A uniqueness probe over fewer rows than this says nothing about production data.
+SMALL_TABLE_ROWS = 50
+
 
 @dataclass
 class Options:
@@ -772,12 +775,12 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
     """Check findings against the data: confirm them, dismiss them, or add new ones."""
     budget = options.max_probes
     # Uniqueness probes: finding -> group -> outcomes. A group holds when every outcome is True.
-    unique_results: dict[int, dict[str | None, list[bool | None]]] = {}
+    unique_results: dict[int, dict[str | None, list[tuple[bool, int | None] | None]]] = {}
     unique_findings: dict[int, Finding] = {}
     done: set[tuple] = set()
     skipped_for_size: set[str] = set()
 
-    def note_unique(probe: Probe, outcome: bool | None) -> None:
+    def note_unique(probe: Probe, outcome: tuple[bool, int | None] | None) -> None:
         if probe.finding is not None:
             unique_results.setdefault(id(probe.finding), {}).setdefault(probe.group, []).append(outcome)
             unique_findings[id(probe.finding)] = probe.finding
@@ -825,17 +828,35 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
 
     for finding_id, groups in unique_results.items():
         finding = unique_findings[finding_id]
-        holds = [outcomes and all(o is True for o in outcomes) for outcomes in groups.values()]
-        broken = [bool(outcomes) and all(o is False for o in outcomes if o is not None) and any(o is False for o in outcomes)
-                  for outcomes in groups.values()]
-        if any(holds):
-            finding.severity = Severity.INFO
-            finding.evidence["data_check"] = "unique"
-            finding.evidence["certainty"] = "dismissed"
-            finding.message += (
-                " Checked against the data: the join columns hold no repeated values at present, "
-                "so nothing is double-counted today. No constraint enforces that."
-            )
+        holding = [outcomes for outcomes in groups.values() if outcomes and all(o is not None and o[0] for o in outcomes)]
+        broken = [
+            bool(outcomes) and any(o is not None and not o[0] for o in outcomes)
+            for outcomes in groups.values()
+        ]
+        if holding:
+            # No duplicates in the data. That is evidence, not a guarantee: no key enforces it, or
+            # the probe would not have been needed. How much it is worth depends on how many rows
+            # were looked at.
+            counts = [o[1] for outcomes in holding for o in outcomes if o is not None]
+            rows = min(counts) if counts and all(c is not None for c in counts) else None
+            finding.evidence["data_check"] = "unique_observed"
+            finding.evidence["rows_probed"] = rows
+            if rows is not None and rows < SMALL_TABLE_ROWS:
+                finding.evidence["certainty"] = "maybe"
+                if finding.severity == Severity.HIGH:
+                    finding.severity = Severity.MEDIUM
+                finding.message += (
+                    f" Checked against the data: no repeated values, but only {rows} rows were there to "
+                    "check, which is too few to tell, and no key enforces it."
+                )
+            else:
+                finding.severity = Severity.LOW
+                finding.evidence["certainty"] = "observed"
+                finding.message += (
+                    " Checked against the data: the join columns hold no repeated values"
+                    + (f" among {rows} rows" if rows is not None else "")
+                    + ", so nothing is double-counted today. No key guarantees it stays that way."
+                )
         elif groups and all(broken):
             finding.evidence["data_check"] = "duplicates"
             if finding.evidence.get("certainty") == "maybe":
@@ -844,10 +865,24 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
             finding.message += " Checked against the data: the join columns do hold repeated values."
 
 
-def _probe_unique(adapter: Adapter, probe: Probe, options: Options) -> bool:
-    """True when the columns hold no repeated (non-NULL) combination."""
+def _probe_unique(adapter: Adapter, probe: Probe, options: Options) -> tuple[bool, int | None]:
+    """``(no repeated non-NULL combination, rows looked at)``."""
     if probe.query is not None:  # a derived table, run as written and grouped by its join columns
-        return not adapter.query(probe.query, max_rows=1, timeout_s=options.probe_timeout_s)
+        unique = not adapter.query(probe.query, max_rows=1, timeout_s=options.probe_timeout_s)
+        rows = None
+        if unique:
+            inner = probe.query.args.get("from_") or probe.query.args.get("from")
+            source = inner.this if inner is not None else None
+            if source is not None:
+                count = exp.select(exp.Count(this=exp.Star())).from_(source.copy())
+                with_ = probe.query.args.get("with_") or probe.query.args.get("with")
+                if with_ is not None:
+                    count.set("with_", with_.copy())
+                try:
+                    rows = int(adapter.query(count, max_rows=1, timeout_s=options.probe_timeout_s)[0][0])
+                except (AdapterError, IndexError, TypeError, ValueError):
+                    rows = None
+        return unique, rows
     columns = [_column(c) for c in probe.columns]
     query = (
         exp.select(exp.Literal.number(1))
@@ -858,7 +893,25 @@ def _probe_unique(adapter: Adapter, probe: Probe, options: Options) -> bool:
     )
     for column in columns:
         query = query.where(exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())))
-    return not adapter.query(query, max_rows=1, timeout_s=options.probe_timeout_s)
+    unique = not adapter.query(query, max_rows=1, timeout_s=options.probe_timeout_s)
+    rows = None
+    if unique:
+        try:
+            rows = adapter.row_count(probe.table)
+        except SqlgamiError:
+            rows = None
+        if rows is None:  # no statistics: count, but only up to a bound
+            bounded = exp.select(exp.Count(this=exp.Star())).from_(
+                exp.Subquery(
+                    this=exp.select(exp.Literal.number(1)).from_(adapter.table_ref(probe.table)).limit(SMALL_TABLE_ROWS * 20),
+                    alias=exp.TableAlias(this=exp.to_identifier("sqlgami_n")),
+                )
+            )
+            try:
+                rows = int(adapter.query(bounded, max_rows=1, timeout_s=options.probe_timeout_s)[0][0])
+            except (AdapterError, IndexError, TypeError, ValueError):
+                rows = None
+    return unique, rows
 
 
 def _probe_has_null(adapter: Adapter, probe: Probe, options: Options) -> None:

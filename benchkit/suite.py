@@ -167,7 +167,10 @@ def load_suite(name_or_path: str | Path) -> Suite:
     config_file = path / "suite.yaml"
     if not config_file.exists():
         raise SuiteError(f"no suite.yaml in {path}")
-    config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+    try:
+        config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise SuiteError(f"{config_file} is not valid YAML: {exc}") from exc
     try:
         engines = list(config["engines"])
         seeds = [Seed(int(s["seed"]), str(s["profile"])) for s in config["seeds"]]

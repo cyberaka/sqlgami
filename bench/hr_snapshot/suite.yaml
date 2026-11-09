@@ -1,0 +1,95 @@
+name: hr_snapshot
+description: >
+  Periodic-snapshot HR suite. One wide fact (emp_period_snapshot) with restated
+  snap_dt × period_end_dt rows, pay_period_dim at B (biweekly) and W (weekly)
+  frequency with period_seq and is_current_flag, hierarchy_dim with LVL 2..7 for
+  both reporting and functional chains, and employee_dim with hire/term cycles.
+  Exercises as-of snapshot semantics, period_seq arithmetic, orphan hierarchy
+  nodes, NULL statuses, rehires, zero-headcount periods, LVL_FN gaps, and
+  restatement (multiple snap_dt rows per period_end_dt where the correct answer
+  always uses snap_dt = period_end_dt).
+
+engines:
+  - sqlite
+  - duckdb
+  - postgres
+
+as_of: "2026-06-30"
+
+sqlite_naming:
+  rule: "<schema>_<table>"
+  notes: >
+    hr.x -> hr_x, hr_ref.x -> hr_ref_x. No ATTACH; one database. BOOLEANs are
+    stored as INTEGER 0/1 (is_current_flag). Dates as TEXT 'YYYY-MM-DD'.
+
+types:
+  dates:
+    serialization: "YYYY-MM-DD"
+  booleans:
+    emit_as: "JSON true / false"
+    storage: "BOOLEAN on Postgres/DuckDB; INTEGER 0/1 on SQLite"
+  nulls:
+    serialization: "JSON null"
+
+seeds:
+  - {seed: 1, profile: clean}
+  - {seed: 2, profile: clean}
+  - {seed: 3, profile: clean}
+  - {seed: 42, profile: nasty}
+  - {seed: 43, profile: nasty}
+
+row_budget:
+  clean_seed_1: 35149    # 156 + 1112 + 250 + 33606 + 15 + 10 + 5 (ref)
+  nasty_seed_42: 35234   # 156 + 1093 + 256 + 33699 + 30 (ref totals)
+  cap: 50000
+
+session:
+  timezone: UTC
+  notes: >
+    All dates stored and queried as calendar DATEs (no time zones). The loader
+    pins session TimeZone=UTC on Postgres and DuckDB defensively.
+
+parameters:
+  style: "single-brace {name}"
+  catalog:
+    period_end_dt: "pay_period_dim.ppe_dt (freq_cd='B'); default '2026-06-20'"
+    period_seq_from: "pay_period_dim.period_seq; default -25"
+    period_seq_to: "pay_period_dim.period_seq; default 0"
+    region: "hr_ref.country_region.region; default 'NorthAm'"
+    country: "hr_ref.country_region.country_cd; default 'US'"
+    lvl_n_id: "hierarchy_dim.node_id at that lvl; default varies"
+
+profile_hazards:
+  clean:
+    - "No NULL statuses"
+    - "No term_before_hire rows"
+    - "Reporting and functional chains are both intact"
+  nasty:
+    - "~2% of snapshot rows have status_cd = NULL"
+    - "One assoc_id has term_dt < hire_dt (bad row)"
+    - "Functional hierarchy has ~10% LVL_6 nodes removed (gaps in _FN chain)"
+    - "One zero-headcount period (status='A' rows removed for one PPE on snap_dt=PPE)"
+    - "One duplicate snapshot row (same PK on nasty; dedup gold must handle)"
+    - "One associate's lvl_5_id points to node_id 999999 (orphan in hierarchy_dim)"
+    - "One extra bad associate (999001) with term before hire"
+
+views:
+  - hr.current_snapshot_v
+  - hr.new_hires_last_26p_v
+  - hr.active_headcount_by_period_v
+  - hr.turnover_26p_v
+  - hr.vol_turnover_26p_v
+  - hr.invol_turnover_26p_v
+  - hr.orphaned_hierarchy_v
+  - hr.active_at_current_period_by_region_v
+materialized_views:
+  - hr.monthly_headcount_mv  # Postgres only; loader refreshes after load.
+
+snapshot_semantics:
+  rule: >
+    For any (assoc_id, period_end_dt) there can be up to 3 snap_dt rows at
+    snap_dt ∈ {period_end_dt, period_end_dt+14d, period_end_dt+28d}. Each later
+    snap_dt restates the earlier one with newly-known facts. The "correct" row
+    for reading period_end_dt is always snap_dt = period_end_dt (the snapshot
+    taken at the period's close). Gold uses snap_dt = period_end_dt by default.
+    Treating a later restatement as the authoritative row is a gold bug.

@@ -207,11 +207,13 @@ def test_fan_out_is_confirmed_or_dismissed_by_the_data(scorer):
     assert finding.severity == Severity.HIGH and finding.evidence["data_check"] == "duplicates"
     assert confirmed.verdict.value == "likely_wrong"
 
-    # profiles has no declared key, but customer_id is unique in the data.
+    # profiles has no declared key, but customer_id is unique in the data. With only three rows
+    # that is evidence, not proof: the doubt stays, lowered, and says how many rows it saw.
     dismissed = scorer.sample("SELECT SUM(o.total) FROM orders o JOIN profiles p ON p.customer_id = o.customer_id")
     finding = next(f for f in dismissed.findings if f.code == "fan_out")
-    assert finding.severity == Severity.INFO and finding.evidence["data_check"] == "unique"
-    assert dismissed.verdict.value == "likely_right"
+    assert finding.severity == Severity.LOW and finding.evidence["data_check"] == "unique_observed"
+    assert finding.evidence["rows_probed"] == 3 and "too few" in finding.message
+    assert dismissed.verdict.value != "likely_wrong"
 
     static = scorer.explain("SELECT SUM(o.total) FROM orders o JOIN profiles p ON p.customer_id = o.customer_id")
     finding = next(f for f in static.findings if f.code == "fan_out")
