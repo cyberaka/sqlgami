@@ -49,6 +49,7 @@ def test_default_mode_is_dry_with_a_connection(scorer):
         "static": "passed",
         "dry_run": "passed",
         "sample": "not_run",
+        "question": "not_run",
     }
     assert report.verdict.value == "uncertain"
     assert report.confidence.calibrated is False
@@ -392,7 +393,7 @@ def test_report_is_json_and_keeps_its_shape(scorer):
         assert finding["severity"] in {"error", "high", "medium", "low", "info"}
     for stage in data["stages"]:
         assert set(stage) == {"name", "status", "detail", "duration_ms"}
-    assert [s["name"] for s in data["stages"]] == ["parse", "statement", "schema", "static", "dry_run", "sample"]
+    assert [s["name"] for s in data["stages"]] == ["parse", "statement", "schema", "static", "dry_run", "sample", "question"]
     assert data == report.to_dict() or json.loads(json.dumps(report.to_dict())) == data
 
 
@@ -510,3 +511,70 @@ def test_cli(tmp_path, capsys):
 
     assert main(["score", "--engine", "sqlite", "--db", str(tmp_path / "nope" / "x.db"), "SELECT 1"]) == 2
     assert "sqlgami:" in capsys.readouterr().err
+
+
+# ------------------------------------------------- regressions from the bench
+
+
+def test_duckdb_stored_view_text_with_nested_join_groups():
+    """DuckDB rewrites view bodies with every join wrapped in parentheses."""
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        """
+        CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, gone TIMESTAMP);
+        CREATE TABLE d (id INTEGER PRIMARY KEY, t_id INTEGER, status TEXT);
+        CREATE TABLE i (id INTEGER PRIMARY KEY, t_id INTEGER, cents INTEGER);
+        CREATE TABLE p (id INTEGER PRIMARY KEY, label TEXT);
+        INSERT INTO t VALUES (1, 'a', NULL), (2, 'b', NULL);
+        INSERT INTO d VALUES (1, 1, 'open'), (2, 1, 'open');
+        INSERT INTO i VALUES (1, 1, 100), (2, 2, 50);
+        INSERT INTO p VALUES (1, 'x');
+        CREATE VIEW chasm_v AS
+            SELECT t.id, COUNT(DISTINCT d.id) AS n, SUM(i.cents) AS cents
+            FROM t LEFT JOIN d ON d.t_id = t.id AND d.status = 'open'
+                   LEFT JOIN i ON i.t_id = t.id
+            WHERE t.gone IS NULL GROUP BY t.id;
+        CREATE VIEW live_v AS SELECT id, name FROM t WHERE gone IS NULL;
+        CREATE VIEW on_view_v AS SELECT l.id, l.name, i.cents FROM live_v l JOIN i ON i.t_id = l.id;
+        """
+    )
+    stored = conn.execute("SELECT sql FROM duckdb_views() WHERE view_name = 'chasm_v'").fetchone()[0]
+    assert "((" in stored  # the shape this test exists for
+    with Scorer("duckdb", db=conn) as scorer:
+        chasm = scorer.sample("SELECT * FROM chasm_v ORDER BY id")
+        assert stages(chasm)["schema"] == "passed"
+        assert chasm.has("fan_out") and not chasm.has("cartesian_join"), chasm.summary()
+        on_view = scorer.sample("SELECT * FROM on_view_v ORDER BY id")
+        assert stages(on_view)["schema"] == "passed", on_view.summary()
+        assert not on_view.findings_at_least(Severity.MEDIUM), on_view.summary()
+        grouped = scorer.sample(
+            "SELECT t.name, x.label FROM (t JOIN d ON d.t_id = t.id) CROSS JOIN p AS x ORDER BY 1"
+        )
+        assert stages(grouped)["schema"] == "passed", grouped.summary()
+
+
+def test_duckdb_time_zone_columns_need_no_extra_package():
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, seen_at TIMESTAMPTZ); "
+        "INSERT INTO e VALUES (1, '2026-03-08 10:00:00+00'), (2, NULL);"
+    )
+    with Scorer("duckdb", db=conn) as scorer:
+        report = scorer.sample("SELECT id, seen_at, id AS id FROM e ORDER BY id")
+    assert stages(report)["sample"] == "passed", report.summary()
+    assert report.signals["rows_returned"] == 2
+    assert report.signals["columns"][1] == "seen_at" and len(report.signals["columns"]) == 3
+
+
+def test_sqlite_cost_counts_rows_not_ids():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        "CREATE TABLE big_ids (id INTEGER PRIMARY KEY, v TEXT);"
+        "INSERT INTO big_ids VALUES (9000000000, 'a'), (9000000001, 'b');"
+    )
+    with Scorer("sqlite", db=conn) as scorer:
+        report = scorer.sample("SELECT v FROM big_ids ORDER BY id")
+    assert report.cost.value == 2
+    assert stages(report)["sample"] == "passed"

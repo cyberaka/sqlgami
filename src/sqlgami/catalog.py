@@ -42,6 +42,8 @@ class Column:
     nullable: bool | None = None  # None means not known
     # The complete set of distinct values, when someone has profiled the column.
     values: tuple[Any, ...] | None = None
+    # Set once a look at the data showed too many distinct values to list.
+    high_cardinality: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name, "type": self.type, "nullable": self.nullable}

@@ -17,6 +17,7 @@ from typing import Any
 from sqlglot import exp
 
 from . import analysis as A
+from . import types as T
 from .catalog import Catalog, Table
 from .checks import CheckContext, Probe, run_static_checks
 from .checks.base import PROBE_HAS_NULL, PROBE_TIMESTAMP_FORMAT, PROBE_UNIQUE, PROBE_VALUE
@@ -32,6 +33,7 @@ from .report import (
     StageResult,
     StageStatus,
 )
+from .question import run_question_checks
 from .scoring import Calibrator, score_report
 
 logger = logging.getLogger("sqlgami")
@@ -48,6 +50,11 @@ class Options:
     probe_timeout_s: float = 5.0
     max_probes: int = 24
     max_distinct_values: int = 200
+    # With a question, low-cardinality text columns of the tables read are profiled (sample
+    # mode only) so words in the question can be matched to stored values.
+    profile_values: bool = True
+    max_profile_columns: int = 40
+    max_profile_values: int = 40
 
 
 class _Clock:
@@ -72,13 +79,11 @@ def run(
     question: str | None = None,
     options: Options | None = None,
     calibrator: Calibrator | None = None,
+    glossary: str | None = None,
 ) -> Report:
     options = options or Options()
     report = Report(engine=engine, mode=mode, sql=sql, question=question)
-    try:
-        _run(report, sql, dialect, mode, catalog, adapter, question, options)
-    except SqlgamiError:
-        raise
+    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options)
     scored = score_report(report, calibrator)
     report.confidence = scored.confidence
     report.verdict = scored.verdict
@@ -102,11 +107,10 @@ def _run(
     catalog: Catalog | None,
     adapter: Adapter | None,
     question: str | None,
+    glossary: str | None,
     options: Options,
 ) -> None:
     clock = _Clock()
-    wants_dry = mode in ("dry", "sample", "full")
-    wants_sample = mode in ("sample", "full")
 
     # ------------------------------------------------------------- parse
     analysis = A.analyse(sql, catalog, dialect)
@@ -116,12 +120,12 @@ def _run(
             Finding("parse_error", Severity.ERROR, f"The statement does not parse: {analysis.parse_error}", "parse")
         )
         _stage(report, "parse", StageStatus.FAILED, analysis.parse_error, elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample"), "the statement does not parse")
+        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "question"), "the statement does not parse")
         return
     if analysis.kind == A.EMPTY:
         report.findings.append(Finding("empty_statement", Severity.ERROR, "There is no statement to check.", "parse"))
         _stage(report, "parse", StageStatus.FAILED, "empty input", elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample"), "empty input")
+        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "question"), "empty input")
         return
     _stage(report, "parse", StageStatus.PASSED, None, elapsed)
 
@@ -164,7 +168,7 @@ def _run(
     if problem is not None:
         report.findings.append(problem)
         _stage(report, "statement", StageStatus.FAILED, problem.message, clock.lap())
-        _not_run(report, ("schema", "static", "dry_run", "sample"), "the statement is not a plain read-only query")
+        _not_run(report, ("schema", "static", "dry_run", "sample", "question"), "the statement is not a plain read-only query")
         return
     _stage(report, "statement", StageStatus.PASSED, None, clock.lap())
 
@@ -251,7 +255,83 @@ def _run(
     else:
         _stage(report, "static", StageStatus.NOT_RUN, "needs a resolved schema")
 
-    # ----------------------------------------------------------- dry run
+    _database_stages(report, sql, mode, adapter, analysis, ctx, schema_findings, options, clock)
+    _question_stage(report, ctx, adapter, question, glossary, mode, options)
+
+
+def _question_stage(
+    report: Report,
+    ctx: CheckContext | None,
+    adapter: Adapter | None,
+    question: str | None,
+    glossary: str | None,
+    mode: str,
+    options: Options,
+) -> None:
+    if not question or not question.strip():
+        _stage(report, "question", StageStatus.NOT_RUN, "no question was supplied")
+        return
+    if ctx is None:
+        _stage(report, "question", StageStatus.NOT_RUN, "needs a resolved schema")
+        return
+    if any(f.severity == Severity.ERROR for f in report.findings):
+        _stage(report, "question", StageStatus.NOT_RUN, "the statement cannot run")
+        return
+    clock = _Clock()
+    sample = report.stage("sample")
+    ran = sample is not None and sample.status in (StageStatus.PASSED, StageStatus.SKIPPED)
+    if adapter is not None and mode in ("sample", "full") and ran and options.profile_values:
+        _profile_values(report, ctx, adapter, options)
+    findings = run_question_checks(ctx, question, glossary)
+    report.findings.extend(findings)
+    _stage(report, "question", StageStatus.PASSED, f"{len(findings)} finding(s)", clock.lap())
+
+
+def _profile_values(report: Report, ctx: CheckContext, adapter: Adapter, options: Options) -> None:
+    """List the distinct values of low-cardinality text columns in the tables the query reads."""
+    budget = options.max_profile_columns
+    limit = options.max_profile_values
+    for table in ctx.analysis.tables.values():
+        if table.is_view or not _probe_allowed(adapter, table, options):
+            continue
+        for column in table.columns:
+            if column.values is not None or column.high_cardinality:
+                continue
+            family = T.family_of_declared(column.type, ctx.dialect)
+            if family not in (T.TEXT, T.UNKNOWN, T.OTHER):
+                continue
+            if budget <= 0:
+                return
+            budget -= 1
+            try:
+                rows = adapter.query(
+                    exp.select(_column(column.name)).distinct().from_(adapter.table_ref(table)).limit(limit + 1),
+                    max_rows=limit + 1,
+                    timeout_s=options.probe_timeout_s,
+                )
+            except AdapterError as exc:
+                logger.debug("value profile failed: %s", exc)
+                column.high_cardinality = True
+                continue
+            if len(rows) <= limit:
+                column.values = tuple(row[0] for row in rows)
+            else:
+                column.high_cardinality = True
+
+
+def _database_stages(
+    report: Report,
+    sql: str,
+    mode: str,
+    adapter: Adapter | None,
+    analysis: A.Analysis,
+    ctx: CheckContext | None,
+    schema_findings: list[Finding],
+    options: Options,
+    clock: _Clock,
+) -> None:
+    wants_dry = mode in ("dry", "sample", "full")
+    wants_sample = mode in ("sample", "full")
     if not wants_dry:
         _not_run(report, ("dry_run", "sample"), f"mode is {mode}")
         return
@@ -573,7 +653,7 @@ def _probe_value(report: Report, ctx: CheckContext, adapter: Adapter, probe: Pro
     literal = str(probe.literal)
     negated = probe.operator == "<>"
     ref = adapter.table_ref(table)
-    if column.values is None:
+    if column.values is None and not column.high_cardinality:
         limit = options.max_distinct_values
         rows = adapter.query(
             exp.select(_column(column.name)).distinct().from_(ref).limit(limit + 1),
@@ -582,6 +662,8 @@ def _probe_value(report: Report, ctx: CheckContext, adapter: Adapter, probe: Pro
         )
         if len(rows) <= limit:
             column.values = tuple(row[0] for row in rows)  # remembered for later queries
+        else:
+            column.high_cardinality = True
     if column.values is not None:
         present, near = judge_value(column.values, literal)
     else:

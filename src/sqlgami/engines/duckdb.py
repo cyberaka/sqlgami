@@ -170,16 +170,21 @@ class DuckDBAdapter(Adapter):
         with self._lock:
             timer.start()
             try:
-                cursor = self.conn.execute(sql)
-                columns = [d[0] for d in cursor.description or []]
                 if max_rows is None:
-                    rows = cursor.fetchall()
-                    truncated = False
-                else:
-                    rows = cursor.fetchmany(max_rows + 1)
-                    truncated = len(rows) > max_rows
-                    rows = rows[:max_rows]
-                return columns, rows_as_tuples(rows), truncated
+                    cursor = self.conn.execute(sql)
+                    columns = [d[0] for d in cursor.description or []]
+                    return columns, rows_as_tuples(cursor.fetchall()), False
+                relation = self.conn.sql(sql)
+                columns = list(relation.columns)
+                # DuckDB needs the pytz package to hand time-zone-aware values to Python.
+                # Reading those columns as text avoids depending on it.
+                projection = ", ".join(
+                    f"CAST(#{i} AS VARCHAR)" if "TIME ZONE" in str(t).upper() else f"#{i}"
+                    for i, t in enumerate(relation.types, 1)
+                )
+                rows = relation.project(projection).limit(max_rows + 1).fetchall()
+                truncated = len(rows) > max_rows
+                return columns, rows_as_tuples(rows[:max_rows]), truncated
             except self._duckdb.Error as exc:
                 if timed_out.is_set():
                     raise _Timeout(str(exc)) from exc
@@ -190,6 +195,8 @@ class DuckDBAdapter(Adapter):
     def _error_kind(self, exc: Exception) -> str:
         if isinstance(exc, _Timeout):
             return TIMEOUT
+        if "failed to import" in str(exc):
+            return OTHER  # a missing Python module on the host, nothing to do with the SQL
         names = {cls.__name__ for cls in type(exc).__mro__}
         return INVALID if names & set(_INVALID_ERRORS) else OTHER
 

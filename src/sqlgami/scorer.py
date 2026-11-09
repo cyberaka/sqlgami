@@ -36,6 +36,9 @@ class Scorer:
         SQLite and DuckDB). Above it the query is not run.
     tenant_column, soft_delete_column:
         Policy hints, applied to the catalog.
+    glossary:
+        Business definitions, as text or a ``{term: meaning}`` dictionary. Values
+        named here are not reported as filters the question never asked for.
 
     A scorer holds no global state and configures no logging. It is safe to
     create several. One scorer should be used from one thread at a time.
@@ -55,6 +58,7 @@ class Scorer:
         soft_delete_column: str | None = None,
         calibrator: Calibrator | None = None,
         options: Options | None = None,
+        glossary: str | dict | None = None,
     ) -> None:
         self.engine = engine.lower()
         self.dialect = dialect_for(self.engine)
@@ -94,6 +98,9 @@ class Scorer:
         if timeout_s is not None:
             self.options.timeout_s = timeout_s
         self.calibrator = calibrator
+        if isinstance(glossary, dict):
+            glossary = "\n".join(f"{term}: {meaning}" for term, meaning in glossary.items())
+        self.glossary: str | None = glossary
 
         default = "dry" if self.adapter is not None else "static"
         self.mode = self._check_mode(mode or default)
@@ -139,6 +146,7 @@ class Scorer:
             question=question,
             options=options,
             calibrator=self.calibrator,
+            glossary=self.glossary,
         )
 
     def explain(self, sql: str, question: str | None = None) -> Report:

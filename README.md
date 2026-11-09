@@ -116,6 +116,26 @@ Static checks, each reported as a finding with a severity:
 | `soft_deleted_rows` | a soft-delete marker that is never looked at (needs `soft_delete_column`) |
 | `natural_join` | `NATURAL JOIN` |
 
+When you pass the question, sqlgami also compares it with the SQL. These checks
+are word-and-structure matching with no language model involved:
+
+| Code | Catches |
+|---|---|
+| `count_grain` | "how many customers" answered by counting rows of a join that repeats customers |
+| `question_value_unused` | the question names a stored value (such as "paid") that the SQL never filters on |
+| `filter_not_in_question` | a filter on a value the question and glossary never mention |
+| `top_n`, `order_direction` | "top 5" without `LIMIT 5`, or sorted the wrong way |
+| `aggregate_mismatch` | "average" or "median" with no such computation |
+| `number_unused` | a number in the question that appears nowhere in the SQL |
+| `grouping_missing` | "per customer" answered with a single aggregate |
+| `negation_missing` | "not", "never", "without" with no negation in the SQL |
+| `time_filter_missing` | a year or period in the question with no date condition |
+
+Matching the question's words to stored values needs the values, which sqlgami
+reads in `sample` mode (low-cardinality text columns of the tables the query
+uses, cached for later calls). Pass `glossary=` to `Scorer` so that values your
+business definitions imply are not reported as unasked-for filters.
+
 Views are expanded before the checks run, including views built on other
 views, so a check sees the base tables a view reads.
 
@@ -151,6 +171,9 @@ if the column really holds NULLs. Filter values are looked up in the column.
   "plan": []
 }
 ```
+
+Stages, in order, are `parse`, `statement`, `schema`, `static`, `dry_run`,
+`sample` and `question`.
 
 Verdicts are `invalid`, `likely_wrong`, `uncertain`, `likely_right` and
 `unverified`. A check that could not run is listed under `checks_not_run`
@@ -194,6 +217,27 @@ sqlgami score --engine duckdb --db shop.duckdb --fail-under 0.5 "SELECT ..."
 uv sync
 uv run pytest
 ```
+
+### Bench
+
+`bench/` holds test suites: realistic schemas, deterministic data generators,
+questions with gold SQL, planted bugs and equivalent rewrites. `benchkit/` is
+the tooling around them. It is not part of the installed package.
+
+```
+uv run python -m benchkit build saas_billing       # generate data, build SQLite and DuckDB databases
+uv run python -m benchkit validate saas_billing    # check gold, bugs and equivalents against each other
+uv run python -m benchkit evaluate saas_billing    # score everything with sqlgami, print metrics
+uv run python -m benchkit label saas_billing bench/.runs/<run-id>   # label candidates.jsonl by execution
+```
+
+A suite can be named by its directory under `bench/` or by a path. Generated
+data, downloaded benchmarks and run output live under `bench/.data/`,
+`bench/.external/` and `bench/.runs/`, which are not committed.
+
+A statement is labelled correct only if it returns what the gold SQL returns
+on every data seed, including one seed built to be hostile (NULLs, duplicates,
+several tenants, soft-deleted rows, boundary dates).
 
 ## License
 

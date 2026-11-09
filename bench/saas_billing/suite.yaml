@@ -1,0 +1,117 @@
+name: saas_billing
+description: >
+  Multi-tenant SaaS billing suite. Two schemas (billing, audit), 42 base tables,
+  12 views (including two view-on-view chains), one Postgres materialized view.
+  Exercises tenant isolation, SCD2, recursive hierarchies, nullable FKs, JSON
+  payloads, soft deletes, time zones, quoted mixed-case identifiers, and (on
+  Postgres) a range-partitioned usage_events table.
+
+engines:
+  - sqlite
+  - duckdb
+  - postgres
+
+as_of: "2026-06-30T00:00:00Z"
+
+tenant_column: tenant_id
+soft_delete_column: deleted_at
+
+seeds:
+  - {seed: 1, profile: clean}
+  - {seed: 2, profile: clean}
+  - {seed: 3, profile: clean}
+  - {seed: 42, profile: nasty}
+
+session:
+  timezone: UTC
+  notes: >
+    The loader pins the session TimeZone to UTC on Postgres and DuckDB. All
+    gold SQL is written assuming a UTC session. DuckDB requires the ICU
+    extension for AT TIME ZONE on TIMESTAMPTZ columns; the duckdb.sql file
+    runs INSTALL icu; LOAD icu; at the top.
+
+sqlite_naming:
+  rule: "<schema>_<table>"
+  quoted_examples:
+    - '"billing_PlanFeatures"'
+  notes: >
+    SQLite has one database. Every table is named <schema>_<table>, with no
+    exceptions. Mixed-case tables are quoted exactly as in Postgres (double
+    quotes). Views follow the same rule. No ATTACH DATABASE.
+
+types:
+  money_cents:
+    storage: INTEGER
+    notes: minor units (cents, paise, yen). JPY uses minor_unit_scale=1.
+  rate_e8:
+    storage: BIGINT
+    scale: 100000000
+    notes: scaled integer; actual_value = rate_e8 / 1e8.
+  pct_e6:
+    storage: BIGINT
+    scale: 1000000
+    notes: percentage scaled; "7.25%" is 7250000.
+  unit_price_e4:
+    storage: BIGINT
+    scale: 10000
+    notes: micro-cents-per-unit; actual_cents = unit_price_e4 * quantity / 10000.
+  booleans:
+    emit_as: "JSON true / false"
+    storage: "BOOLEAN on Postgres/DuckDB; INTEGER 0/1 on SQLite (loader maps)"
+  timestamps:
+    storage: "TIMESTAMPTZ on Postgres/DuckDB; TEXT on SQLite"
+    serialization: "ISO 8601 with +00:00 offset"
+  dates:
+    serialization: "YYYY-MM-DD"
+  json:
+    postgres_type: JSONB
+    duckdb_type: JSON
+    sqlite_type: TEXT
+
+tenants:
+  count: 6
+  billing_timezones:
+    - "Asia/Kolkata (no DST)"
+    - "Asia/Tokyo (no DST)"
+    - "America/Los_Angeles (DST)"
+    - "Europe/London (DST)"
+    - "Asia/Kolkata (no DST)"
+    - "America/Los_Angeles (DST)"
+  notes: >
+    Tenants carry an IANA zone in billing_timezone. All stored timestamps are
+    UTC. The zone is used only when a question asks for a business-local
+    boundary — gold for DST-affected questions is null on sqlite when a fixed
+    offset isn't safe.
+
+row_budget:
+  clean_seed_1: 34503
+  clean_seed_2: 34389
+  clean_seed_3: 34365
+  nasty_seed_42: 34443
+  cap: 50000
+
+views:
+  view_on_view_chains:
+    - [billing.current_addresses_v, billing.current_tax_rates_v, billing.tenant_billing_details_v]
+    - [billing.active_subscriptions_v, billing.tenant_mrr_v, billing.mrr_by_month_v]
+  materialized_views:
+    - billing.monthly_revenue_mv  # Postgres only; loader refreshes after load.
+
+partitioned_tables:
+  - billing.usage_events  # Postgres only; range-partitioned by event_at (monthly).
+
+quoted_identifiers:
+  - billing."PlanFeatures" (table)
+  - billing.invoices."IsAutoBilled" (column)
+  - audit.audit_log."OldState" (column)
+  - audit.audit_log."NewState" (column)
+
+nasty_profile_hazards:
+  - NULLs in nullable columns the questions touch
+  - Three tenants sharing the same invoice_number (INV-SHARED-0001)
+  - Soft-deleted subscription that's the newest-updated for its tenant
+  - Usage events at month and DST boundaries (2026-03-08)
+  - Empty-string vs NULL email on one billing_contact
+  - Orphaned FK (notification.tenant_id=99999 — no FK constraint declared on that column)
+  - Duplicate ties in total_cents (two invoices at exactly 42000)
+  - Trailing whitespace in user emails

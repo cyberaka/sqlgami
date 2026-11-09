@@ -370,6 +370,11 @@ class _Resolver:
                 alias=exp.TableAlias(this=alias_ident, columns=columns or None),
             )
             subquery.meta["sqlgami_view"] = qualified
+            # In a parenthesised join group the joins hang off the first table; keep them.
+            for key in ("joins", "pivots", "laterals"):
+                carried = node.args.get(key)
+                if carried:
+                    subquery.set(key, carried)
             node.replace(subquery)
             return
 

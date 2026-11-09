@@ -108,6 +108,8 @@ class _Loader:
 class SQLiteAdapter(Adapter):
     engine = "sqlite"
     dialect = "sqlite"
+    # Tables are counted only up to this many rows; beyond it the count reads as "at least".
+    row_count_bound = 20_000_000
 
     def __init__(self, db: Any) -> None:
         self._owned = False
@@ -232,15 +234,18 @@ class SQLiteAdapter(Adapter):
         return rows
 
     def row_count(self, table: Table) -> int | None:
+        """Rows in a table, counted up to a bound so a huge table costs a fixed amount."""
         key = (table.schema, table.name)
         if key not in self._row_counts:
             count: int | None = None
             if not table.is_view:
                 schema = _quote(table.schema or "main")
+                bound = self.row_count_bound
                 try:
-                    # MAX(rowid) is an index lookup: a cheap upper bound on the row count.
-                    row = self._fetch(f"SELECT MAX(rowid) FROM {schema}.{_quote(table.name)}")
-                    count = int(row[0][0]) if row and row[0][0] is not None else 0
+                    row = self._fetch(
+                        f"SELECT COUNT(*) FROM (SELECT 1 FROM {schema}.{_quote(table.name)} LIMIT {bound + 1})"
+                    )
+                    count = int(row[0][0])
                 except (AdapterError, TypeError, ValueError):
                     count = None
             self._row_counts[key] = count

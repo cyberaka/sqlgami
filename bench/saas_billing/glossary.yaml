@@ -1,0 +1,43 @@
+terms:
+  active_subscription: >
+    deleted_at IS NULL AND status IN ('active','past_due') AND
+    (ended_at IS NULL OR ended_at > as_of).
+  current_tax_rate: >
+    A row in billing.tax_rates with effective_to IS NULL. Historical rows are
+    kept for audit; "current" means the one row per jurisdiction with
+    effective_to IS NULL.
+  current_address: >
+    A row in billing.addresses with effective_to IS NULL.
+  mrr: >
+    Monthly recurring revenue. Computed only for subscriptions on monthly
+    plans (billing_interval='month'). base_price_cents is the recurring
+    charge; one-time credits, adjustments and taxes are excluded from MRR.
+  tenant_scope: >
+    Multi-tenant isolation. Every tenant-scoped query must filter by
+    tenant_id. Questions that imply an acting tenant carry a tenant field;
+    questions that ask across tenants have tenant=null and the gold does
+    not add a filter.
+  overdue: >
+    An invoice whose status='overdue'. The generator sets status
+    deterministically; the question should not re-derive overdue from
+    due_date.
+  revenue: >
+    SUM(total_cents) over invoices with status IN ('paid','partial') and
+    deleted_at IS NULL. Returns are not deducted inside this suite; see
+    retail suite for return-aware revenue.
+  last_month: >
+    In this suite, "last month" is the previous calendar month in UTC —
+    e.g. for as_of 2026-06-30T00:00:00Z, last month is 2026-05-01 through
+    2026-05-31 inclusive, or [2026-05-01, 2026-06-01). Trailing-30-days
+    questions say so explicitly.
+  tenant_timezone_bucket: >
+    When a question asks for "daily/monthly in the tenant's billing
+    timezone", gold converts UTC timestamps via AT TIME ZONE
+    tenants.billing_timezone before truncating. DuckDB requires ICU;
+    SQLite gold is null on DST zones for the periods affected.
+
+scales:
+  rate_e8: "value = rate_e8 / 1e8"
+  pct_e6:  "percentage = pct_e6 / 1e6"
+  unit_price_e4: "unit price in cents = unit_price_e4 / 1e4"
+  money_cents: "minor units (per currency's minor_unit_scale)"

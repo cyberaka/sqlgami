@@ -1,0 +1,11 @@
+name: minisuite
+description: A tiny suite used to test the bench tooling itself.
+engines: [sqlite, duckdb]
+as_of: "2026-06-30T00:00:00Z"
+tenant_column: tenant_id
+soft_delete_column: deleted_at
+seeds:
+  - {seed: 1, profile: clean}
+  - {seed: 2, profile: clean}
+  - {seed: 3, profile: clean}
+  - {seed: 42, profile: nasty}

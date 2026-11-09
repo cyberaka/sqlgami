@@ -88,19 +88,28 @@ class JoinRecord:
 
 
 def _expand_join_target(node: exp.Expression) -> tuple[list[str], list[JoinRecord]]:
-    """Aliases and joins inside one FROM item, which may be a parenthesised join group."""
+    """Aliases and joins inside one FROM item, which may be a parenthesised join group.
+
+    ``((a JOIN b ON ...) JOIN c ON ...)`` nests wrappers, and each wrapper level
+    can carry joins of its own.
+    """
+    levels = [node]
     base = node
-    while isinstance(base, exp.Subquery) and base.this is not None and not isinstance(base.this, exp.Query):
+    # exp.Subquery is itself a Query subclass, so test for the real query node types.
+    while isinstance(base, exp.Subquery) and isinstance(base.this, (exp.Table, exp.Subquery)):
         base = base.this
-    aliases = [base.alias_or_name]
+        levels.append(base)
+    alias = next((level.alias_or_name for level in levels if level.alias_or_name), "")
+    aliases = [alias]
     records: list[JoinRecord] = []
-    for join in base.args.get("joins") or []:
-        if join.this is None:
-            continue
-        targets, nested = _expand_join_target(join.this)
-        records.extend(nested)
-        records.append(JoinRecord(join, targets, list(aliases)))
-        aliases.extend(targets)
+    for level in reversed(levels):  # innermost first: that is the order the joins apply in
+        for join in level.args.get("joins") or []:
+            if join.this is None:
+                continue
+            targets, nested = _expand_join_target(join.this)
+            records.extend(nested)
+            records.append(JoinRecord(join, targets, list(aliases)))
+            aliases.extend(targets)
     return aliases, records
 
 
