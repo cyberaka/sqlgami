@@ -396,7 +396,7 @@ def test_report_is_json_and_keeps_its_shape(scorer):
     assert data["schema_version"] == SCHEMA_VERSION == "1.0"
     assert data["advisory"] == ADVISORY
     assert data["question"] == "Total order value per US customer"
-    assert set(data["confidence"]) == {"value", "low", "high", "calibrated", "cap", "cap_reason", "basis"}
+    assert set(data["confidence"]) == {"value", "raw", "low", "high", "calibrated", "cap", "cap_reason", "basis"}
     assert 0.0 <= data["confidence"]["low"] <= data["confidence"]["value"] <= data["confidence"]["high"] <= 1.0
     for finding in data["findings"]:
         assert set(finding) == {"code", "severity", "message", "stage", "snippet", "suggestion", "evidence"}

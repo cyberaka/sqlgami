@@ -74,20 +74,30 @@ def _pg_connect(database: str | None = None, read_only: bool = False) -> Any:
         raise SuiteError(f"could not connect to Postgres database {database or ''}: {exc}") from exc
 
 
-def _build_postgres(suite: Suite, seed: Seed, statements: list[str], order: list[str], by_key: dict[str, Path], force: bool) -> str:
+def _build_postgres(
+    suite: Suite,
+    seed: Seed,
+    statements: list[str],
+    order: list[str],
+    by_key: dict[str, Path],
+    force: bool,
+    stamp: str,
+) -> str:
     name = pg_database(suite, seed)
     admin = _pg_connect()
     try:
         exists = admin.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone()
         if exists and not force:
-            marker = None
+            built_from = None
             try:
                 check = _pg_connect(name)
-                marker = check.execute("SELECT to_regclass('public.sqlgami_bench_complete')").fetchone()[0]
+                if check.execute("SELECT to_regclass('public.sqlgami_bench_complete')").fetchone()[0]:
+                    row = check.execute("SELECT fingerprint FROM public.sqlgami_bench_complete").fetchone()
+                    built_from = row[0] if row else None
                 check.close()
-            except SuiteError:
-                marker = None
-            if marker:
+            except Exception:
+                built_from = None
+            if built_from == stamp:
                 return name
         admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         admin.execute(f'CREATE DATABASE "{name}"')
@@ -109,7 +119,8 @@ def _build_postgres(suite: Suite, seed: Seed, statements: list[str], order: list
         for schema, view in conn.execute("SELECT schemaname, matviewname FROM pg_matviews").fetchall():
             conn.execute(f'REFRESH MATERIALIZED VIEW "{schema}"."{view}"')
         conn.execute("ANALYZE")
-        conn.execute("CREATE TABLE public.sqlgami_bench_complete (built_at timestamptz DEFAULT now())")
+        conn.execute("CREATE TABLE public.sqlgami_bench_complete (fingerprint text)")
+        conn.execute("INSERT INTO public.sqlgami_bench_complete VALUES (%s)", (stamp,))
     finally:
         conn.close()
     return name
@@ -132,11 +143,12 @@ def generate(suite: Suite, seed: Seed, out: Path | None = None, force: bool = Fa
     """Run the suite's generator for one seed. Reuses existing output unless ``force``."""
     out = out or data_dir(suite, seed)
     marker = out / ".complete"
-    if marker.exists() and not force:
-        return out
     script = suite.path / "generate.py"
     if not script.exists():
         raise SuiteError(f"{suite.name} has no generate.py")
+    script_hash = hashlib.sha256(script.read_bytes()).hexdigest()
+    if marker.exists() and not force and marker.read_text().strip() == script_hash:
+        return out
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob("*.jsonl"):
         old.unlink()
@@ -149,7 +161,7 @@ def generate(suite: Suite, seed: Seed, out: Path | None = None, force: bool = Fa
     )
     if result.returncode != 0:
         raise SuiteError(f"generate.py failed for seed {seed.seed}: {result.stderr.strip()[-800:]}")
-    marker.write_text("ok\n")
+    marker.write_text(script_hash + "\n")
     return out
 
 
@@ -159,6 +171,14 @@ def digest(directory: Path) -> str:
     for path in sorted(directory.glob("*.jsonl")):
         sha.update(path.name.encode())
         sha.update(path.read_bytes())
+    return sha.hexdigest()
+
+
+def fingerprint(suite: Suite, engine: str, rows_dir: Path) -> str:
+    """Identifies the schema and data a database was built from, to spot a stale build."""
+    sha = hashlib.sha256()
+    sha.update(suite.schema_file(engine).read_bytes())
+    sha.update(digest(rows_dir).encode())
     return sha.hexdigest()
 
 
@@ -299,11 +319,15 @@ def build(suite: Suite, engine: str, seed: Seed, force: bool = False) -> Path:
         statements = split_statements(schema_file.read_text(encoding="utf-8"))
         by_key = {_stem_key(engine, p.stem): p for p in sorted(rows_dir.glob("*.jsonl"))}
         order = _insert_order(sorted(by_key), _references(statements, engine))
-        return Path(_build_postgres(suite, seed, statements, order, by_key, force))
+        return Path(
+            _build_postgres(suite, seed, statements, order, by_key, force, fingerprint(suite, engine, rows_dir))
+        )
     path = db_path(suite, engine, seed)
-    if path.exists() and not force:
-        return path
     rows_dir = generate(suite, seed)
+    stamp = fingerprint(suite, engine, rows_dir)
+    stamp_file = path.with_suffix(path.suffix + ".fingerprint")
+    if path.exists() and not force and stamp_file.exists() and stamp_file.read_text().strip() == stamp:
+        return path
     statements = split_statements(schema_file.read_text(encoding="utf-8"))
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".partial")
@@ -360,6 +384,7 @@ def build(suite: Suite, engine: str, seed: Seed, force: bool = False) -> Path:
         finally:
             conn.close()
     partial.rename(path)
+    stamp_file.write_text(stamp + "\n")
     return path
 
 

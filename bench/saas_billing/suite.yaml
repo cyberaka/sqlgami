@@ -87,7 +87,7 @@ row_budget:
   clean_seed_1: 34503
   clean_seed_2: 34389
   clean_seed_3: 34365
-  nasty_seed_42: 34443
+  nasty_seed_42: 34467
   cap: 50000
 
 views:
@@ -109,9 +109,18 @@ quoted_identifiers:
 nasty_profile_hazards:
   - NULLs in nullable columns the questions touch
   - Three tenants sharing the same invoice_number (INV-SHARED-0001)
-  - Soft-deleted subscription that's the newest-updated for its tenant
+  - Three soft-deleted subscriptions across different plans
+  - Three soft-deleted invoices (status='paid' with deleted_at NOT NULL)
+  - Two soft-deleted users
+  - Two soft-deleted payment methods
+  - An invoice with total_cents = exactly 50000 (boundary trap)
+  - A credit with expires_at = exactly 2026-07-01T00:00:00+00:00 (boundary)
+  - An invoice issued at exactly 2026-07-01T00:00:00+00:00 (upper Q2 boundary)
   - Usage events at month and DST boundaries (2026-03-08)
   - Empty-string vs NULL email on one billing_contact
-  - Orphaned FK (notification.tenant_id=99999 — no FK constraint declared on that column)
-  - Duplicate ties in total_cents (two invoices at exactly 42000)
+  - Orphaned FK (notifications.tenant_id=99999 — no FK constraint declared on that column)
+  - Two tied highest-paid invoices (two at 9999900)
+  - Eight mid-range tied invoices (four each on tenants 10002 and 10003)
   - Trailing whitespace in user emails
+  - A "Quiet Holdings" tenant with no disputes / subscriptions / invoices (triggers outer-join collapse bugs)
+  - A "Both Pro and Enterprise" tenant that has both plan tiers (triggers NOT IN / EXCEPT bugs)

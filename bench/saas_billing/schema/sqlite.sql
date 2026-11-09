@@ -525,14 +525,18 @@ SELECT substr(s.started_at, 1, 7) || '-01' AS month_start,
 CREATE VIEW billing_at_risk_accounts_v AS
 SELECT t.tenant_id,
        t.name,
-       COUNT(DISTINCT d.dispute_id)                 AS open_disputes,
-       COALESCE(SUM(CASE WHEN i.status = 'overdue'
-                         THEN i.total_cents ELSE 0 END), 0) AS overdue_cents
+       COALESCE(d.open_disputes, 0) AS open_disputes,
+       COALESCE(i.overdue_cents,  0) AS overdue_cents
   FROM billing_tenants t
-  LEFT JOIN audit_disputes d       ON d.tenant_id = t.tenant_id AND d.status = 'open'
-  LEFT JOIN billing_invoices i      ON i.tenant_id = t.tenant_id AND i.deleted_at IS NULL
- WHERE t.deleted_at IS NULL
- GROUP BY t.tenant_id, t.name;
+  LEFT JOIN (SELECT tenant_id, COUNT(*) AS open_disputes
+               FROM audit_disputes
+              WHERE status = 'open'
+              GROUP BY tenant_id) d ON d.tenant_id = t.tenant_id
+  LEFT JOIN (SELECT tenant_id, SUM(total_cents) AS overdue_cents
+               FROM billing_invoices
+              WHERE status = 'overdue' AND deleted_at IS NULL
+              GROUP BY tenant_id) i ON i.tenant_id = t.tenant_id
+ WHERE t.deleted_at IS NULL;
 
 CREATE VIEW billing_credit_balance_v AS
 SELECT c.credit_id,

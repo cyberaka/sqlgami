@@ -82,6 +82,10 @@ class Table:
     row_count: int | None = None
     # False when key information could not be read at all (as opposed to "has no keys").
     keys_known: bool = True
+    # Columns the table is partitioned by. A query that does not filter on them scans everything.
+    partition_columns: tuple[str, ...] = ()
+    # For a periodic snapshot table (one row per thing per snapshot): the snapshot date column.
+    snapshot_column: str | None = None
 
     @property
     def is_view(self) -> bool:
@@ -113,7 +117,65 @@ class Table:
             "view_columns": list(self.view_columns),
             "row_count": self.row_count,
             "keys_known": self.keys_known,
+            "partition_columns": list(self.partition_columns),
+            "snapshot_column": self.snapshot_column,
         }
+
+
+@dataclass
+class RequiredPredicate:
+    """A rule that every query reading certain tables must filter on certain columns.
+
+    ``match`` says how:
+
+    * ``any``: at least one of the columns is pinned to a value;
+    * ``all``: every one of them is;
+    * ``or_chain``: the query holds one ``c1 = v OR c2 = v OR ...`` condition covering
+      every listed column the table has. This is the shape of a hierarchy
+      access filter ("this manager at any level").
+    """
+
+    name: str
+    columns: tuple[str, ...]
+    tables: tuple[str, ...] = ()  # empty means every table that has any of the columns
+    match: str = "any"
+    severity: str = "high"
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        self.columns = tuple(self.columns)
+        self.tables = tuple(self.tables)
+        if self.match not in ("any", "all", "or_chain"):
+            raise CatalogError(f"required predicate {self.name!r}: unknown match {self.match!r}")
+        if not self.columns:
+            raise CatalogError(f"required predicate {self.name!r} names no columns")
+
+    def applies_to(self, table: "Table") -> bool:
+        if not self.tables:
+            return True
+        names = {table.name.lower(), table.qualified_name.lower()}
+        return any(t.lower() in names for t in self.tables)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "columns": list(self.columns),
+            "tables": list(self.tables),
+            "match": self.match,
+            "severity": self.severity,
+            "description": self.description,
+        }
+
+    @classmethod
+    def coerce(cls, value: Any) -> "RequiredPredicate":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            try:
+                return cls(**value)
+            except TypeError as exc:
+                raise CatalogError(f"malformed required predicate: {exc}") from exc
+        raise CatalogError("a required predicate must be a RequiredPredicate or a dictionary")
 
 
 class CatalogLoader(Protocol):
@@ -141,7 +203,20 @@ class Catalog:
         Column name that isolates tenants. When set, every table that has this
         column is expected to be filtered on it.
     soft_delete_column:
-        Column name that marks soft-deleted rows, used for an advisory check.
+        Column name that marks soft-deleted rows.
+    soft_delete_policy:
+        ``advisory`` (the default): reading such a table without looking at the
+        marker is a medium-severity finding. ``required``: your rule is that
+        deleted rows are excluded unless a question asks for them, so the same
+        omission is a high-severity policy violation.
+    required_predicates:
+        :class:`RequiredPredicate` rules (or dictionaries in the same shape), for
+        filters such as access control that every query on a table must carry.
+    snapshot_columns:
+        ``{table name: column}`` for periodic snapshot tables, where each thing
+        has one row per snapshot and a query must choose which snapshots it reads.
+    default_project:
+        BigQuery only: the project assumed for names written as ``dataset.table``.
     """
 
     def __init__(
@@ -153,14 +228,28 @@ class Catalog:
         tenant_column: str | None = None,
         soft_delete_column: str | None = None,
         loader: CatalogLoader | None = None,
+        default_project: str | None = None,
+        required_predicates: Iterable[Any] | None = None,
+        snapshot_columns: dict[str, str] | None = None,
+        soft_delete_policy: str = "advisory",
     ) -> None:
         self.dialect = dialect
+        # BigQuery: the project assumed for names written as dataset.table.
+        self.default_project = default_project
+        self.required_predicates: list[RequiredPredicate] = [
+            RequiredPredicate.coerce(p) for p in (required_predicates or [])
+        ]
+        # table name (bare or qualified) -> its snapshot date column
+        self.snapshot_columns: dict[str, str] = {k.lower(): v for k, v in (snapshot_columns or {}).items()}
         self.default_schema = default_schema or default_schema_for(dialect)
         self.search_path: list[str] = list(search_path) if search_path else (
             [self.default_schema] if self.default_schema else []
         )
         self.tenant_column = tenant_column
         self.soft_delete_column = soft_delete_column
+        if soft_delete_policy not in ("advisory", "required"):
+            raise CatalogError("soft_delete_policy must be 'advisory' or 'required'")
+        self.soft_delete_policy = soft_delete_policy
         self._loader = loader
         self._tables: dict[tuple[str, str], Table] = {}
         self._index: dict[tuple[str, str], tuple[str | None, str]] | None = None
@@ -174,18 +263,42 @@ class Catalog:
         return self.dialect in _QUOTED_CASE_SENSITIVE
 
     def storage_key(self, name: str | None) -> str:
-        """Key under which a stored object name is filed."""
+        """Key under which a stored table or schema name is filed."""
+        if name is None:
+            return ""
+        if self.dialect == "bigquery" or self.case_sensitive_when_quoted:
+            return name  # BigQuery dataset and table names are case-sensitive
+        return name.lower()
+
+    def reference_key(self, name: str | None, quoted: bool = False) -> str:
+        """Key for a table or schema name as written in a query."""
+        if name is None:
+            return ""
+        if self.dialect == "bigquery":
+            return name
+        if self.case_sensitive_when_quoted and quoted:
+            return name
+        return name.lower()
+
+    def column_key(self, name: str | None) -> str:
+        """Key under which a stored column name is filed."""
         if name is None:
             return ""
         return name if self.case_sensitive_when_quoted else name.lower()
 
-    def reference_key(self, name: str | None, quoted: bool = False) -> str:
-        """Key for a name as written in a query."""
+    def column_reference_key(self, name: str | None, quoted: bool = False) -> str:
+        """Key for a column name as written in a query. BigQuery column names ignore case."""
         if name is None:
             return ""
         if self.case_sensitive_when_quoted and quoted:
             return name
         return name.lower()
+
+    def written(self, name: str) -> str:
+        """How a stored name must be written in a query: quoted when its case would otherwise be lost."""
+        if self.case_sensitive_when_quoted and name != name.lower():
+            return '"' + name.replace('"', '""') + '"'
+        return name
 
     # ---------------------------------------------------------------- filling
 
@@ -277,6 +390,8 @@ class Catalog:
     ) -> Table | None:
         """Find a table or view by the name written in a query."""
         name_key = self.reference_key(name, quoted)
+        if self.dialect == "bigquery" and (not schema or "." not in schema):
+            return self._resolve_bigquery(name_key, schema)
         if schema:
             return self._get((self.reference_key(schema, schema_quoted), name_key))
         for candidate in (list(search_path) if search_path else self.search_path):
@@ -285,29 +400,56 @@ class Catalog:
                 return table
         return None
 
+    def _resolve_bigquery(self, name_key: str, dataset: str | None) -> Table | None:
+        """``dataset.table`` or a bare table name: fill in the project (and dataset) if unambiguous."""
+        if dataset and self.default_project:
+            found = self._get((f"{self.default_project}.{dataset}", name_key))
+            if found is not None:
+                return found
+        if not dataset:
+            for candidate in self.search_path:
+                found = self._get((candidate, name_key))
+                if found is not None:
+                    return found
+        matches = [
+            key
+            for key in self._ensure_index()
+            if key[1] == name_key and (not dataset or key[0] == dataset or key[0].endswith("." + dataset))
+        ]
+        return self._get(matches[0]) if len(matches) == 1 else None
+
     def column(self, table: Table, name: str, quoted: bool = False) -> Column | None:
-        key = self.reference_key(name, quoted)
+        key = self.column_reference_key(name, quoted)
         for column in table.columns:
-            if self.storage_key(column.name) == key:
+            if self.column_key(column.name) == key:
                 return column
         return None
 
     def column_keys(self, table: Table) -> set[str]:
-        return {self.storage_key(c.name) for c in table.columns}
+        return {self.column_key(c.name) for c in table.columns}
 
     def unique_key_sets(self, table: Table) -> list[frozenset[str]]:
-        return [frozenset(self.storage_key(c) for c in key) for key in table.all_unique_keys()]
+        return [frozenset(self.column_key(c) for c in key) for key in table.all_unique_keys()]
+
+    def snapshot_column_of(self, table: Table) -> Column | None:
+        """The snapshot date column of a periodic snapshot table, if one is declared for it."""
+        name = table.snapshot_column
+        if not name:
+            name = self.snapshot_columns.get(table.qualified_name.lower()) or self.snapshot_columns.get(
+                table.name.lower()
+            )
+        return self.column(table, name) if name else None
 
     def suggest_tables(self, name: str, limit: int = 3) -> list[str]:
         index = self._ensure_index()
         by_lower: dict[str, str] = {}
         for schema, table in index.values():
-            by_lower.setdefault(table.lower(), f"{schema}.{table}" if schema else table)
+            by_lower.setdefault(table.lower(), ".".join(self.written(p) for p in (schema, table) if p))
         close = difflib.get_close_matches(name.lower(), list(by_lower), n=limit, cutoff=0.6)
         return [by_lower[c] for c in close]
 
     def suggest_columns(self, table: Table, name: str, limit: int = 3) -> list[str]:
-        by_lower = {c.name.lower(): c.name for c in table.columns}
+        by_lower = {c.name.lower(): self.written(c.name) for c in table.columns}
         close = difflib.get_close_matches(name.lower(), list(by_lower), n=limit, cutoff=0.6)
         return [by_lower[c] for c in close]
 
@@ -321,6 +463,10 @@ class Catalog:
             "search_path": list(self.search_path),
             "tenant_column": self.tenant_column,
             "soft_delete_column": self.soft_delete_column,
+            "soft_delete_policy": self.soft_delete_policy,
+            "default_project": self.default_project,
+            "required_predicates": [p.to_dict() for p in self.required_predicates],
+            "snapshot_columns": dict(self.snapshot_columns),
             "tables": [t.to_dict() for t in self._tables.values()],
         }
 
@@ -337,6 +483,10 @@ class Catalog:
             search_path=data.get("search_path"),
             tenant_column=data.get("tenant_column"),
             soft_delete_column=data.get("soft_delete_column"),
+            soft_delete_policy=data.get("soft_delete_policy") or "advisory",
+            default_project=data.get("default_project"),
+            required_predicates=data.get("required_predicates"),
+            snapshot_columns=data.get("snapshot_columns"),
         )
         for entry in data.get("tables", []):
             try:
@@ -371,6 +521,8 @@ class Catalog:
                     view_columns=tuple(entry.get("view_columns") or ()),
                     row_count=entry.get("row_count"),
                     keys_known=entry.get("keys_known", True),
+                    partition_columns=tuple(entry.get("partition_columns") or ()),
+                    snapshot_column=entry.get("snapshot_column"),
                 )
             except (KeyError, TypeError) as exc:
                 raise CatalogError(f"malformed table entry in catalog data: {exc!r}") from exc
@@ -408,7 +560,7 @@ class Catalog:
                 continue
             table = catalog.resolve(
                 target.name,
-                target.db or None,
+                schema_name_of(target, dialect),
                 quoted=_quoted(target.this),
                 schema_quoted=_quoted(target.args.get("db")),
             )
@@ -431,6 +583,29 @@ def _quoted(identifier: Any) -> bool:
     return bool(isinstance(identifier, exp.Identifier) and identifier.args.get("quoted"))
 
 
+def schema_name_of(node: exp.Table, dialect: str) -> str | None:
+    """The schema a table node names. For BigQuery that is ``project.dataset`` as one string."""
+    db = node.db or None
+    if dialect == "bigquery" and db and node.catalog:
+        return f"{node.catalog}.{db}"
+    return db
+
+
+def _partition_columns(statement: exp.Create) -> tuple[str, ...]:
+    properties = statement.args.get("properties")
+    if properties is None:
+        return ()
+    names: list[str] = []
+    for prop in properties.find_all(exp.PartitionedByProperty):
+        for node in prop.find_all(exp.Column, exp.Identifier):
+            name = node.name
+            if name and name not in names and isinstance(node, (exp.Column, exp.Identifier)):
+                if isinstance(node, exp.Identifier) and isinstance(node.parent, exp.Column):
+                    continue
+                names.append(name)
+    return tuple(names)
+
+
 def _table_from_create(statement: exp.Create, dialect: str) -> Table | None:
     schema_node = statement.this
     if not isinstance(schema_node, exp.Schema):
@@ -438,11 +613,13 @@ def _table_from_create(statement: exp.Create, dialect: str) -> Table | None:
         target = schema_node if isinstance(schema_node, exp.Table) else None
         if target is None:
             return None
-        return Table(name=target.name, schema=target.db or None, keys_known=False)
+        return Table(name=target.name, schema=schema_name_of(target, dialect), keys_known=False)
     target = schema_node.this
     if not isinstance(target, exp.Table):
         return None
-    table = Table(name=target.name, schema=target.db or None)
+    table = Table(name=target.name, schema=schema_name_of(target, dialect))
+    known = {c.name.lower() for c in schema_node.expressions if isinstance(c, exp.ColumnDef)}
+    table.partition_columns = tuple(c for c in _partition_columns(statement) if c.lower() in known)
     for item in schema_node.expressions:
         if isinstance(item, exp.ColumnDef):
             kind = item.args.get("kind")
@@ -534,7 +711,7 @@ def _view_from_create(statement: exp.Create, dialect: str) -> Table | None:
     materialized = bool(properties and properties.find(exp.MaterializedProperty))
     return Table(
         name=target.name,
-        schema=target.db or None,
+        schema=schema_name_of(target, dialect),
         kind=MATERIALIZED_VIEW if materialized else VIEW,
         definition=statement.expression.sql(dialect=dialect),
         view_columns=view_columns,

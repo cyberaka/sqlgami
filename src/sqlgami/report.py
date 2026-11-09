@@ -127,10 +127,12 @@ class Confidence:
     cap: float | None = None
     cap_reason: str | None = None
     basis: str = ""
+    raw: float | None = None  # the provisional score before any calibration
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "value": _round(self.value),
+            "raw": _round(self.raw),
             "low": _round(self.low),
             "high": _round(self.high),
             "calibrated": self.calibrated,

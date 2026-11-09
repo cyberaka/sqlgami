@@ -17,7 +17,15 @@ import sys
 from pathlib import Path
 
 from . import build as build_mod
-from .evaluate import evaluate, format_metrics, label_run, read_candidates, write_run
+from .evaluate import (
+    calibration_samples,
+    evaluate,
+    fit_calibration,
+    format_metrics,
+    label_run,
+    read_candidates,
+    write_run,
+)
 from .suite import SuiteError, load_suite
 from .validate import validate
 
@@ -48,12 +56,32 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--candidates", help="path to a candidates.jsonl file")
     p_eval.add_argument("--run-id", help="name of the directory under bench/.runs/")
 
+    p_cal = sub.add_parser("calibrate", help="fit a calibration file from the suite's labelled SQL")
+    p_cal.add_argument("suite", nargs="+", help="one or more suites to fit on together")
+    p_cal.add_argument("--engine", action="append")
+    p_cal.add_argument("--out", required=True, help="where to write the calibration JSON")
+
     p_label = sub.add_parser("label", help="label candidate SQL as right or wrong by running it on every seed")
     p_label.add_argument("suite")
     p_label.add_argument("run", help="a run directory holding candidates.jsonl, or the file itself")
 
     args = parser.parse_args(argv)
     try:
+        if args.command == "calibrate":
+            samples = []
+            names = []
+            for name in args.suite:
+                one = load_suite(name)
+                names.append(one.name)
+                for engine in [e for e in (args.engine or one.engines) if e in build_mod.SUPPORTED]:
+                    for mode in ("static", "dry", "sample"):
+                        items, _ = evaluate(one, engine, mode)
+                        samples.extend(calibration_samples(items, mode))
+            calibrator, report = fit_calibration(samples, meta={"suites": names})
+            calibrator.save(args.out)
+            print(json.dumps(report, indent=2))
+            print(f"calibration: {args.out}")
+            return 0
         suite = load_suite(args.suite)
         if args.command == "label":
             target = label_run(suite, Path(args.run))

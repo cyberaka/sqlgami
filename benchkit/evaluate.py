@@ -35,6 +35,11 @@ class Item:
     findings: list[str] = field(default_factory=list)
     high_findings: list[str] = field(default_factory=list)
     latency_ms: float = 0.0
+    difficulty: str = ""
+    generator: str = ""
+    question: str = ""
+    cap_reason: str = ""
+    failed_stage: str = ""
 
 
 def auroc(scores: list[float], labels: list[bool]) -> float | None:
@@ -104,8 +109,46 @@ def metrics(items: list[Item]) -> dict[str, Any]:
     for entry in by_class.values():
         entry["flagged_share"] = round(entry["flagged"] / entry["total"], 3)
 
+    at_80 = [i for i in scored if i.score >= 0.8]
+    by_difficulty: dict[str, dict[str, Any]] = {}
+    for item in scored:
+        entry = by_difficulty.setdefault(item.difficulty or "unknown", {"correct": 0, "correct_flagged": 0, "wrong": 0, "wrong_flagged": 0})
+        if item.correct:
+            entry["correct"] += 1
+            entry["correct_flagged"] += int(item.score <= 0.4)
+        else:
+            entry["wrong"] += 1
+            entry["wrong_flagged"] += int(item.score <= 0.4)
+    by_kind: dict[str, dict[str, Any]] = {}
+    for item in scored:
+        entry = by_kind.setdefault(item.kind, {"n": 0, "correct": 0, "scores": []})
+        entry["n"] += 1
+        entry["correct"] += int(item.correct)
+        entry["scores"].append(item.score)
+    for entry in by_kind.values():
+        values = sorted(entry.pop("scores"))
+        entry["score_min"] = round(values[0], 3)
+        entry["score_median"] = round(values[len(values) // 2], 3)
+        entry["score_max"] = round(values[-1], 3)
+        entry["at_or_below_0.4"] = sum(1 for v in values if v <= 0.4)
+        entry["at_or_above_0.7"] = sum(1 for v in values if v >= 0.7)
+    by_generator: dict[str, dict[str, Any]] = {}
+    for item in scored:
+        if item.kind != "candidate":
+            continue
+        entry = by_generator.setdefault(item.generator or "unknown", {"n": 0, "correct": 0})
+        entry["n"] += 1
+        entry["correct"] += int(item.correct)
+    for entry in by_generator.values():
+        entry["accuracy"] = round(entry["correct"] / entry["n"], 3)
+
     latencies = [i.latency_ms for i in scored]
     return {
+        "precision_at_0.8": share([i for i in at_80 if i.correct], at_80),
+        "count_at_0.8": len(at_80),
+        "by_difficulty": dict(sorted(by_difficulty.items())),
+        "by_kind": dict(sorted(by_kind.items())),
+        "by_generator": dict(sorted(by_generator.items())),
         "items": len(scored),
         "correct": len(correct),
         "wrong": len(wrong),
@@ -161,6 +204,7 @@ def evaluate(
                 db=conn,
                 tenant_column=suite.tenant_column if scoped else None,
                 soft_delete_column=suite.soft_delete_column,
+                soft_delete_policy=suite.soft_delete_policy,
                 glossary=glossary,
             )
         return scorers[scoped]
@@ -173,15 +217,20 @@ def evaluate(
         correct = True if kind == "gold" else runner.is_correct(question, engine, sql)
         if correct is None:
             return
-        runs = runner.run(engine, seed, sql).ok
+        runs = runner.run(engine, seed, question.render(sql)).ok
         item = Item(item_id, question.id, kind, sql, bool(correct), runs, **extra)
         started = time.perf_counter()
-        report = scorer_for(question).score(sql, question.question, mode=mode)
+        # sqlgami gets the statement as written (a template stays a template) plus its values.
+        report = scorer_for(question).score(sql, question.question, mode=mode, params=question.param_values() or None)
         item.latency_ms = (time.perf_counter() - started) * 1000
         item.score = report.score
         item.verdict = report.verdict.value
         item.findings = [f.code for f in report.findings if f.severity.value != "info"]
         item.high_findings = [f.code for f in report.findings if f.severity.value in ("high", "error")]
+        item.difficulty = question.difficulty
+        item.question = question.question
+        item.cap_reason = report.confidence.cap_reason or ""
+        item.failed_stage = next((st.name for st in report.stages if st.status.value == "failed"), "")
         items.append(item)
 
     try:
@@ -210,6 +259,8 @@ def evaluate(
             if question is None or not row.get("sql"):
                 continue
             add(f"cand-{index}:{row.get('generator', '')}:{row.get('sample', 0)}", question, "candidate", row["sql"])
+            if items and items[-1].id.startswith(f"cand-{index}:"):
+                items[-1].generator = row.get("generator", "")
     finally:
         for scorer in scorers.values():
             scorer.close()
@@ -257,7 +308,7 @@ def label_run(suite: Suite, run: Path) -> Path:
                 matches = runner.matches_gold(question, engine, row["sql"])
                 entry["per_seed"] = {label: equal for label, (equal, _) in matches.items()}
                 entry["correct"] = all(entry["per_seed"].values())
-                entry["runs"] = all(runner.run(engine, seed, row["sql"]).ok for seed in suite.seeds)
+                entry["runs"] = all(runner.run(engine, seed, question.render(row["sql"])).ok for seed in suite.seeds)
                 reasons = [f"{label}: {why}" for label, (equal, why) in matches.items() if not equal]
                 entry["note"] = "; ".join(reasons[:2])
             out_rows.append(entry)
@@ -266,6 +317,55 @@ def label_run(suite: Suite, run: Path) -> Path:
     target = source.parent / "labels.jsonl"
     target.write_text("".join(json.dumps(r) + "\n" for r in out_rows), encoding="utf-8")
     return target
+
+
+def calibration_samples(items: list[Item], depth: str) -> list[tuple[float, bool, str, str]]:
+    """``(score, correct, depth, question id)`` for items that got past the hard gates.
+
+    Gated statements keep their fixed near-zero score and are not part of the fit.
+    """
+    return [(i.score, i.correct, depth, i.question_id) for i in items if i.score is not None and i.score > 0.1]
+
+
+def fit_calibration(samples: list[tuple[float, bool, str, str]], folds: int = 5, meta: dict[str, Any] | None = None):
+    """Fit a calibrator and estimate its error on questions it was not fitted on.
+
+    Folds are split by question, so a question's gold, bugs and rewrites never
+    sit on both sides of a split.
+    """
+    from sqlgami import IsotonicCalibrator
+
+    calibrator = IsotonicCalibrator.fit([(s, y, d) for s, y, d, _ in samples], meta=meta)
+    questions = sorted({q for _, _, _, q in samples})
+    held_scores: list[float] = []
+    held_labels: list[bool] = []
+    raw_scores: list[float] = []
+    if len(questions) >= folds:
+        for fold in range(folds):
+            held = {q for index, q in enumerate(questions) if index % folds == fold}
+            train = [(s, y, d) for s, y, d, q in samples if q not in held]
+            part = IsotonicCalibrator.fit(train, min_samples=max(10, 30 * (folds - 1) // folds))
+            for score, correct, depth, question in samples:
+                if question not in held:
+                    continue
+                value = part.calibrate(score, depth)
+                if value is None:
+                    continue
+                held_scores.append(value)
+                held_labels.append(correct)
+                raw_scores.append(score)
+    report = {
+        "samples": len(samples),
+        "questions": len(questions),
+        "fitted_depths": sorted(calibrator.curves),
+        "held_out_items": len(held_scores),
+        "ece_before": expected_calibration_error(raw_scores, held_labels),
+        "ece_after_held_out": expected_calibration_error(held_scores, held_labels),
+        "auroc_before": auroc(raw_scores, held_labels),
+        "auroc_after_held_out": auroc(held_scores, held_labels),
+    }
+    calibrator.meta["cross_validation"] = report
+    return calibrator, report
 
 
 def write_run(suite: Suite, engine: str, mode: str, items: list[Item], result: dict[str, Any], run_id: str) -> Path:
@@ -298,6 +398,21 @@ def format_metrics(result: dict[str, Any]) -> str:
         f"mean score: correct {num(result['mean_score_correct'], 2)}, wrong {num(result['mean_score_wrong'], 2)}",
         f"latency p50 {num(result['latency_ms_p50'], 1)} ms, p95 {num(result['latency_ms_p95'], 1)} ms",
     ]
+    lines.append(f"precision at score >= 0.8: {pct(result['precision_at_0.8'])} of {result['count_at_0.8']}")
+    lines.append("by kind (n, correct, score min/median/max, <=0.4, >=0.7):")
+    for name, entry in result["by_kind"].items():
+        lines.append(
+            f"  {name:12} n={entry['n']:3} correct={entry['correct']:3} "
+            f"{entry['score_min']:.2f}/{entry['score_median']:.2f}/{entry['score_max']:.2f} "
+            f"low={entry['at_or_below_0.4']:3} high={entry['at_or_above_0.7']:3}"
+        )
+    lines.append("by difficulty (wrong flagged / wrong, correct flagged / correct):")
+    for name, entry in result["by_difficulty"].items():
+        lines.append(
+            f"  {name:10} {entry['wrong_flagged']:3} / {entry['wrong']:3}    {entry['correct_flagged']:3} / {entry['correct']:3}"
+        )
+    for name, entry in result["by_generator"].items():
+        lines.append(f"generator {name}: {entry['correct']} of {entry['n']} correct ({entry['accuracy'] * 100:.0f}%)")
     if result["by_bug_class"]:
         lines.append("by bug class (flagged / total):")
         for name, entry in result["by_bug_class"].items():

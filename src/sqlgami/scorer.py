@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
-from .catalog import Catalog
+from .catalog import Catalog, RequiredPredicate
 from .engines import dialect_for, get_adapter
 from .engines.base import Adapter
 from .errors import ConfigurationError
@@ -36,6 +37,17 @@ class Scorer:
         SQLite and DuckDB). Above it the query is not run.
     tenant_column, soft_delete_column:
         Policy hints, applied to the catalog.
+    soft_delete_policy:
+        ``advisory`` (default) or ``required``. With ``required``, reading a table
+        without its soft-delete filter is a high-severity policy violation.
+    calibrator:
+        A fitted calibrator, or the path of a calibration file written by
+        ``IsotonicCalibrator.save``. Without one, scores are provisional.
+    required_predicates:
+        Rules for filters that every query on certain tables must carry, such as
+        access control. See :class:`sqlgami.RequiredPredicate`.
+    snapshot_columns:
+        ``{table: column}`` for periodic snapshot tables.
     glossary:
         Business definitions, as text or a ``{term: meaning}`` dictionary. Values
         named here are not reported as filters the question never asked for.
@@ -56,9 +68,13 @@ class Scorer:
         timeout_s: float | None = None,
         tenant_column: str | None = None,
         soft_delete_column: str | None = None,
-        calibrator: Calibrator | None = None,
+        soft_delete_policy: str | None = None,
+        calibrator: Calibrator | str | os.PathLike | None = None,
         options: Options | None = None,
         glossary: str | dict | None = None,
+        required_predicates: list | None = None,
+        snapshot_columns: dict[str, str] | None = None,
+        default_project: str | None = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -89,6 +105,16 @@ class Scorer:
                 self.catalog.tenant_column = tenant_column
             if soft_delete_column is not None:
                 self.catalog.soft_delete_column = soft_delete_column
+            if soft_delete_policy is not None:
+                if soft_delete_policy not in ("advisory", "required"):
+                    raise ConfigurationError("soft_delete_policy must be 'advisory' or 'required'")
+                self.catalog.soft_delete_policy = soft_delete_policy
+            if required_predicates:
+                self.catalog.required_predicates.extend(RequiredPredicate.coerce(p) for p in required_predicates)
+            if snapshot_columns:
+                self.catalog.snapshot_columns.update({k.lower(): v for k, v in snapshot_columns.items()})
+            if default_project is not None:
+                self.catalog.default_project = default_project
 
         self.options = options or Options()
         if cost_ceiling is not None:
@@ -97,6 +123,10 @@ class Scorer:
             self.options.sample_rows = sample_rows
         if timeout_s is not None:
             self.options.timeout_s = timeout_s
+        if isinstance(calibrator, (str, os.PathLike)):
+            from .calibration import IsotonicCalibrator
+
+            calibrator = IsotonicCalibrator.load(calibrator)
         self.calibrator = calibrator
         if isinstance(glossary, dict):
             glossary = "\n".join(f"{term}: {meaning}" for term, meaning in glossary.items())
@@ -123,8 +153,14 @@ class Scorer:
         *,
         mode: str | None = None,
         cost_ceiling: float | None = None,
+        params: dict[str, Any] | None = None,
     ) -> Report:
         """Check ``sql`` and return a :class:`Report`.
+
+        ``sql`` may be a template with ``{name}`` placeholders. Pass ``params``
+        to give their values; the SQL is then filled in the way ``str.format``
+        would and can be sent to the database. Without values the template is
+        still analysed, but never run.
 
         Bad SQL never raises: it comes back as a report. Exceptions (all
         subclasses of ``SqlgamiError``) mean the scorer was misused or the
@@ -147,19 +183,26 @@ class Scorer:
             options=options,
             calibrator=self.calibrator,
             glossary=self.glossary,
+            params=params,
         )
 
-    def explain(self, sql: str, question: str | None = None) -> Report:
+    def explain(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None) -> Report:
         """Static checks only. Never contacts the database for the query itself."""
-        return self.score(sql, question, mode="static")
+        return self.score(sql, question, mode="static", params=params)
 
-    def dry_run(self, sql: str, question: str | None = None) -> Report:
+    def dry_run(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None) -> Report:
         """Static checks plus the engine's own planner. Does not run the query."""
-        return self.score(sql, question, mode="dry")
+        return self.score(sql, question, mode="dry", params=params)
 
-    def sample(self, sql: str, question: str | None = None, cost_ceiling: float | None = None) -> Report:
+    def sample(
+        self,
+        sql: str,
+        question: str | None = None,
+        cost_ceiling: float | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Report:
         """Also runs the query read-only, if its estimated cost is under the ceiling."""
-        return self.score(sql, question, mode="sample", cost_ceiling=cost_ceiling)
+        return self.score(sql, question, mode="sample", cost_ceiling=cost_ceiling, params=params)
 
     # ----------------------------------------------------------- lifecycle
 

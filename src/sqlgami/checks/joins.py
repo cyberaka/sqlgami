@@ -7,9 +7,9 @@ from typing import Iterable
 
 from sqlglot import exp
 
-from ..model import MAYBE, NO, YES, SelectModel, flatten_and, strip, walk_own
+from ..model import MAYBE, NO, YES, SelectModel, flatten_and, strip, walk_own  # noqa: F401
 from ..report import Finding, Severity
-from .base import PROBE_UNIQUE, CheckContext, Probe, check
+from .base import PROBE_QUERY, PROBE_UNIQUE, CheckContext, Probe, check
 
 _CROSS_JOIN_RE = re.compile(r"\bcross\s+join\b", re.IGNORECASE)
 
@@ -214,7 +214,7 @@ def distinct_masking(ctx: CheckContext) -> Iterable[Finding]:
             continue
         yield ctx.finding(
             "distinct_masking",
-            Severity.LOW,
+            Severity.INFO,
             (
                 "SELECT DISTINCT is removing rows repeated by a join, and no key column is "
                 "selected, so different rows that share the selected values are merged too."
@@ -381,3 +381,128 @@ def natural_join(ctx: CheckContext) -> Iterable[Finding]:
                     join,
                     suggestion="Write the join condition out with ON.",
                 )
+
+
+# ------------------------------------------------------------ repeated rows
+
+
+@check("duplicate_rows", description="A plain listing returns the same row several times because of a join.")
+def duplicate_rows(ctx: CheckContext) -> Iterable[Finding]:
+    root = ctx.analysis.root_scope
+    if root is None or not isinstance(root.expression, exp.Select):
+        return
+    model = ctx.cache.model(root)
+    select = model.select
+    if len(model.sources) < 2 or model.is_aggregated or select.args.get("distinct") is not None:
+        return
+    if any(isinstance(n, exp.Window) for p in select.expressions for n in walk_own(p)):
+        return
+    projected = sorted({c.table for p in select.expressions for c in model.local_columns(p)})
+    if not projected:
+        return
+    state, culprits, read = _repeat_state(model, projected)
+    if state != YES:
+        return
+    shown = ", ".join(model.sources[a].label for a in read)
+    by = ", ".join(model.sources[c].label for c in culprits)
+    finding = ctx.finding(
+        "duplicate_rows",
+        Severity.LOW,
+        f"Only columns of {shown} are returned, but the join to {by} can match several rows for "
+        f"each of them, so the same {shown} row is listed once per match.",
+        suggestion="Use SELECT DISTINCT, or test for a match with EXISTS instead of joining.",
+        shown=read,
+        repeated_by=culprits,
+    )
+    _uniqueness_probes(ctx, model, finding, culprits, read)
+    yield finding
+
+
+# ------------------------------------------------- rows an inner join drops
+
+
+def _unmatched_probe(model: SelectModel, entity: str, other: str) -> exp.Expression | None:
+    """A query that returns a row if some ``entity`` row has no partner in ``other``."""
+    a, b = model.sources[entity], model.sources[other]
+    if a.table is None or b.table is None:
+        return None
+    inner: list[exp.Expression] = []
+    outer: list[exp.Expression] = []
+    for conjunct in model.conjuncts:
+        if conjunct.expr.find(exp.Select) is not None:
+            return None
+        aliases = conjunct.aliases
+        if aliases <= {entity, other} and other in aliases:
+            inner.append(conjunct.expr.copy())
+        elif aliases == frozenset({entity}):
+            outer.append(conjunct.expr.copy())
+        elif aliases:
+            return None
+    if not inner:
+        return None
+    partner = exp.select(exp.Literal.number(1)).from_(b.node.copy())
+    for condition in inner:
+        partner = partner.where(condition)
+    query = exp.select(exp.Literal.number(1)).from_(a.node.copy())
+    for condition in outer:
+        query = query.where(condition)
+    return query.where(exp.Not(this=exp.Exists(this=partner))).limit(1)
+
+
+@check("inner_join_drops_rows", description="An inner join leaves out things that have no related rows.")
+def inner_join_drops_rows(ctx: CheckContext) -> Iterable[Finding]:
+    """``... FROM tenants t JOIN disputes d ... GROUP BY t.id``: tenants with no disputes vanish.
+
+    Whether that matters depends on the question ("for every tenant ..."), so this
+    is informational on its own; the question stage raises it when the wording asks
+    for every one.
+    """
+    root = ctx.analysis.root_scope
+    if root is None or not isinstance(root.expression, exp.Select):
+        return
+    model = ctx.cache.model(root)
+    group = model.group
+    if group is None or len(model.sources) != 2:
+        return
+    grouped = {strip(e).table for e in group.expressions if isinstance(strip(e), exp.Column)}
+    grouped &= set(model.sources)
+    if len(grouped) != 1:
+        return
+    entity = next(iter(grouped))
+    other = next(a for a in model.sources if a != entity)
+    aggregates = model.own_aggregates()
+    if not aggregates:
+        return
+    for agg in aggregates:
+        tables = {c.table for c in model.local_columns(agg)}
+        if tables - {other}:
+            return
+    if model.sources[other].null_supplied or model.sources[entity].null_supplied:
+        return  # already an outer join
+    if model.multiplied(entity).state == NO:
+        return  # at most one partner each: nothing is being counted
+    finding = ctx.finding(
+        "inner_join_drops_rows",
+        Severity.INFO,
+        f"{model.sources[entity].label} is inner-joined to {model.sources[other].label} and then "
+        f"aggregated, so any {model.sources[entity].label} row with no match is missing from the "
+        "result instead of appearing with a zero.",
+        suggestion="Use a LEFT JOIN (with COALESCE for sums) if every row should appear.",
+        entity=entity,
+        other=other,
+        counts_only=all(isinstance(a, exp.Count) for a in aggregates),
+    )
+    query = _unmatched_probe(model, entity, other)
+    if query is not None:
+        ctx.probes.append(
+            Probe(
+                PROBE_QUERY,
+                model.sources[entity].table,
+                (),
+                finding,
+                query=query,
+                on_rows=(Severity.LOW, " Checked against the data: some rows do have no match, and are dropped.", "unmatched"),
+                on_empty=(None, " Checked against the data: every row has a match at present.", "all_matched"),
+            )
+        )
+    yield finding
