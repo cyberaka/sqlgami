@@ -58,34 +58,6 @@ _DDL = {"shop": SHOP_DDL, "members": HISTORY_DDL, "extra": EXTRA_DDL}
 
 MISSED = [
     # fan_out
-    (
-        'fan_out',
-        'derived_join_then_sum',
-        "SELECT SUM(x.total) FROM (SELECT o.total FROM orders o JOIN items i ON i.order_id = o.id ) x",
-        {},
-        "the join repeats each order once per item inside the derived table; the outer SUM has one source so the check skips it (shop data: 365.5 instead of 265.5)",
-    ),
-    (
-        'fan_out',
-        'cte_join_then_sum',
-        "WITH x AS (SELECT o.id, o.total FROM orders o JOIN items i ON i.order_id = o.id ) SELECT SUM(total) FROM x",
-        {},
-        "same repeated rows, hidden in a CTE",
-    ),
-    (
-        'fan_out',
-        'cte_star_join_then_sum',
-        "WITH x AS (SELECT o.*, i.qty FROM orders o JOIN items i ON i.order_id = o.id ) SELECT SUM(total) FROM x",
-        {},
-        "same repeated rows, hidden in a CTE that selects o.*",
-    ),
-    (
-        'fan_out',
-        'window_sum',
-        "SELECT DISTINCT c.name, SUM(o.total) OVER (PARTITION BY c.id) FROM customers c JOIN orders o ON o.customer_id = c.id JOIN items i ON i.order_id = o.id",
-        {},
-        "a window SUM over joined rows is inflated exactly like a grouped SUM; window aggregates are not examined",
-    ),
     # outer_join_nullified
     (
         'outer_join_nullified',
@@ -344,13 +316,6 @@ MISSED = [
         "start_date / end_date is a common history pair and is not recognised",
     ),
     # distinct_masking
-    (
-        'distinct_masking',
-        'count_distinct_non_key',
-        "SELECT COUNT(DISTINCT c.name) FROM customers c JOIN orders o ON o.customer_id = c.id",
-        {},
-        "COUNT(DISTINCT name) hides the repeated rows but merges customers who share a name",
-    ),
     (
         'distinct_masking',
         'group_by_as_dedupe',
@@ -613,21 +578,7 @@ FALSE_ALARMS = [
         "the invoice line references the version it was taxed under by primary key",
     ),
     # distinct_masking
-    (
-        'distinct_masking',
-        'distinct_dimension_list',
-        "SELECT DISTINCT o.status FROM orders o JOIN items i ON i.order_id = o.id WHERE i.sku = 'A'",
-        {},
-        "the distinct statuses of orders containing an item are exactly what is asked for",
-    ),
     # cartesian_join
-    (
-        'cartesian_join',
-        'both_pinned_by_pk',
-        "SELECT c.name, o.total FROM customers c, orders o WHERE c.id = 1 AND o.id = 10",
-        {},
-        "both tables are pinned to one row by primary key, so the result is one row",
-    ),
     # null_comparison
     (
         'null_comparison',
@@ -708,6 +659,36 @@ FALSE_ALARMS = [
 ]
 
 STILL_FIRES = [
+    (
+        'fan_out',
+        'window_sum',
+        "SELECT DISTINCT c.name, SUM(o.total) OVER (PARTITION BY c.id) FROM customers c JOIN orders o ON o.customer_id = c.id JOIN items i ON i.order_id = o.id",
+        {},
+    ),
+    (
+        'fan_out',
+        'derived_join_then_sum',
+        "SELECT SUM(x.total) FROM (SELECT o.total FROM orders o JOIN items i ON i.order_id = o.id ) x",
+        {},
+    ),
+    (
+        'fan_out',
+        'cte_star_join_then_sum',
+        "WITH x AS (SELECT o.*, i.qty FROM orders o JOIN items i ON i.order_id = o.id ) SELECT SUM(total) FROM x",
+        {},
+    ),
+    (
+        'fan_out',
+        'cte_join_then_sum',
+        "WITH x AS (SELECT o.id, o.total FROM orders o JOIN items i ON i.order_id = o.id ) SELECT SUM(total) FROM x",
+        {},
+    ),
+    (
+        'distinct_masking',
+        'count_distinct_non_key',
+        "SELECT COUNT(DISTINCT c.name) FROM customers c JOIN orders o ON o.customer_id = c.id",
+        {},
+    ),
     (
         'cartesian_join',
         'or_true',
@@ -1399,6 +1380,18 @@ STILL_FIRES = [
 
 STILL_QUIET = [
     (
+        'distinct_masking',
+        'distinct_dimension_list',
+        "SELECT DISTINCT o.status FROM orders o JOIN items i ON i.order_id = o.id WHERE i.sku = 'A'",
+        {},
+    ),
+    (
+        'cartesian_join',
+        'both_pinned_by_pk',
+        "SELECT c.name, o.total FROM customers c, orders o WHERE c.id = 1 AND o.id = 10",
+        {},
+    ),
+    (
         'missing_tenant_filter',
         'using_tenant_unqualified',
         "SELECT c.name, o.total FROM customers c JOIN orders o USING (tenant_id) WHERE tenant_id = 7 AND o.customer_id = c.id",
@@ -1999,14 +1992,6 @@ def test_using_join_merged_column_is_not_ambiguous(dialect):
     assert report.stage("schema").status.value == "passed", report.summary()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "cartesian_join decides a cross join is deliberate by searching the raw SQL text for "
-        "'cross join', so a comment containing those words downgrades an accidental comma join "
-        "from high to low."
-    ),
-)
 @pytest.mark.parametrize("dialect", DIALECTS)
 def test_comment_does_not_make_a_comma_join_deliberate(dialect):
     report = _explain(dialect, "SELECT /* not a cross join */ c.name, o.total FROM customers c, orders o", {})

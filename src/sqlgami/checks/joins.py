@@ -13,6 +13,13 @@ from .base import PROBE_QUERY, PROBE_UNIQUE, CheckContext, Probe, check
 
 _CROSS_JOIN_RE = re.compile(r"\bcross\s+join\b", re.IGNORECASE)
 
+def _code_only(sql: str, dialect: str) -> str:
+    """The statement with comments and string literals removed."""
+    from ..template import CODE, segments
+
+    return " ".join(text for kind, text in segments(sql, dialect) if kind == CODE)
+
+
 # Aggregates whose result does not change when input rows are repeated.
 _REPEAT_SAFE = tuple(
     getattr(exp, name)
@@ -98,26 +105,95 @@ def _uniqueness_probes(
         ctx.probes.append(Probe(PROBE_UNIQUE, source.table, tuple(columns), finding))
 
 
+def _repeated_inside(model: SelectModel, column: exp.Column, depth: int = 0):
+    """Follow a column into the subquery or CTE it comes from, looking for a join that repeats its rows.
+
+    Returns ``(inner model, alias, culprits)`` for the first level at which the
+    column's own table is repeated by a join and nothing (GROUP BY, DISTINCT)
+    undoes it before the rows come out.
+    """
+    source = model.sources.get(column.table)
+    if source is None or source.kind != "derived" or source.scope is None or depth > 32:
+        return None
+    if not isinstance(source.scope.expression, exp.Select):
+        return None
+    inner = model.cache.model(source.scope)
+    if inner.is_aggregated or inner.select.args.get("distinct") is not None:
+        return None
+    defining = inner.projection(column.name)
+    if defining is None:
+        return None
+    defining = strip(defining)
+    if not isinstance(defining, exp.Column) or defining.table not in inner.sources:
+        return None
+    if len(inner.sources) >= 2:
+        repeated = inner.multiplied(defining.table)
+        if repeated.state == YES:
+            return inner, defining.table, repeated.culprits
+    return _repeated_inside(inner, defining, depth + 1)
+
+
+def _window_aggregates(model: SelectModel) -> list[exp.AggFunc]:
+    found = []
+    for projection in model.select.expressions:
+        for node in walk_own(projection):
+            if isinstance(node, exp.Window) and isinstance(node.this, exp.AggFunc):
+                if not isinstance(node.this, _REPEAT_SAFE):
+                    found.append(node.this)
+    return found
+
+
 @check("fan_out", description="An aggregate reads rows that a join has repeated.")
 def fan_out(ctx: CheckContext) -> Iterable[Finding]:
     for model in ctx.cache.models():
-        if len(model.sources) < 2:
-            continue
-        aggregates = [a for a in model.own_aggregates() if not isinstance(a, _REPEAT_SAFE)]
-        if not aggregates or _group_pins_one_row(model):
-            continue
         if all(source.kind == "function" for source in model.sources.values()):
             continue  # generate_series and friends: combining them is the point
+        plain = [a for a in model.own_aggregates() if not isinstance(a, _REPEAT_SAFE)]
+        windowed = _window_aggregates(model)
+        if not plain and not windowed:
+            continue
+        pinned = _group_pins_one_row(model)
         reported: set[tuple[str, tuple[str, ...]]] = set()
-        for agg in aggregates:
-            if _is_distinct(agg):
+        for agg in plain + windowed:
+            is_window = any(agg is w for w in windowed)
+            if _is_distinct(agg) or (pinned and not is_window):
                 continue
-            aliases = sorted({c.table for c in model.local_columns(agg)})
+            columns = model.local_columns(agg)
+            aliases = sorted({c.table for c in columns})
             counts_rows = not aliases
             if counts_rows:
                 aliases = sorted(model.sources)
-            state, culprits, read = _repeat_state(model, aliases)
+            state, culprits, read = (NO, [], [])
+            if len(model.sources) >= 2:
+                state, culprits, read = _repeat_state(model, aliases)
             if state == NO:
+                # Not repeated here. The rows may have been repeated already, inside a
+                # subquery or CTE this SELECT reads from.
+                for column in columns:
+                    hidden = _repeated_inside(model, column)
+                    if hidden is None:
+                        continue
+                    inner, inner_alias, inner_culprits = hidden
+                    key = ("inside", (column.table, column.name))
+                    if key in reported:
+                        break
+                    reported.add(key)
+                    by = ", ".join(inner.sources[c].label for c in inner_culprits) or "another table"
+                    yield ctx.finding(
+                        "fan_out",
+                        Severity.MEDIUM if isinstance(agg, exp.Count) else Severity.HIGH,
+                        f"{ctx.snippet(agg)} reads {column.table}.{column.name}, which comes from "
+                        f"{inner.sources[inner_alias].label} inside a subquery. There, the join to {by} "
+                        "repeats each of those rows, and nothing removes the repeats before the "
+                        "aggregate, so the same value is counted more than once.",
+                        agg,
+                        suggestion="Aggregate before joining, or do not join the repeating table in the subquery.",
+                        reads=[column.table],
+                        repeated_by=inner_culprits,
+                        certainty=YES,
+                        inside_subquery=True,
+                    )
+                    break
                 continue
             key = ("rows" if counts_rows else ",".join(read), tuple(culprits))
             if key in reported:
@@ -139,7 +215,7 @@ def fan_out(ctx: CheckContext) -> Iterable[Finding]:
                         f"several rows for each row of {read_label}, so the same value is "
                         "counted more than once."
                     )
-                    severity = Severity.MEDIUM if isinstance(agg, exp.Count) else Severity.HIGH
+                    severity = Severity.MEDIUM if isinstance(agg, exp.Count) or is_window else Severity.HIGH
                 else:
                     message = (
                         f"{ctx.snippet(agg)} reads {read_label}; the join to {by} may repeat "
@@ -193,35 +269,31 @@ def distinct_masking(ctx: CheckContext) -> Iterable[Finding]:
             _uniqueness_probes(ctx, model, finding, culprits, read)
             yield finding
 
-        select = model.select
-        distinct = select.args.get("distinct")
-        if distinct is None or distinct.args.get("on") is not None or model.is_aggregated:
-            continue
-        repeated = [a for a in model.sources if model.multiplied(a).state == YES]
-        if not repeated:
-            continue
-        projected: dict[str, set[str]] = {}
-        for projection in select.expressions:
-            for column in model.local_columns(projection):
-                projected.setdefault(column.table, set()).add(column.name)
-        has_key = any(
-            key <= projected.get(alias, set())
-            for alias in model.sources
-            for key in model.key_info(alias).keys
-            if key
-        )
-        if has_key or not projected:
-            continue
-        yield ctx.finding(
-            "distinct_masking",
-            Severity.INFO,
-            (
-                "SELECT DISTINCT is removing rows repeated by a join, and no key column is "
-                "selected, so different rows that share the selected values are merged too."
-            ),
-            suggestion="Select a key column, or filter with EXISTS instead of joining.",
-            repeated=repeated,
-        )
+        for agg in model.own_aggregates():
+            if not isinstance(agg, exp.Count) or not _is_distinct(agg):
+                continue
+            inner = agg.this.expressions if isinstance(agg.this, exp.Distinct) else [agg.this]
+            columns = [strip(e) for e in inner]
+            if len(columns) != 1 or not isinstance(columns[0], exp.Column) or columns[0].table not in model.sources:
+                continue
+            column = columns[0]
+            info = model.key_info(column.table)
+            if not info.certain or frozenset({column.name}) in info.keys:
+                continue
+            if model.multiplied(column.table, per_group=True).state != YES:
+                continue
+            yield ctx.finding(
+                "distinct_masking",
+                Severity.LOW,
+                (
+                    f"{ctx.snippet(agg)} counts distinct values of a column that is not a key of "
+                    f"{model.sources[column.table].label}. DISTINCT hides the rows the join repeats, "
+                    "but it also counts two different rows with the same value as one."
+                ),
+                agg,
+                suggestion="Count the key column if rows are meant, or keep this if distinct values are meant.",
+                reads=[column.table],
+            )
 
 
 @check("cartesian_join", description="Tables are combined with no condition linking them.")
@@ -237,13 +309,15 @@ def cartesian_join(ctx: CheckContext) -> Iterable[Finding]:
             members = [
                 a
                 for a in group
-                if not model.is_single_row(a) and model.sources[a].kind != "function"
+                if not model.is_single_row(a)
+                and model.sources[a].kind != "function"
+                and not model.joins_at_most_one(a, set())  # pinned to one row by its key
             ]
             if members:
                 real.append(sorted(group))
         if len(real) < 2:
             continue
-        explicit = bool(_CROSS_JOIN_RE.search(ctx.analysis.sql)) and all(
+        explicit = bool(_CROSS_JOIN_RE.search(_code_only(ctx.analysis.sql, ctx.dialect))) and all(
             source.join is None or not source.join.args.get("on") for source in model.sources.values()
         )
         labels = [" + ".join(model.sources[a].label for a in group) for group in real]
