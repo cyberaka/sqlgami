@@ -68,6 +68,15 @@ class Options:
     # "judge": two or more independent sources agreeing against the candidate is strong
     # evidence against it. Only for alternatives at least as capable as the candidate's author.
     consistency_role: str = "confirm"
+    # The most time the whole consistency stage may take, however many alternatives there are.
+    consistency_budget_s: float = 30.0
+    # True when the question asks for rows in a particular order: an alternative that returns
+    # the same rows in another order then counts as a different answer.
+    consistency_ordered: bool = False
+    # Functions the host vouches for (its own user-defined functions, say). A statement that
+    # calls anything outside the engine's built-in allow-list and this list is not sent to
+    # the database.
+    allowed_functions: tuple[str, ...] = ()
 
 
 class _Clock:
@@ -156,7 +165,7 @@ def _run(
         report.signals["template_parameters"] = [p.to_dict() for p in prepared.params]
     if prepared.disabled_filters:
         report.signals["disabled_filters"] = list(prepared.disabled_filters)
-    analysis = A.analyse(prepared.analysis_sql, catalog, dialect)
+    analysis = A.analyse(prepared.analysis_sql, catalog, dialect, options.allowed_functions)
     if analysis.script_statements:
         report.signals["script"] = {
             "statements": list(analysis.script_statements),
@@ -208,8 +217,8 @@ def _run(
         problem = Finding(
             "external_access",
             Severity.ERROR,
-            f"The query reaches outside the database or can stall it ({names}). It was not sent "
-            "to the database.",
+            f"The query reaches outside the tables it should read, or can stall the database "
+            f"({names}). It was not sent to the database.",
             "statement",
             evidence={"functions": analysis.unsafe_functions},
         )
@@ -322,6 +331,42 @@ def _run(
         blocked = f"the SQL is a template and no value was given for: {missing}"
     elif analysis.script_statements and not getattr(adapter, "supports_scripts", False):
         blocked = "the SQL is a multi-statement script, which is not sent to this engine"
+    elif analysis.unlisted_functions and adapter is not None and mode != "static":
+        # Not on the allow-list. Ask the catalogue (never the statement itself) whether the
+        # function exists at all: a made-up name is an error, a real one is merely unvouched for.
+        missing = []
+        for name in analysis.unlisted_functions:
+            if "." not in name and adapter.function_exists(name) is False:
+                missing.append(name)
+        if missing:
+            names = ", ".join(missing)
+            report.findings.append(
+                Finding(
+                    "unknown_function",
+                    Severity.ERROR,
+                    f"Function {names} does not exist in this database, so the query cannot run.",
+                    "dry_run",
+                    evidence={"functions": missing},
+                )
+            )
+            _stage(report, "dry_run", StageStatus.FAILED, f"function {names} does not exist")
+            _stage(report, "sample", StageStatus.NOT_RUN, "the query cannot run")
+            _not_run(report, ("consistency", "question"), "the query cannot run")
+            return
+        names = ", ".join(analysis.unlisted_functions)
+        blocked = f"the query calls a function sqlgami does not know to be read-only ({names})"
+        report.findings.append(
+            Finding(
+                "unlisted_function",
+                Severity.LOW,
+                f"The query calls {names}, which is not one of this engine's built-in functions that "
+                "sqlgami knows to be read-only. It was not sent to the database, so it is unverified "
+                "beyond the static checks.",
+                "statement",
+                suggestion="If the function only reads data, name it in allowed_functions.",
+                evidence={"functions": list(analysis.unlisted_functions)},
+            )
+        )
     if blocked is not None and adapter is not None and mode != "static":
         _stage(report, "dry_run", StageStatus.SKIPPED, blocked)
         _stage(report, "sample", StageStatus.SKIPPED, blocked + "; unverified beyond static checks")
@@ -401,6 +446,9 @@ def _consistency_stage(
         cost_ceiling=options.cost_ceiling,
         max_alternatives=options.consistency_max_alternatives,
         role=options.consistency_role,
+        budget_s=options.consistency_budget_s,
+        ordered=options.consistency_ordered,
+        allowed_functions=options.allowed_functions,
     )
     report.signals["consistency"] = outcome.to_dict()
     if not outcome.ran:

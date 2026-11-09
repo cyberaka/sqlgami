@@ -19,11 +19,16 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import math
+import re
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
+
+from sqlglot import exp
 
 from . import analysis as A
+from . import safety
 from .catalog import Catalog
 from .engines.base import Adapter
 from .errors import SqlgamiError
@@ -36,6 +41,8 @@ Generator = Callable[[str, str, "str | None", int], Sequence[str]]
 
 AGREES = "agrees"
 AGREES_REORDERED = "agrees_columns_reordered"
+AGREES_OTHER_ORDER = "agrees_rows_in_another_order"  # both say ORDER BY, and the orders differ
+BOTH_EMPTY = "both_empty"  # no rows, or nothing but NULL, on both sides: evidence of nothing
 DIFFERS = "differs"
 INVALID = "invalid"  # not a runnable read-only query against this schema
 FAILED = "failed"  # the engine could not run it
@@ -93,6 +100,10 @@ class Outcome:
         }
 
 
+ZERO_TOLERANCE = 1e-9  # numbers closer to zero than this are zero
+MAX_PERMUTATIONS = 5000  # column orders tried before giving up on matching two results
+
+
 def _norm(value: Any) -> Any:
     if value is None:
         return None
@@ -104,6 +115,8 @@ def _norm(value: Any) -> Any:
         number = float(value)
         if math.isnan(number):
             return "NaN"
+        if abs(number) < ZERO_TOLERANCE:
+            return 0  # 0.1 + 0.2 - 0.3 is 5.6e-17 in binary floating point
         if number.is_integer() and abs(number) < 1e15:
             return int(number)
         return float(f"{number:.9g}")
@@ -128,17 +141,168 @@ def _key(value: Any) -> tuple:
     return (2, str(value))
 
 
-def fingerprint(rows: Sequence[Sequence[Any]]) -> tuple[tuple, tuple]:
-    """Two order-insensitive signatures of a result set.
+def _normed(rows: Sequence[Sequence[Any]]) -> list[tuple]:
+    return [tuple(_norm(v) for v in row) for row in rows]
 
-    The first keeps column positions. The second also ignores column order, so
-    ``SELECT a, b`` and ``SELECT b, a`` match.
+
+def _row_key(row: Sequence[Any]) -> tuple:
+    return tuple(_key(v) for v in row)
+
+
+def _column_signatures(rows: list[tuple], width: int) -> list[tuple]:
+    return [tuple(sorted((_key(row[i]) for row in rows))) for i in range(width)]
+
+
+def fingerprint(rows: Sequence[Sequence[Any]]) -> tuple[tuple, tuple]:
+    """Two signatures of a result set that ignore row order.
+
+    The first keeps column positions. The second also ignores column order: the
+    columns are put in a fixed order worked out from their contents, so
+    ``SELECT a, b`` and ``SELECT b, a`` match, while values that moved between
+    columns in some rows only do not.
     """
-    normed = [tuple(_norm(v) for v in row) for row in rows]
-    strict = tuple(sorted(normed, key=lambda r: tuple(_key(v) for v in r)))
-    loose_rows = [tuple(sorted(row, key=_key)) for row in normed]
-    loose = tuple(sorted(loose_rows, key=lambda r: tuple(_key(v) for v in r)))
+    normed = _normed(rows)
+    strict = tuple(sorted(normed, key=_row_key))
+    width = len(normed[0]) if normed else 0
+    signatures = _column_signatures(normed, width)
+    order = sorted(range(width), key=lambda i: signatures[i])
+    loose = tuple(sorted((tuple(row[i] for i in order) for row in normed), key=_row_key))
     return strict, loose
+
+
+def _bound_by_name(left: Sequence[str] | None, right: Sequence[str] | None) -> list[int] | None:
+    """When both results use the same column names, the names say which column is which."""
+    if not left or not right or len(left) != len(right):
+        return None
+    a = [str(name).lower() for name in left]
+    b = [str(name).lower() for name in right]
+    if len(set(a)) != len(a) or len(set(b)) != len(b) or set(a) != set(b):
+        return None
+    return [b.index(name) for name in a]
+
+
+def _permutations(base: list[tuple], other: list[tuple], width: int) -> Iterable[list[int]]:
+    """Column orders of ``other`` that could line up with ``base``, judged column by column."""
+    mine = _column_signatures(base, width)
+    theirs = _column_signatures(other, width)
+    options = [[j for j in range(width) if theirs[j] == mine[i]] for i in range(width)]
+    if any(not choice for choice in options):
+        return
+    budget = [MAX_PERMUTATIONS]
+
+    def walk(position: int, used: tuple[int, ...]) -> Iterable[list[int]]:
+        if budget[0] <= 0:
+            return
+        if position == width:
+            budget[0] -= 1
+            yield list(used)
+            return
+        for j in options[position]:
+            if j not in used:
+                yield from walk(position + 1, used + (j,))
+
+    yield from walk(0, ())
+
+
+def compare(
+    base: Sequence[Sequence[Any]],
+    other: Sequence[Sequence[Any]],
+    base_columns: Sequence[str] | None = None,
+    other_columns: Sequence[str] | None = None,
+) -> tuple[str, bool]:
+    """Whether two results hold the same data: ``(AGREES | AGREES_REORDERED | DIFFERS, same row order)``.
+
+    Row order never decides the answer; it is reported separately. Columns may come
+    in another order, but one reordering has to work for every row. When both results
+    carry the same column names, the names decide which column is which.
+    """
+    left, right = _normed(base), _normed(other)
+    if len(left) != len(right):
+        return DIFFERS, False
+    width = len(left[0]) if left else len(base_columns or ())
+    other_width = len(right[0]) if right else len(other_columns or ())
+    if width != other_width:
+        return DIFFERS, False
+    left_sorted = sorted(left, key=_row_key)
+
+    def under(order: list[int]) -> list[tuple]:
+        return [tuple(row[j] for j in order) for row in right]
+
+    named = _bound_by_name(base_columns, other_columns)
+    if named is not None:
+        moved = under(named)
+        if sorted(moved, key=_row_key) != left_sorted:
+            return DIFFERS, False
+        return (AGREES if named == list(range(width)) else AGREES_REORDERED), moved == left
+    if sorted(right, key=_row_key) == left_sorted:
+        return AGREES, right == left
+    for order in _permutations(left, right, width):
+        moved = under(order)
+        if sorted(moved, key=_row_key) == left_sorted:
+            return AGREES_REORDERED, moved == left
+    return DIFFERS, False
+
+
+def _says_nothing(rows: Sequence[Sequence[Any]]) -> bool:
+    """No rows at all, or nothing but NULL: two such results agreeing is not evidence."""
+    return all(value is None for row in rows for value in row)
+
+
+_QUOTED = re.compile(r"('(?:[^']|'')*')")
+
+
+def _text_key(sql: str) -> str:
+    """The statement with spacing and letter case evened out, except inside string literals."""
+    parts = _QUOTED.split(sql.strip().rstrip(";").strip())
+    return "".join(part if index % 2 else " ".join(part.lower().split()) for index, part in enumerate(parts))
+
+
+def _row_limit(tree: exp.Expression | None) -> int | None:
+    """N when the statement ends in a plain ``LIMIT N`` with no OFFSET."""
+    if tree is None or tree.args.get("offset") is not None:
+        return None
+    limit = tree.args.get("limit")
+    count = limit.expression if isinstance(limit, exp.Limit) else None
+    if isinstance(count, exp.Literal) and not count.is_string and count.name.isdigit():
+        return int(count.name)
+    return None
+
+
+def unstable(checked: A.Analysis, catalog: Catalog | None, rows_returned: int | None = None) -> str | None:
+    """Why this statement's result may differ between two runs on the same data, or ``None``."""
+    tree = checked.tree
+    if tree is None:
+        return None
+    random = safety.nondeterministic(tree)
+    if random:
+        return f"it uses {', '.join(random)}"
+    findings: list[Finding] = []
+    if checked.resolved is not None and catalog is not None:
+        try:
+            from .checks import aggregation
+            from .checks.base import CheckContext
+
+            findings = list(aggregation.limit_without_order(CheckContext(checked, catalog, None)))
+        except Exception:  # fall back to the plain reading below
+            logger.debug("limit check failed on an alternative", exc_info=True)
+            findings = []
+    else:
+        for node in tree.find_all(exp.Query):
+            cut = node.args.get("limit") is not None or node.args.get("offset") is not None
+            if cut and node.args.get("order") is None and not isinstance(node.parent, exp.Exists):
+                return "it cuts rows off with no ORDER BY"
+        return None
+    if not findings:
+        return None
+    top = _row_limit(tree)
+    only_at_the_end = all(not f.evidence.get("nested") for f in findings)
+    if only_at_the_end and top is not None and rows_returned is not None and rows_returned < top:
+        return None  # the LIMIT did not cut anything off
+    return "it cuts rows off with no ORDER BY that says which"
+
+
+def _has_order(tree: exp.Expression | None) -> bool:
+    return tree is not None and tree.args.get("order") is not None
 
 
 def describe_schema(catalog: Catalog, focus: Sequence[str] = (), limit: int = 150) -> str:
@@ -181,6 +345,9 @@ def run(
     cost_ceiling: float | None = None,
     max_alternatives: int = 8,
     role: str = "confirm",
+    budget_s: float | None = 30.0,
+    ordered: bool = False,
+    allowed_functions: Iterable[str] = (),
 ) -> Outcome:
     """Run the candidate and each alternative, and compare what they return.
 
@@ -190,21 +357,44 @@ def run(
     the candidate, that is treated as strong evidence the candidate is wrong. Use
     ``judge`` only when the alternatives come from sources at least as capable as
     whatever wrote the candidate.
+
+    ``budget_s`` caps the time spent on the whole comparison. ``ordered`` says the
+    question asks for rows in a particular order, so the same rows in another order
+    are a different answer.
+
+    An alternative is run only if it is a single read-only query over known tables
+    whose every function call is on the engine's allow-list.
     """
     outcome = Outcome()
+    started = time.perf_counter()
+
+    def remaining() -> float:
+        if budget_s is None:
+            return timeout_s
+        return min(timeout_s, budget_s - (time.perf_counter() - started))
+
     seen: set[tuple[str, str | None]] = set()
-    unique: list[tuple[str, str | None]] = []
-    own = " ".join(sql.split()).rstrip(";").lower()
+    by_source: dict[str | None, list[tuple[str, str | None]]] = {}
+    own = _text_key(sql)
     for item in alternatives:
         alt, source = split_alternative(item)
         if not alt:
             continue
-        text = " ".join(alt.split()).rstrip(";").lower()
+        text = _text_key(alt)
         if text == own or (text, source) in seen:
             continue  # the candidate again, or a repeat from the same source: no new evidence
         seen.add((text, source))
-        unique.append((alt, source))
-    unique = unique[:max_alternatives]
+        by_source.setdefault(source if source is not None else f"\0{len(seen)}", []).append((alt, source))
+    # Take turns between sources, so a limit never leaves a whole source out.
+    unique: list[tuple[str, str | None]] = []
+    queues = list(by_source.values())
+    while queues and len(unique) < max_alternatives:
+        for queue in list(queues):
+            if len(unique) >= max_alternatives:
+                break
+            unique.append(queue.pop(0))
+            if not queue:
+                queues.remove(queue)
     if not unique:
         outcome.reason = "no alternative differs from the candidate's own text"
         return outcome
@@ -216,24 +406,39 @@ def run(
     if base.truncated:
         outcome.reason = f"the candidate returns more than {max_rows} rows, too many to compare"
         return outcome
-    base_strict, base_loose = fingerprint(base.rows)
+    try:
+        own_analysis = A.analyse(sql, catalog, dialect, allowed_functions)
+    except Exception:
+        own_analysis = None
+    if own_analysis is not None:
+        why = unstable(own_analysis, catalog, len(base.rows))
+        if why:
+            outcome.reason = f"the query's result is not fixed from one run to the next ({why}), so comparing it says nothing"
+            return outcome
+    base_ordered = _has_order(own_analysis.tree) if own_analysis is not None else False
+    base_empty = _says_nothing(base.rows)
 
-    clusters: dict[tuple, int] = {}
+    # Results that differ from the candidate's, grouped: (rows, columns) of the first of each group.
+    groups: list[tuple[list[tuple], list[str]]] = []
     cluster_sizes: dict[int, int] = {}
     # For each source, how many of its comparable samples landed on each result. Result 0 is
     # the candidate's own.
     tallies: dict[str, dict[int, int]] = {}
+    empty_matches = 0
     for position, (alt, source) in enumerate(unique):
         voice = source if source is not None else f"#{position}"  # unlabelled: each its own voice
         entry = Alternative(sql=alt, status=INVALID, source=source)
         outcome.alternatives.append(entry)
         try:
-            checked = A.analyse(alt, catalog, dialect)
+            checked = A.analyse(alt, catalog, dialect, allowed_functions)
         except Exception as exc:  # an alternative must never break scoring
             entry.detail = f"could not be analysed: {type(exc).__name__}"
             continue
         if not checked.is_query or checked.unsafe_functions or checked.script_statements:
             entry.detail = "not a single read-only query"
+            continue
+        if checked.unlisted_functions:
+            entry.detail = "calls a function not known to be read-only: " + ", ".join(checked.unlisted_functions)
             continue
         if catalog is not None and (checked.unknown_tables or checked.unknown_columns):
             entry.detail = "names a table or column that does not exist"
@@ -253,8 +458,12 @@ def run(
             if known and total > cost_ceiling:
                 entry.status, entry.detail = SKIPPED, "estimated cost is above the ceiling"
                 continue
+        left = remaining()
+        if left <= 0.05:
+            entry.status, entry.detail = SKIPPED, "the time allowed for comparing alternatives ran out"
+            continue
         try:
-            result = adapter.execute(alt, max_rows=max_rows, timeout_s=timeout_s)
+            result = adapter.execute(alt, max_rows=max_rows, timeout_s=left)
         except SqlgamiError as exc:
             entry.status, entry.detail = INVALID, str(exc)[:160]
             continue
@@ -265,28 +474,52 @@ def run(
         if result.truncated:
             entry.status, entry.detail = SKIPPED, "result too large to compare"
             continue
-        strict, loose = fingerprint(result.rows)
+        why = unstable(checked, catalog, len(result.rows))
+        if why:
+            entry.status, entry.detail = SKIPPED, f"its result is not fixed from one run to the next: {why}"
+            continue
+        verdict, same_order = compare(base.rows, result.rows, base.columns, result.columns)
+        if verdict != DIFFERS and base_empty:
+            # Two queries that both find nothing agree whatever they were looking for.
+            entry.status, entry.detail = BOTH_EMPTY, "neither returns any value, which supports nothing"
+            empty_matches += 1
+            continue
+        if verdict != DIFFERS and not same_order and base_ordered and _has_order(checked.tree):
+            if ordered:
+                verdict = DIFFERS
+                entry.detail = "same rows in another order, and the question asks for an order"
+            else:
+                entry.status = AGREES_OTHER_ORDER
         outcome.comparable += 1
         tally = tallies.setdefault(voice, {})
-        if strict == base_strict:
-            entry.status = AGREES
+        if verdict != DIFFERS:
+            if entry.status != AGREES_OTHER_ORDER:
+                entry.status = verdict
             outcome.agreeing += 1
             tally[0] = tally.get(0, 0) + 1
-        elif loose == base_loose:
-            entry.status = AGREES_REORDERED
-            outcome.agreeing += 1
-            tally[0] = tally.get(0, 0) + 1
-        else:
-            entry.status = DIFFERS
-            number = clusters.setdefault(loose, len(clusters) + 1)
-            entry.cluster = number
-            cluster_sizes[number] = cluster_sizes.get(number, 0) + 1
-            tally[number] = tally.get(number, 0) + 1
-            entry.detail = _difference(base.rows, result.rows)
+            continue
+        entry.status = DIFFERS
+        number = None
+        if not _says_nothing(result.rows):  # results that hold nothing are never grouped together
+            for index, (rows, columns) in enumerate(groups, 1):
+                if compare(rows, result.rows, columns, result.columns)[0] != DIFFERS:
+                    number = index
+                    break
+        if number is None:
+            groups.append((list(result.rows), list(result.columns)))
+            number = len(groups)
+        entry.cluster = number
+        cluster_sizes[number] = cluster_sizes.get(number, 0) + 1
+        tally[number] = tally.get(number, 0) + 1
+        entry.detail = entry.detail or _difference(base.rows, result.rows)
 
     outcome.ran = outcome.comparable > 0
     if not outcome.ran:
-        outcome.reason = "no alternative could be run and compared"
+        outcome.reason = (
+            "the query and its alternatives all return nothing, which is not evidence either way"
+            if empty_matches
+            else "no alternative could be run and compared"
+        )
         return outcome
     outcome.largest_other_cluster = max(cluster_sizes.values(), default=0)
     # Each source casts one vote: the result most of its samples returned. A source whose

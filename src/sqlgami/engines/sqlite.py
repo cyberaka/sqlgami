@@ -196,7 +196,7 @@ class SQLiteAdapter(Adapter):
     # -------------------------------------------------------------- adapter
 
     def dry_run(self, sql: str) -> DryRunResult:
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, self.allowed_functions)
         try:
             _, rows, _ = self._guarded(f"EXPLAIN QUERY PLAN {sql}", None, 10.0)
         except (sqlite3.Error, _Timeout) as exc:
@@ -205,7 +205,7 @@ class SQLiteAdapter(Adapter):
         return DryRunResult(ok=True, plan=plan)
 
     def execute(self, sql: str, *, max_rows: int, timeout_s: float) -> ExecutionResult:
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, self.allowed_functions)
         started = time.perf_counter()
         try:
             columns, rows, truncated = self._guarded(sql, max_rows, timeout_s)
@@ -226,7 +226,7 @@ class SQLiteAdapter(Adapter):
 
     def query(self, expression: exp.Expression, *, max_rows: int = 1000, timeout_s: float = 10.0) -> list[tuple]:
         sql = expression.sql(dialect=self.dialect)
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, check_functions=False)  # built by sqlgami itself
         try:
             _, rows, _ = self._guarded(sql, max_rows, timeout_s)
         except (sqlite3.Error, _Timeout) as exc:
@@ -250,6 +250,17 @@ class SQLiteAdapter(Adapter):
                     count = None
             self._row_counts[key] = count
         return self._row_counts[key]
+
+    def function_exists(self, name: str) -> bool | None:
+        try:
+            rows = self._fetch(
+                "SELECT 1 FROM pragma_function_list WHERE lower(name) = ? "
+                "UNION ALL SELECT 1 FROM pragma_module_list WHERE lower(name) = ? LIMIT 1",
+                (name.lower(), name.lower()),
+            )
+        except Exception:
+            return None
+        return bool(rows)
 
     def version(self) -> str | None:
         # The SQLite library in this process, which decides what syntax is accepted

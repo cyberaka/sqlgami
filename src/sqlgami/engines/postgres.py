@@ -227,7 +227,7 @@ class PostgresAdapter(Adapter):
     # -------------------------------------------------------------- adapter
 
     def dry_run(self, sql: str) -> DryRunResult:
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, self.allowed_functions)
         try:
             _, rows, _ = self._guarded(f"EXPLAIN (FORMAT JSON) {sql}", None, 15.0)
         except self._psycopg.Error as exc:
@@ -236,7 +236,7 @@ class PostgresAdapter(Adapter):
         return DryRunResult(ok=True, plan=plan)
 
     def execute(self, sql: str, *, max_rows: int, timeout_s: float) -> ExecutionResult:
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, self.allowed_functions)
         started = time.perf_counter()
         try:
             columns, rows, truncated = self._guarded(sql, max_rows, timeout_s)
@@ -258,7 +258,7 @@ class PostgresAdapter(Adapter):
 
     def query(self, expression: exp.Expression, *, max_rows: int = 1000, timeout_s: float = 10.0) -> list[tuple]:
         sql = expression.sql(dialect=self.dialect)
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, check_functions=False)  # built by sqlgami itself
         try:
             _, rows, _ = self._guarded(sql, max_rows, timeout_s)
         except self._psycopg.Error as exc:
@@ -268,6 +268,13 @@ class PostgresAdapter(Adapter):
     def row_count(self, table: Table) -> int | None:
         """The planner's row estimate. Unknown until the table has been analysed."""
         return table.row_count
+
+    def function_exists(self, name: str) -> bool | None:
+        try:
+            rows = self._fetch("SELECT 1 FROM pg_catalog.pg_proc WHERE proname = %s LIMIT 1", (name.lower(),))
+        except Exception:
+            return None
+        return bool(rows)
 
     def version(self) -> str | None:
         if self._version is None:

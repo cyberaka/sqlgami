@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
+from .. import safety
 from ..analysis import _mutation_kinds
 from ..catalog import Catalog, CatalogLoader, Table
 from ..errors import UnsafeQueryError
@@ -48,8 +49,18 @@ class ExecutionResult:
     duration_ms: float | None = None
 
 
-def assert_read_only(sql: str, dialect: str) -> exp.Expression:
-    """Parse ``sql`` and refuse it unless it is exactly one read-only query."""
+def assert_read_only(
+    sql: str,
+    dialect: str,
+    allowed_functions: Iterable[str] = (),
+    *,
+    check_functions: bool = True,
+) -> exp.Expression:
+    """Parse ``sql`` and refuse it unless it is exactly one read-only query.
+
+    With ``check_functions`` (the default) every function it calls must also be on the
+    engine's allow-list or in ``allowed_functions``: see :mod:`sqlgami.safety`.
+    """
     try:
         statements = [s for s in sqlglot.parse(sql, dialect=dialect) if s is not None]
     except SqlglotError as exc:
@@ -63,6 +74,17 @@ def assert_read_only(sql: str, dialect: str) -> exp.Expression:
     if kinds or not isinstance(statement, exp.Query):
         what = ", ".join(kinds) or type(statement).__name__.upper()
         raise UnsafeQueryError(f"only read-only queries are sent to the database (found {what})")
+    if check_functions:
+        review = safety.review(sql, statement, dialect, allowed_functions)
+        if review.refused:
+            raise UnsafeQueryError(
+                f"the query reaches outside the tables ({', '.join(review.refused)}), so it was not sent"
+            )
+        if review.unlisted:
+            raise UnsafeQueryError(
+                f"the query calls a function not known to be read-only ({', '.join(review.unlisted)}), "
+                "so it was not sent; pass allowed_functions to vouch for it"
+            )
     return statement
 
 
@@ -72,6 +94,8 @@ class Adapter(abc.ABC):
     engine: str = ""
     dialect: str = ""
     cost_unit: str = "rows"
+    # Functions the host vouches for, beyond the engine's built-in allow-list.
+    allowed_functions: frozenset[str] = frozenset()
 
     @abc.abstractmethod
     def loader(self) -> CatalogLoader:
@@ -106,6 +130,10 @@ class Adapter(abc.ABC):
 
     def version(self) -> str | None:
         """The version of the engine being talked to, for the report."""
+        return None
+
+    def function_exists(self, name: str) -> bool | None:
+        """Whether the database has a function of this name, or ``None`` if that cannot be told."""
         return None
 
     def close(self) -> None:

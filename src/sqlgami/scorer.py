@@ -52,6 +52,10 @@ class Scorer:
         Optional function ``(question, schema_text, glossary, k) -> list of SQL`` that
         writes alternative queries for the consistency stage in ``full`` mode. sqlgami
         ships no model and calls none unless you pass this.
+    allowed_functions:
+        Names of functions you vouch for as read-only, such as your own user-defined
+        functions. sqlgami sends a statement to the database only if every function it
+        calls is a built-in known to be read-only or is named here.
     glossary:
         Business definitions, as text or a ``{term: meaning}`` dictionary. Values
         named here are not reported as filters the question never asked for.
@@ -80,6 +84,7 @@ class Scorer:
         snapshot_columns: dict[str, str] | None = None,
         default_project: str | None = None,
         generator: Any = None,
+        allowed_functions: Sequence[str] | None = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -122,6 +127,12 @@ class Scorer:
                 self.catalog.default_project = default_project
 
         self.options = options or Options()
+        if allowed_functions:
+            self.options.allowed_functions = tuple(dict.fromkeys([*self.options.allowed_functions, *allowed_functions]))
+        if self.adapter is not None and self.options.allowed_functions:
+            self.adapter.allowed_functions = frozenset(self.adapter.allowed_functions) | {
+                name.lower() for name in self.options.allowed_functions
+            }
         if cost_ceiling is not None:
             self.options.cost_ceiling = cost_ceiling
         if sample_rows is not None:

@@ -103,11 +103,12 @@ def test_cost_ceiling_blocks_execution(scorer):
 # ---------------------------------------------------------- database gates
 
 
-def test_database_rejects_what_static_analysis_cannot_see(scorer, engine):
+def test_database_knows_what_static_analysis_cannot_see(scorer, engine):
+    # The function is looked up in the database's catalogue; the statement itself is not sent.
     report = scorer.score("SELECT no_such_function(name) FROM customers")
-    assert report.has("dry_run_error")
+    assert report.has("unknown_function")
     assert report.verdict.value == "invalid" and report.score <= 0.1
-    assert stages(report)["sample"] == "not_run"
+    assert stages(report)["dry_run"] == "failed" and stages(report)["sample"] == "not_run"
 
 
 def test_unknown_column_is_confirmed_by_the_database(scorer):

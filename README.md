@@ -256,10 +256,25 @@ Two settings in `Options` matter:
   samples of the same model lowered precision in our tests; a second model
   raised it.
 
-Alternatives that are not single read-only queries, that name things that do
-not exist, or that reach outside the database are never run. Result sets are
-compared without regard to row order, and a match that differs only in column
-order still counts.
+Alternatives are held to the same rules as the query under review: one that is
+not a single read-only query, names something that does not exist, or calls a
+function outside the allow-list (see Safety) is never run. The whole stage has
+a time budget (`consistency_budget_s`, 30 seconds by default).
+
+How results are compared:
+
+- Row order is ignored, unless you set `consistency_ordered=True` because the
+  question asks for an order.
+- Columns may come in another order, but one reordering must work for every
+  row. When both results use the same column names, the names decide which
+  column is which, so two queries that swap the values of `paid` and `open`
+  do not agree.
+- Numbers agree to nine significant digits, and anything within 1e-9 of zero
+  is zero.
+- Two results that are both empty, or hold nothing but NULL, are not counted:
+  they would agree whatever the queries were looking for.
+- A query whose result can change from run to run (`LIMIT` with no `ORDER BY`
+  that actually cuts rows off, `random()`, a sample of rows) is not compared.
 
 The value of this signal depends on how independent and how capable the
 alternatives are. Samples from the same model and prompt as the candidate tend
@@ -365,6 +380,24 @@ one from bench suites and prints its error on questions held out of the fit.
 - sqlgami sends the database only read-only work: the statement under review
   (after it has been parsed and confirmed to be a single query), `EXPLAIN` of
   it, schema lookups, and small probe queries it builds itself.
+- A read-only query can still do harm through what it calls: read a file,
+  change a setting, take a lock. So a statement is sent only if every function
+  it calls is on an allow-list of that engine's built-in functions that do
+  nothing but compute (about 150 for SQLite, 900 for DuckDB, 1,550 for
+  Postgres; see `sqlgami/_functions.py`). The rule covers the query under
+  review and every alternative query alike.
+  - A built-in that reaches outside the tables (`read_csv`, `pg_read_file`,
+    `current_setting`, `nextval`, ...) is reported as `external_access` and the
+    statement is not sent.
+  - A function that does not exist is reported as `unknown_function`, from the
+    database's catalogue, without sending the statement.
+  - A function that exists but is not on the list, such as one of your own,
+    is reported as `unlisted_function`: the statement is analysed but not run.
+    Vouch for it with `Scorer(..., allowed_functions=["my_schema.my_function"])`.
+  - `SELECT ... FOR UPDATE` and `FOR SHARE` are refused, as are DuckDB file
+    paths written where a table name belongs.
+- These checks rest on parsing the statement. They are a strong filter, not a
+  sandbox: give sqlgami a database role that can only read what it should.
 - A database opened by path is opened read-only. On a SQLite connection you
   pass in, writes are disabled for the duration of each call and restored
   afterwards.

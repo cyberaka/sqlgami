@@ -9,9 +9,8 @@ what the candidate returns. These cases ask five things of it:
 4. Columns may be reordered, but values may not move between columns.
 5. Two results that are both empty (or both a lone NULL) are not evidence of anything.
 
-Known defects are ``xfail(strict=True)``: the suite stays green, and a case turns red when
-it is fixed, at which point its mark should be removed. ``pytest --runxfail`` shows them as
-plain failures. Everything else here passes today and should keep passing.
+Every case here passes. The ones that were defects when the checker wrote them were fixed
+with the function allow-list (sqlgami.safety) and the comparison rules in sqlgami.consistency.
 
 No unsafe statement is really executed by these tests: the adapter is wrapped so that the
 statement under test is recorded and refused instead of being run.
@@ -126,10 +125,10 @@ def test_unsafe_alternative_is_never_sent(engine, db, engines, alternative):
     assert _counts(db) == before
 
 
-# (engine, sql, why it matters). Each passes the gate today and is sent to the engine.
-# The same list guards the candidate itself (analysis._UNSAFE_FUNCTIONS is a list of names
-# to refuse, so anything not on it gets through).
-SENT_TODAY = [
+# (engine, sql, why it matters). A list of names to refuse let each of these through; the
+# allow-list of functions, and the refusal of FOR UPDATE, stop them. The candidate is held
+# to the same rule.
+OUTSIDE_THE_SCHEMA = [
     (
         "postgres",
         "SELECT pg_reload_conf()",
@@ -155,26 +154,16 @@ SENT_TODAY = [
 ]
 
 
-@pytest.mark.parametrize("target,alternative,why", SENT_TODAY, ids=[sql[:48] for _, sql, _ in SENT_TODAY])
+@pytest.mark.parametrize("target,alternative,why", OUTSIDE_THE_SCHEMA, ids=[sql[:48] for _, sql, _ in OUTSIDE_THE_SCHEMA])
 def test_statement_outside_the_schema_is_not_sent(engine, db, target, alternative, why, request):
     if engine != target:
         pytest.skip("statement belongs to another engine")
-    request.applymarker(pytest.mark.xfail(strict=True, reason=why))
     assert not _sent_to_engine(engine, db, alternative)
 
 
 def test_duckdb_sniff_csv_does_not_open_a_file(engine, db, tmp_path, request):
     if engine != "duckdb":
         pytest.skip("DuckDB only")
-    request.applymarker(
-        pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "read_csv is refused but sniff_csv is not on the list: it opens the named file "
-                "(it ran against /etc/passwd and returned a row)"
-            ),
-        )
-    )
     path = tmp_path / "outside.csv"
     path.write_text("secret,value\nx,1\n")
     assert not _sent_to_engine(engine, db, f"SELECT * FROM sniff_csv('{path}')")
@@ -210,14 +199,6 @@ def test_unsafe_candidate_given_straight_to_run_is_refused(engine, db):
 # ------------------------------------------------------------- 2. non-deterministic results
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Both queries cut the table off with LIMIT and no ORDER BY. On one engine and one "
-        "plan they return the same arbitrary rows, which is counted as agreement and lifts "
-        "the score (0.81 to 0.90 on all three engines)."
-    ),
-)
 def test_limit_without_order_is_not_counted_as_agreement(scorer):
     alone = scorer.sample("SELECT name FROM customers LIMIT 2", QUESTION)
     backed = scorer.sample(
@@ -227,14 +208,6 @@ def test_limit_without_order_is_not_counted_as_agreement(scorer):
     assert backed.score <= alone.score
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Two queries that are the same apart from an alias both select random(). Their "
-        "values differ on every run, which is reported as consistency_disagreement and "
-        "lowers the score (0.88 to 0.72)."
-    ),
-)
 def test_random_values_are_not_counted_as_disagreement(scorer):
     report = scorer.sample(
         "SELECT name, random() AS r FROM customers",
@@ -245,14 +218,6 @@ def test_random_values_are_not_counted_as_disagreement(scorer):
     assert _signal(report).get("agreeing", 0) == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The candidate picks two rows at random. Whether the alternative 'agrees' is luck: "
-        "it agreed on DuckDB and Postgres and disagreed on SQLite in one run. Neither "
-        "outcome says anything about the query."
-    ),
-)
 def test_randomly_chosen_rows_are_not_compared(scorer):
     report = scorer.sample(
         "SELECT name FROM customers ORDER BY random() LIMIT 2",
@@ -278,26 +243,12 @@ def test_tolerance_is_nine_significant_digits():
     assert same(float("nan"), float("nan"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The tolerance is relative only. 0.1 + 0.2 - 0.3 is 5.6e-17 in binary floating point "
-        "and 0 in exact arithmetic; with no absolute tolerance near zero the two differ."
-    ),
-)
 def test_noise_around_zero_agrees_with_zero():
     assert fingerprint([(0.1 + 0.2 - 0.3,)])[0] == fingerprint([(0.0,)])[0]
 
 
 def test_noise_around_zero_in_sql(engine, db, request):
     """SQLite computes 0.1 + 0.2 - 0.3 in binary floating point; DuckDB and Postgres use decimals."""
-    if engine == "sqlite":
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="on SQLite the candidate returns 5.6e-17, the alternative 0.0, and they are reported as differing",
-            )
-        )
     with Scorer(engine, db=db) as scorer:
         report = scorer.sample("SELECT 0.1 + 0.2 - 0.3 AS d", QUESTION, alternatives=["SELECT 0.0 AS d"])
     assert _statuses(report) == ["agrees"]
@@ -319,26 +270,10 @@ def test_columns_in_another_order_agree(scorer):
     assert _statuses(report) == ["agrees_columns_reordered"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "The column-order-free signature sorts the values inside each row, so it cannot tell "
-        "a column swap from values that moved between columns. [(1, 2), (3, 4)] and "
-        "[(2, 1), (3, 4)] match although no reordering of columns turns one into the other."
-    ),
-)
 def test_values_swapped_in_one_row_only_do_not_match():
     assert fingerprint([(1, 2), (3, 4)])[1] != fingerprint([(2, 1), (3, 4)])[1]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Both queries name their columns paid and open_n, and one has the two conditions the "
-        "wrong way round: (3, 1) against (1, 3). Column names are ignored, so this is "
-        "reported as agrees_columns_reordered and lifts the score (0.73 to 0.84)."
-    ),
-)
 def test_same_column_names_with_swapped_values_disagree(scorer):
     paid_first = (
         "SELECT SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid, "
@@ -352,14 +287,6 @@ def test_same_column_names_with_swapped_values_disagree(scorer):
     assert _statuses(report) == ["differs"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Row order is ignored even when both queries say ORDER BY and say the opposite. For "
-        "a question that asks for a sorted list the two answers differ, and plain 'agrees' "
-        "says they do not."
-    ),
-)
 def test_opposite_sort_orders_are_not_plain_agreement(scorer):
     report = scorer.sample(
         "SELECT name FROM customers ORDER BY name",
@@ -372,14 +299,6 @@ def test_opposite_sort_orders_are_not_plain_agreement(scorer):
 # ---------------------------------------------------------------------- 5. empty results
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Both queries return no rows, for different reasons and with different columns. An "
-        "empty result equals any other empty result, so this counts as agreement and lifts "
-        "the score (0.31 to 0.40)."
-    ),
-)
 def test_two_empty_results_are_not_agreement(scorer):
     candidate = "SELECT name FROM customers WHERE country = 'XX'"
     alone = scorer.sample(candidate, QUESTION)
@@ -390,13 +309,6 @@ def test_two_empty_results_are_not_agreement(scorer):
     assert backed.score <= alone.score
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SUM over no rows and MAX over no rows are both a single NULL. That is counted as "
-        "agreement and lifts the score (0.23 to 0.38)."
-    ),
-)
 def test_two_lone_nulls_are_not_agreement(scorer):
     candidate = "SELECT SUM(total) FROM orders WHERE status = 'zzz'"
     alone = scorer.sample(candidate, QUESTION)
@@ -410,14 +322,6 @@ def test_two_lone_nulls_are_not_agreement(scorer):
 # ------------------------------------------------------------- which alternatives are compared
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Alternatives are compared with the candidate's text after lower-casing all of it, "
-        "string literals included. country = 'us' is dropped as 'the candidate again' although "
-        "it returns no rows where country = 'US' returns two."
-    ),
-)
 def test_literal_in_another_case_is_a_different_query(scorer):
     report = scorer.sample(
         "SELECT name FROM customers WHERE country = 'US'",
@@ -433,14 +337,6 @@ def test_same_text_in_another_letter_case_is_the_candidate_again(scorer):
     assert report.stage("consistency").status.value == "skipped"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "When there are more alternatives than consistency_max_alternatives the list is cut "
-        "from the front. Four samples from one model fill the limit and the two other models "
-        "are never run, so one voice is counted instead of three."
-    ),
-)
 def test_the_limit_keeps_every_source_in_play(engine, db):
     alternatives = [(f"SELECT c.name FROM customers c WHERE {i} = {i}", "model-a") for i in range(4)]
     alternatives += [

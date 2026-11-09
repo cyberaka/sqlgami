@@ -203,7 +203,7 @@ class DuckDBAdapter(Adapter):
     # -------------------------------------------------------------- adapter
 
     def dry_run(self, sql: str) -> DryRunResult:
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, self.allowed_functions)
         try:
             _, rows, _ = self._guarded(f"EXPLAIN {sql}", None, 10.0)
         except (self._duckdb.Error, _Timeout) as exc:
@@ -212,7 +212,7 @@ class DuckDBAdapter(Adapter):
         return DryRunResult(ok=True, plan=plan)
 
     def execute(self, sql: str, *, max_rows: int, timeout_s: float) -> ExecutionResult:
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, self.allowed_functions)
         started = time.perf_counter()
         try:
             columns, rows, truncated = self._guarded(sql, max_rows, timeout_s)
@@ -233,12 +233,21 @@ class DuckDBAdapter(Adapter):
 
     def query(self, expression: exp.Expression, *, max_rows: int = 1000, timeout_s: float = 10.0) -> list[tuple]:
         sql = expression.sql(dialect=self.dialect)
-        assert_read_only(sql, self.dialect)
+        assert_read_only(sql, self.dialect, check_functions=False)  # built by sqlgami itself
         try:
             _, rows, _ = self._guarded(sql, max_rows, timeout_s)
         except (self._duckdb.Error, _Timeout) as exc:
             raise AdapterError(f"probe query failed: {_first_lines(str(exc))}") from exc
         return rows
+
+    def function_exists(self, name: str) -> bool | None:
+        try:
+            rows = self._fetch(
+                "SELECT 1 FROM duckdb_functions() WHERE lower(function_name) = ? LIMIT 1", (name.lower(),)
+            )
+        except Exception:
+            return None
+        return bool(rows)
 
     def version(self) -> str | None:
         return getattr(self._duckdb, "__version__", None)

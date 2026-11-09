@@ -21,6 +21,7 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, build_scope
 from sqlglot.schema import MappingSchema
 
+from . import safety
 from .catalog import Catalog, Table, schema_name_of, view_query_from_sql
 from .types import sqlglot_type_name
 
@@ -104,6 +105,8 @@ class Analysis:
     views_used: list[str] = field(default_factory=list)
     table_functions: list[str] = field(default_factory=list)
     unsafe_functions: list[str] = field(default_factory=list)
+    # Calls sqlgami does not know to be read-only (a user-defined function, say). Analysed, never run.
+    unlisted_functions: list[str] = field(default_factory=list)
     string_identifiers: list[str] = field(default_factory=list)
     types_annotated: bool = False
     # For a script (DECLARE ...; SET ...; SELECT ...): what came before the query.
@@ -142,7 +145,12 @@ class Analysis:
         return [s for s in self.scopes() if isinstance(s.expression, exp.Select)]
 
 
-def analyse(sql: str, catalog: Catalog | None, dialect: str | None = None) -> Analysis:
+def analyse(
+    sql: str,
+    catalog: Catalog | None,
+    dialect: str | None = None,
+    allowed_functions: Iterable[str] = (),
+) -> Analysis:
     """Parse ``sql`` and, if a catalog is given, resolve it against the schema."""
     dialect = dialect or (catalog.dialect if catalog is not None else None)
     if not dialect:
@@ -195,41 +203,13 @@ def analyse(sql: str, catalog: Catalog | None, dialect: str | None = None) -> An
         analysis.kind = OTHER
         return analysis
     analysis.kind = QUERY
-    analysis.unsafe_functions = _unsafe_functions(tree)
+    review = safety.review(sql, tree, dialect, allowed_functions)
+    analysis.unsafe_functions = review.refused
+    analysis.unlisted_functions = review.unlisted
 
     if catalog is not None:
         _Resolver(analysis, catalog).run()
     return analysis
-
-
-# Functions that reach outside the database (files, network, other servers) or stall it.
-_UNSAFE_FUNCTIONS = {
-    "read_csv", "read_csv_auto", "read_parquet", "parquet_scan", "read_json", "read_json_auto",
-    "read_json_objects", "read_ndjson", "read_ndjson_auto", "read_text", "read_blob", "glob",
-    "sqlite_scan", "postgres_scan", "postgres_query", "mysql_scan", "mysql_query", "iceberg_scan",
-    "delta_scan", "read_xlsx", "st_read", "getenv", "query", "query_table",
-    "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file", "lo_import", "lo_export",
-    "dblink", "dblink_exec", "pg_sleep", "pg_sleep_for", "pg_sleep_until", "pg_terminate_backend",
-    "pg_cancel_backend", "set_config", "nextval", "setval", "pg_advisory_lock",
-    "load_extension", "readfile", "writefile", "edit", "fts3_tokenizer",
-}
-
-
-def _unsafe_functions(tree: exp.Expression) -> list[str]:
-    found: set[str] = set()
-    for node in tree.find_all(exp.Func):
-        name = node.name if isinstance(node, exp.Anonymous) else node.sql_name()
-        name = (name or "").lower()
-        if name in _UNSAFE_FUNCTIONS:
-            found.add(name)
-    for node in tree.find_all(exp.Table):
-        # DuckDB reads a file when a quoted path stands where a table name should.
-        ident = node.this
-        if isinstance(ident, exp.Identifier) and ident.args.get("quoted") and not node.db:
-            text = ident.name.lower()
-            if "/" in text or text.endswith((".csv", ".parquet", ".json", ".ndjson", ".tsv", ".xlsx", ".db")):
-                found.add(f"file {ident.name!r}")
-    return sorted(found)
 
 
 _SCRIPT_DIALECTS = {"bigquery"}
@@ -264,6 +244,8 @@ def _mutation_kinds(tree: exp.Expression) -> list[str]:
         if isinstance(node, _MUTATING_NODES):
             name = type(node).__name__.upper()
             kinds.add("SELECT INTO" if name == "INTO" else name)
+        elif isinstance(node, exp.Lock):
+            kinds.add("FOR UPDATE" if node.args.get("update") else "FOR SHARE")  # asks for row locks
     return sorted(kinds)
 
 

@@ -181,7 +181,13 @@ def test_plan_is_the_engines_json(scorer):
 
 
 def test_a_function_that_writes_cannot_write(pg, scorer):
+    # First line of defence: a function nobody vouched for is not sent at all.
     report = scorer.sample(f"SELECT {AUDIT}.sneaky()")
+    assert report.has("unlisted_function") and stages(report)["sample"] == "skipped", report.summary()
+    assert pg.execute(f"SELECT COUNT(*) FROM {AUDIT}.side_effects").fetchone()[0] == 0
+    # Second: if the host vouches for it wrongly, the read-only transaction still stops the write.
+    with Scorer("postgres", db=pg, allowed_functions=[f"{AUDIT}.sneaky"]) as trusting:
+        report = trusting.sample(f"SELECT {AUDIT}.sneaky()")
     assert report.has("execution_error"), report.summary()
     assert "read-only" in next(f.message for f in report.findings if f.code == "execution_error")
     assert pg.execute(f"SELECT COUNT(*) FROM {AUDIT}.side_effects").fetchone()[0] == 0
