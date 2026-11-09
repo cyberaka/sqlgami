@@ -771,35 +771,39 @@ def _probe_allowed(adapter: Adapter, table: Table, options: Options) -> bool:
 def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Options) -> None:
     """Check findings against the data: confirm them, dismiss them, or add new ones."""
     budget = options.max_probes
-    unique_results: dict[int, list[bool | None]] = {}
+    # Uniqueness probes: finding -> group -> outcomes. A group holds when every outcome is True.
+    unique_results: dict[int, dict[str | None, list[bool | None]]] = {}
     unique_findings: dict[int, Finding] = {}
     done: set[tuple] = set()
     skipped_for_size: set[str] = set()
 
+    def note_unique(probe: Probe, outcome: bool | None) -> None:
+        if probe.finding is not None:
+            unique_results.setdefault(id(probe.finding), {}).setdefault(probe.group, []).append(outcome)
+            unique_findings[id(probe.finding)] = probe.finding
+
     for probe in ctx.probes:
-        key = (probe.kind, probe.table.qualified_name, probe.columns, probe.literal, probe.operator, id(probe.finding))
+        key = (probe.kind, probe.table.qualified_name, probe.columns, probe.literal, probe.operator, id(probe.finding), probe.group, probe.snippet)
         if key in done:
             continue
         done.add(key)
         if probe.kind == PROBE_UNIQUE and probe.finding is not None:
-            unique_results.setdefault(id(probe.finding), [])
+            unique_results.setdefault(id(probe.finding), {}).setdefault(probe.group, [])
             unique_findings[id(probe.finding)] = probe.finding
         if budget <= 0:
             report.checks_not_run.append(SkippedCheck(f"probe:{probe.kind}", "probe budget for this query is used up"))
-            if probe.kind == PROBE_UNIQUE and probe.finding is not None:
-                unique_results[id(probe.finding)].append(None)
+            if probe.kind == PROBE_UNIQUE:
+                note_unique(probe, None)
             continue
         if not _probe_allowed(adapter, probe.table, options):
             skipped_for_size.add(probe.table.qualified_name)
-            if probe.kind == PROBE_UNIQUE and probe.finding is not None:
-                unique_results[id(probe.finding)].append(None)
+            if probe.kind == PROBE_UNIQUE:
+                note_unique(probe, None)
             continue
         budget -= 1
         try:
             if probe.kind == PROBE_UNIQUE:
-                outcome = _probe_unique(adapter, probe, options)
-                if probe.finding is not None:
-                    unique_results[id(probe.finding)].append(outcome)
+                note_unique(probe, _probe_unique(adapter, probe, options))
             elif probe.kind == PROBE_HAS_NULL:
                 _probe_has_null(adapter, probe, options)
             elif probe.kind == PROBE_VALUE:
@@ -811,17 +815,20 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
         except AdapterError as exc:
             logger.debug("probe failed: %s", exc)
             report.checks_not_run.append(SkippedCheck(f"probe:{probe.kind}", str(exc)))
-            if probe.kind == PROBE_UNIQUE and probe.finding is not None:
-                unique_results[id(probe.finding)].append(None)
+            if probe.kind == PROBE_UNIQUE:
+                note_unique(probe, None)
 
     for table in sorted(skipped_for_size):
         report.checks_not_run.append(
             SkippedCheck("probe", f"{table} is too large to probe within the row ceiling")
         )
 
-    for finding_id, outcomes in unique_results.items():
+    for finding_id, groups in unique_results.items():
         finding = unique_findings[finding_id]
-        if outcomes and all(outcome is True for outcome in outcomes):
+        holds = [outcomes and all(o is True for o in outcomes) for outcomes in groups.values()]
+        broken = [bool(outcomes) and all(o is False for o in outcomes if o is not None) and any(o is False for o in outcomes)
+                  for outcomes in groups.values()]
+        if any(holds):
             finding.severity = Severity.INFO
             finding.evidence["data_check"] = "unique"
             finding.evidence["certainty"] = "dismissed"
@@ -829,7 +836,7 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
                 " Checked against the data: the join columns hold no repeated values at present, "
                 "so nothing is double-counted today. No constraint enforces that."
             )
-        elif any(outcome is False for outcome in outcomes):
+        elif groups and all(broken):
             finding.evidence["data_check"] = "duplicates"
             if finding.evidence.get("certainty") == "maybe":
                 finding.evidence["certainty"] = "yes"
@@ -839,6 +846,8 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
 
 def _probe_unique(adapter: Adapter, probe: Probe, options: Options) -> bool:
     """True when the columns hold no repeated (non-NULL) combination."""
+    if probe.query is not None:  # a derived table, run as written and grouped by its join columns
+        return not adapter.query(probe.query, max_rows=1, timeout_s=options.probe_timeout_s)
     columns = [_column(c) for c in probe.columns]
     query = (
         exp.select(exp.Literal.number(1))

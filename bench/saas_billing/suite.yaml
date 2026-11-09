@@ -93,11 +93,11 @@ row_budget:
   cap: 50000
 
 seed_43_nasty2_hazards:
-  - CHF currency row (no exchange_rate to USD) + a CHF invoice (triggers rules.fx_conversion missing-rate branch)
-  - '"At-Average Inc" tenant with a round-number USD invoice (triggers >= vs > on avg thresholds)' 
-  - Invoice issued exactly on the 2026-01-01 tax-rate boundary date (SCD2 as-of boundary)
-  - '"Only Invoices Co" (invoice without a payment) and "Only Payments LLC" (payment without an invoice) — the only_inv / only_pay sides of EXCEPT reconciliation' 
-  - All seed 42 nasty hazards still present (nasty2 is a superset)
+  - "CHF currency row (no exchange_rate to USD) + a CHF invoice (triggers rules.fx_conversion missing-rate branch)"
+  - "'At-Average Inc' tenant with a round-number USD invoice (triggers >= vs > on avg thresholds)"
+  - "Invoice issued exactly on the 2026-01-01 tax-rate boundary date (SCD2 as-of boundary)"
+  - "'Only Invoices Co' (invoice without a payment) and 'Only Payments LLC' (payment without an invoice) — the only_inv / only_pay sides of EXCEPT reconciliation"
+  - "All seed 42 nasty hazards still present (nasty2 is a superset)"
 
 views:
   view_on_view_chains:

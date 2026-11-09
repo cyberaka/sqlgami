@@ -1,0 +1,191 @@
+"""Grain reasoning on production shapes: lookups, CTE keys, filters applied upstream.
+
+Each rule here is tested in both directions: the shape that must stay quiet, and the
+neighbouring shape that must still be caught.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from sqlgami import Scorer
+from sqlgami.report import Severity
+
+from conftest import SHOP_DDL
+
+
+@pytest.fixture(params=["sqlite", "duckdb", "postgres"])
+def dialect(request) -> str:
+    return request.param
+
+
+def _codes(report, at_least=Severity.MEDIUM):
+    return sorted({f.code for f in report.findings_at_least(at_least)})
+
+
+def _finding(report, code):
+    return next((f for f in report.findings if f.code == code), None)
+
+
+# ------------------------------------------------------------------ fan_out: derived lookups
+
+
+def test_lookup_cte_unique_on_the_data_is_dismissed_by_a_probe(scorer):
+    # profiles.customer_id has no declared key; one profile per customer in the data.
+    sql = (
+        "WITH prof AS (SELECT customer_id, bio FROM profiles) "
+        "SELECT SUM(o.total) FROM orders o JOIN prof ON prof.customer_id = o.customer_id"
+    )
+    static = scorer.explain(sql)
+    assert "fan_out" in _codes(static, Severity.LOW)  # statically unknown, so it is raised...
+    sampled = scorer.sample(sql)
+    finding = _finding(sampled, "fan_out")
+    assert finding is not None and finding.severity == Severity.INFO  # ...and dismissed by the data
+    assert finding.evidence.get("data_check") == "unique"
+
+
+def test_lookup_cte_with_duplicates_on_the_data_is_confirmed(scorer):
+    # payments has several rows per order: a "lookup" on order_id repeats the orders.
+    sql = (
+        "WITH pay AS (SELECT order_id, amount FROM payments) "
+        "SELECT SUM(o.total) FROM orders o JOIN pay ON pay.order_id = o.id"
+    )
+    sampled = scorer.sample(sql)
+    finding = _finding(sampled, "fan_out")
+    assert finding is not None and finding.severity == Severity.HIGH
+    assert finding.evidence.get("data_check") == "duplicates"
+
+
+def test_count_star_is_safe_once_one_table_is_not_repeated(scorer):
+    # COUNT(*) over orders joined to a per-customer lookup counts orders, however many
+    # orders a customer has. Only the lookup has to be unique.
+    sql = (
+        "WITH prof AS (SELECT customer_id, bio FROM profiles) "
+        "SELECT prof.bio, COUNT(*) FROM orders o JOIN prof ON prof.customer_id = o.customer_id GROUP BY prof.bio"
+    )
+    sampled = scorer.sample(sql)
+    assert "fan_out" not in _codes(sampled)
+
+
+def test_join_on_an_expression_binds_the_column(dialect):
+    # tm has one row per (customer_id, m); joining on customer_id and m = <expression of c>
+    # picks at most one tm row per c row, twice over.
+    sql = (
+        "WITH tm AS (SELECT customer_id, EXTRACT(month FROM created_at) AS m, SUM(total) AS t "
+        "FROM orders GROUP BY customer_id, EXTRACT(month FROM created_at)), "
+        "c AS (SELECT customer_id, MIN(EXTRACT(month FROM created_at)) AS first_m FROM orders GROUP BY customer_id) "
+        "SELECT c.first_m, COUNT(*) AS n, COUNT(t1.customer_id) AS n1, SUM(t2.t) AS s2 FROM c "
+        "LEFT JOIN tm t1 ON t1.customer_id = c.customer_id AND t1.m = c.first_m + 1 "
+        "LEFT JOIN tm t2 ON t2.customer_id = c.customer_id AND t2.m = c.first_m + 2 "
+        "GROUP BY c.first_m"
+    )
+    report = Scorer(dialect, catalog=SHOP_DDL).explain(sql)
+    assert "fan_out" not in _codes(report, Severity.LOW), report.summary()
+
+
+def test_join_without_the_second_key_column_still_fans_out(dialect):
+    # Joined on customer_id alone, tm has several rows per c row, so c's values are repeated.
+    sql = (
+        "WITH tm AS (SELECT customer_id, EXTRACT(month FROM created_at) AS m, SUM(total) AS t "
+        "FROM orders GROUP BY customer_id, EXTRACT(month FROM created_at)), "
+        "c AS (SELECT customer_id, MIN(EXTRACT(month FROM created_at)) AS first_m, COUNT(*) AS n FROM orders GROUP BY customer_id) "
+        "SELECT c.first_m, SUM(c.n) FROM c LEFT JOIN tm t1 ON t1.customer_id = c.customer_id GROUP BY c.first_m"
+    )
+    report = Scorer(dialect, catalog=SHOP_DDL).explain(sql)
+    assert "fan_out" in _codes(report), report.summary()
+
+
+# --------------------------------------------------------------- fan_out: inside a CTE
+
+
+def test_rate_looked_up_per_row_inside_a_cte_is_not_a_fan_out(dialect):
+    # Each item carries its order's... no: each order carries its customer's country; a value
+    # applied once per row of the CTE's own grain, and the aggregate also reads a grain column.
+    sql = (
+        "WITH x AS (SELECT o.id, o.total, c.country FROM orders o JOIN customers c ON c.id = o.customer_id) "
+        "SELECT country, SUM(total) FROM x GROUP BY country"
+    )
+    assert "fan_out" not in _codes(Scorer(dialect, catalog=SHOP_DDL).explain(sql), Severity.LOW)
+
+
+def test_parent_total_summed_per_child_row_is_still_a_fan_out(dialect):
+    # The CTE's rows have no key of their own (a range join), and total is a parent's own figure,
+    # not a per-row rate: summing it once per payment is a fan-out.
+    sql = (
+        "WITH x AS (SELECT p.id AS pay_id, p.amount, o.total FROM payments p JOIN orders o ON p.paid_at >= o.created_at) "
+        "SELECT SUM(total) FROM x"
+    )
+    report = Scorer(dialect, catalog=SHOP_DDL).explain(sql)
+    assert "fan_out" in _codes(report), report.summary()
+
+
+def test_price_times_quantity_inside_a_cte_is_fine(dialect):
+    sql = (
+        "WITH x AS (SELECT i.id, i.qty, o.total AS order_total, i.price FROM items i JOIN orders o ON o.id = i.order_id) "
+        "SELECT SUM(price * qty) FROM x"
+    )
+    assert "fan_out" not in _codes(Scorer(dialect, catalog=SHOP_DDL).explain(sql), Severity.LOW)
+
+
+# ----------------------------------------------------- soft_deleted_rows: lookups, upstream filters
+
+LIVE_DDL = SHOP_DDL
+
+
+def _policy_scorer(dialect, question=None):
+    return Scorer(dialect, catalog=LIVE_DDL, soft_delete_column="deleted_at", soft_delete_policy="required")
+
+
+def test_table_filtered_upstream_is_anchored_through_the_cte_key(dialect):
+    # rev only holds live customers' totals; joining customers back on its key adds no deleted ones.
+    sql = (
+        "WITH rev AS (SELECT o.customer_id, SUM(o.total) AS t FROM orders o "
+        "JOIN customers c ON c.id = o.customer_id AND c.deleted_at IS NULL GROUP BY o.customer_id) "
+        "SELECT r.customer_id, c.name, r.t FROM rev r JOIN customers c ON c.id = r.customer_id"
+    )
+    assert "soft_deleted_rows" not in _codes(_policy_scorer(dialect).explain(sql), Severity.LOW)
+
+
+def test_cte_consumed_through_a_filtered_table_is_anchored(dialect):
+    sql = (
+        "WITH cc AS (SELECT c.id, c.country FROM customers c) "
+        "SELECT c.id, c.name, cc.country FROM customers c JOIN cc ON cc.id = c.id WHERE c.deleted_at IS NULL"
+    )
+    assert "soft_deleted_rows" not in _codes(_policy_scorer(dialect).explain(sql), Severity.LOW)
+
+
+def test_lookup_only_use_is_a_note_not_a_violation(dialect):
+    # customers is only used to classify orders by country; its rows are not listed or counted.
+    sql = (
+        "WITH cc AS (SELECT c.id, c.country FROM customers c) "
+        "SELECT cc.country, SUM(o.total) FROM orders o JOIN cc ON cc.id = o.customer_id GROUP BY cc.country"
+    )
+    report = _policy_scorer(dialect).explain(sql)
+    finding = _finding(report, "soft_deleted_rows")
+    assert finding is not None and finding.severity == Severity.LOW and finding.evidence["lookup"] is True
+
+
+def test_lookup_that_lists_rows_per_entity_stays_a_violation(dialect):
+    # Grouping by the lookup's key lists customers: a deleted customer in the output is the classic bug.
+    sql = (
+        "WITH cc AS (SELECT c.id, c.country FROM customers c) "
+        "SELECT cc.id, SUM(o.total) FROM orders o JOIN cc ON cc.id = o.customer_id GROUP BY cc.id"
+    )
+    report = _policy_scorer(dialect).explain(sql)
+    finding = _finding(report, "soft_deleted_rows")
+    assert finding is not None and finding.severity == Severity.HIGH
+
+
+def test_lookup_the_question_asks_to_filter_is_at_least_medium(dialect):
+    sql = (
+        "WITH cc AS (SELECT c.id, c.country FROM customers c) "
+        "SELECT cc.country, SUM(o.total) FROM orders o JOIN cc ON cc.id = o.customer_id GROUP BY cc.country"
+    )
+    report = _policy_scorer(dialect).explain(sql, "Total order value by country of non-deleted customers")
+    finding = _finding(report, "soft_deleted_rows")
+    assert finding is not None and finding.severity.rank >= Severity.MEDIUM.rank
+
+
+def test_plain_unfiltered_table_at_the_grain_is_still_high(dialect):
+    report = _policy_scorer(dialect).explain("SELECT c.id, c.name FROM customers c")
+    assert _finding(report, "soft_deleted_rows").severity == Severity.HIGH

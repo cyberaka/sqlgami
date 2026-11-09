@@ -18,7 +18,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import Scope
 
 from ..catalog import Column, RequiredPredicate, Table
-from ..model import NO, ColRef, SelectModel, strip, walk_own
+from ..model import NO, ColRef, SelectModel, strip, walk_own, unalias
 from ..report import Finding, Severity
 from .base import CheckContext, check
 
@@ -37,6 +37,9 @@ class Miss:
     bridge: bool = False  # only passed through on the way to another table
     in_view: bool = False  # the table is read inside a view body, not by the query's author
     counted: bool = True  # its rows are what the query counts or lists (not a parent it merely joins to)
+    # The table sits in a derived table that the query uses only to look values up: joined at most
+    # one row per row of a source with many rows, and not grouped or listed by.
+    lookup: bool = False
 
 
 def inside_view(node: exp.Expression) -> bool:
@@ -64,7 +67,8 @@ class _Tracer:
         self.mode = mode
         self.misses: dict[int, Miss] = {}
         self.satisfied: set[int] = set()
-        self._visited: set[tuple[int, frozenset[str]]] = set()
+        self._visited: set[tuple[int, frozenset[str], frozenset[str]]] = set()
+        self._live: dict[int, frozenset[str]] = {}
 
     @classmethod
     def for_names(cls, ctx: CheckContext, names: Iterable[str], mode: str, applies=None) -> "_Tracer":
@@ -86,8 +90,17 @@ class _Tracer:
 
     # ------------------------------------------------------------ traversal
 
-    def _visit(self, scope: Scope, external: frozenset[str], outer: frozenset[ColRef]) -> None:
-        key = (id(scope), external)
+    def _visit(
+        self,
+        scope: Scope,
+        external: frozenset[str],
+        outer: frozenset[ColRef],
+        live: frozenset[str] = frozenset(),
+        lookup: bool = False,
+    ) -> None:
+        """``live``: output columns of this query that the consumer ties to anchored keys, so the
+        rows that matter are already the filtered ones. ``lookup``: the consumer only looks values up here."""
+        key = (id(scope), external, live)
         if key in self._visited:
             return
         self._visited.add(key)
@@ -100,13 +113,15 @@ class _Tracer:
                     list(branch.expression.named_selects) if isinstance(branch.expression, exp.Query) else []
                 )
                 mapped = frozenset(branch_names[i] for i in positions if i < len(branch_names))
-                self._visit(branch, mapped, outer)
+                live_positions = [i for i, name in enumerate(names) if name in live]
+                mapped_live = frozenset(branch_names[i] for i in live_positions if i < len(branch_names))
+                self._visit(branch, mapped, outer, mapped_live, lookup)
             return
         if not isinstance(expression, exp.Select):
             return
         model = self.ctx.cache.model(scope)
         covered = self._covered(model, external, outer)
-        anchored = self._anchored(model, covered, outer)
+        anchored = self._anchored(model, covered, outer, self._anchored_by_live(model, live))
 
         for alias, source in model.sources.items():
             if source.kind == "table" and source.table is not None:
@@ -128,11 +143,19 @@ class _Tracer:
                         bridge=self._is_bridge(model, alias),
                         in_view=inside_view(source.node),
                         counted=len(model.sources) == 1 or model.multiplied(alias).state == NO,
+                        lookup=lookup and (len(model.sources) == 1 or model.multiplied(alias).state == NO),
                     ),
                 )
             elif source.kind == "derived" and source.scope is not None:
                 names = frozenset(column for (a, column) in covered if a == alias)
-                self._visit(source.scope, names, outer | covered if source.lateral else outer)
+                inner_live = self._live_names_for(model, alias, anchored)
+                self._visit(
+                    source.scope,
+                    names,
+                    outer | covered if source.lateral else outer,
+                    inner_live,
+                    lookup or self._is_lookup(model, alias),
+                )
 
         for sub in scope.subquery_scopes:
             self._visit(sub, frozenset(), outer | covered)
@@ -143,16 +166,23 @@ class _Tracer:
             return []
         return [(alias, self.ctx.catalog.column_key(c.name)) for c in self.columns_for(source.table)]
 
-    def _anchored(self, model: SelectModel, covered: frozenset[ColRef], outer: frozenset[ColRef]) -> set[str]:
+    def _anchored(
+        self,
+        model: SelectModel,
+        covered: frozenset[ColRef],
+        outer: frozenset[ColRef],
+        given: set[str] | None = None,
+    ) -> set[str]:
         """Sources whose rows are limited the way this check requires.
 
         A table is anchored when its own column is covered. It is also anchored
         when it is tied by a single-column key to an anchored source: the join
         then picks out rows that belong to the anchored ones, so no separate
         filter is needed. (A join on part of a composite key gives no such
-        assurance, and stays a finding.)
+        assurance, and stays a finding.) A derived table is anchored on a column
+        when that column holds only keys of rows already filtered inside it.
         """
-        anchored: set[str] = set()
+        anchored: set[str] = set(given or ())
         for alias, source in model.sources.items():
             if source.kind == "table":
                 if any(ref in covered for ref in self._own_refs(model, alias)):
@@ -160,6 +190,7 @@ class _Tracer:
             elif any(a == alias for (a, _) in covered):
                 anchored.add(alias)  # a derived table with a covered column; checked inside as well
         if self.mode == MENTIONED:
+            anchored |= self._anchored_by_derived_keys(model, anchored)
             return anchored | self._key_semi_joined(model, anchored, outer)
         changed = True
         while changed:
@@ -175,7 +206,131 @@ class _Tracer:
                     if _single_column_key(model, near[0], near[1]) or _single_column_key(model, far[0], far[1]):
                         anchored.add(near[0])
                         changed = True
+            more = self._anchored_by_derived_keys(model, anchored) - anchored
+            if more:
+                anchored |= more
+                changed = True
         return anchored | self._key_semi_joined(model, anchored, outer)
+
+    # --------------------------------------------- filters applied inside a derived table
+
+    def _live_keys(self, scope: Scope) -> frozenset[str]:
+        """Output columns of a derived table that hold only keys of rows it has already filtered.
+
+        ``WITH rev AS (SELECT i.tenant_id ... FROM invoices i JOIN tenants t ON t.tenant_id = i.tenant_id
+        AND t.deleted_at IS NULL ...)``: rev.tenant_id names live tenants only.
+        """
+        cached = self._live.get(id(scope))
+        if cached is not None:
+            return cached
+        self._live[id(scope)] = frozenset()  # guards recursion
+        found: set[str] = set()
+        expression = scope.expression
+        if isinstance(expression, exp.SetOperation):
+            branches = [self._live_keys(b) for b in scope.union_scopes]
+            if branches:
+                names = list(expression.named_selects)
+                common = set.intersection(*[set(b) for b in branches]) if all(branches) else set()
+                found = {n for n in names if n in common}
+        elif isinstance(expression, exp.Select):
+            try:
+                model = self.ctx.cache.model(scope)
+                anchored = self._anchored(model, self._covered(model, frozenset(), frozenset()), frozenset())
+            except Exception:
+                anchored = set()
+            keyed: set[ColRef] = set()
+            for alias in anchored:
+                source = model.sources[alias]
+                if source.kind == "table" and source.table is not None:
+                    for key in model.key_info(alias).keys:
+                        if len(key) == 1:
+                            keyed.add((alias, next(iter(key))))
+                elif source.kind == "derived" and source.scope is not None:
+                    for name in self._live_keys(source.scope):
+                        keyed.add((alias, name))
+            for ref in list(keyed):
+                keyed.update(model.class_members(ref))
+            for projection in model.select.expressions:
+                inner = strip(unalias(projection))
+                if isinstance(inner, exp.Column) and (inner.table, inner.name) in keyed and projection.alias_or_name:
+                    found.add(projection.alias_or_name)
+        self._live[id(scope)] = frozenset(found)
+        return self._live[id(scope)]
+
+    def _anchored_by_derived_keys(self, model: SelectModel, anchored: set[str]) -> set[str]:
+        """Tables joined on their single-column key to a derived table's live keys."""
+        found: set[str] = set()
+        for a, b, conjunct in model.equalities:
+            for near, far in ((a, b), (b, a)):
+                if near[0] in anchored or near[0] in found:
+                    continue
+                source_far = model.sources.get(far[0])
+                if source_far is None or source_far.kind != "derived" or source_far.scope is None:
+                    continue
+                if far[1] not in self._live_keys(source_far.scope):
+                    continue
+                if not model.filters(near, conjunct):
+                    continue
+                if model.sources[near[0]].kind == "table" and _single_column_key(model, near[0], near[1]):
+                    found.add(near[0])
+        return found
+
+    def _anchored_by_live(self, model: SelectModel, live: frozenset[str]) -> set[str]:
+        """Inside a derived table: sources whose single-column key is a column the consumer ties to live keys."""
+        found: set[str] = set()
+        for name in live:
+            defining = model.projection(name)
+            if defining is None:
+                continue
+            inner = strip(defining)
+            if not isinstance(inner, exp.Column) or inner.table not in model.sources:
+                continue
+            for ref in model.class_members((inner.table, inner.name)):
+                source = model.sources.get(ref[0])
+                if source is None:
+                    continue
+                if source.kind == "table" and _single_column_key(model, ref[0], ref[1]):
+                    found.add(ref[0])
+        return found
+
+    def _live_names_for(self, model: SelectModel, alias: str, anchored: set[str]) -> frozenset[str]:
+        """Columns of derived ``alias`` equated to an anchored source's single-column key."""
+        names: set[str] = set()
+        for a, b, conjunct in model.equalities:
+            for mine, theirs in ((a, b), (b, a)):
+                if mine[0] != alias or theirs[0] not in anchored or theirs[0] == alias:
+                    continue
+                if not model.filters(mine, conjunct):
+                    continue
+                other = model.sources[theirs[0]]
+                if other.kind == "table" and _single_column_key(model, theirs[0], theirs[1]):
+                    names.add(mine[1])
+                elif other.kind == "derived" and other.scope is not None and theirs[1] in self._live_keys(other.scope):
+                    names.add(mine[1])
+        return frozenset(names)
+
+    def _is_lookup(self, model: SelectModel, alias: str) -> bool:
+        """``alias`` is joined at most one row per row of a source that has many rows, and no column of
+        it is grouped by: the query looks values up in it and does not list or count its rows."""
+        others = set(model.sources) - {alias}
+        if not others or not model.joins_at_most_one(alias, others):
+            return False
+        # Grouping by its key lists its rows (one per tenant); grouping by an attribute (region)
+        # only classifies the other table's rows.
+        grouped = {ref[1] for ref in model.group_refs() if ref[0] == alias}
+        if grouped and any(key and key <= grouped for key in model.key_info(alias).keys):
+            return False
+        if model.group is None:
+            for projection in model.select.expressions:
+                inner = strip(unalias(projection))
+                if isinstance(inner, exp.Column) and inner.table == alias:
+                    if any(key and key <= {inner.name} for key in model.key_info(alias).keys):
+                        return False  # its key is listed: rows per tenant
+        driver = any(
+            model.multiplied(other).state == NO and not model.joins_at_most_one(other, set(model.sources) - {other})
+            for other in others
+        )
+        return driver
 
     def _key_semi_joined(self, model: SelectModel, anchored: set[str], outer: frozenset[ColRef]) -> set[str]:
         """``t.key IN (SELECT key FROM t WHERE <the filter>)``: the outer rows are the filtered ones."""
@@ -477,6 +632,20 @@ def or_chain_gap(ctx: CheckContext) -> Iterable[Finding]:
 # ------------------------------------------------------------ soft deletes
 
 
+_LIVE_WORDS = r"(non-?\s?deleted|not\s+deleted|undeleted|active|live|current|existing|surviving)"
+
+
+def _question_asks_live(question: str | None, table_name: str) -> bool:
+    """The question says "non-deleted tenants", "active customers" and the like about this table."""
+    if not question:
+        return False
+    stem = re.sub(r"(ies|s)$", "", table_name.lower().rsplit(".", 1)[-1].rsplit("_", 1)[-1])
+    if len(stem) < 3:
+        return False
+    pattern = _LIVE_WORDS + r"\W+(?:\w+\W+){0,2}?" + re.escape(stem[:-1] if stem.endswith("y") else stem)
+    return re.search(pattern, question, re.IGNORECASE) is not None
+
+
 @check("soft_deleted_rows", description="A table with a soft-delete marker is read without looking at it.")
 def soft_deleted_rows(ctx: CheckContext) -> Iterable[Finding]:
     column = ctx.catalog.soft_delete_column
@@ -487,10 +656,16 @@ def soft_deleted_rows(ctx: CheckContext) -> Iterable[Finding]:
             continue  # the view's author decided what the view shows
         source = miss.model.sources[miss.alias]
         required = ctx.catalog.soft_delete_policy == "required"
+        asked = _question_asks_live(ctx.question, miss.table.name)
         if miss.bridge or not miss.counted:
             # A parent or pass-through table: whether its own deletion matters is a convention
             # that differs between organisations, so this stays a low-key note.
             severity = Severity.LOW
+        elif miss.lookup:
+            # Used only to look values up for rows of another table, and not listed or grouped by:
+            # the deleted rows are not themselves in the result. Unless the question asks for the
+            # live ones, that is the usual convention (deletion is not transitive).
+            severity = Severity.MEDIUM if asked else Severity.LOW
         else:
             severity = Severity.HIGH if required else Severity.MEDIUM
         yield ctx.finding(
@@ -505,13 +680,21 @@ def soft_deleted_rows(ctx: CheckContext) -> Iterable[Finding]:
                     if not miss.counted and not miss.bridge
                     else ""
                 )
-                + (" Policy here is that deleted rows are excluded unless asked for." if required else "")
+                + (
+                    " Here it is only used to look values up for rows of another table; its own "
+                    "deleted rows are not listed or counted."
+                    if miss.lookup and miss.counted and not miss.bridge
+                    else ""
+                )
+                + (" The question asks for the live ones." if asked and miss.lookup else "")
+                + (" Policy here is that deleted rows are excluded unless asked for." if required and not miss.lookup else "")
             ),
             suggestion=f"Filter on {miss.alias}.{column} unless deleted rows are wanted.",
             table=miss.table.qualified_name,
             alias=miss.alias,
             bridge=miss.bridge,
             counted=miss.counted,
+            lookup=miss.lookup,
             table_name=miss.table.name,
             policy=ctx.catalog.soft_delete_policy,
         )

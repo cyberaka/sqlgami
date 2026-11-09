@@ -42,6 +42,10 @@ class Probe:
     siblings: tuple[str, ...] = ()
     on_rows: tuple[Severity | None, str, str] | None = None
     on_empty: tuple[Severity | None, str, str] | None = None
+    # For PROBE_UNIQUE: probes that share a group stand or fall together (every repeating source of
+    # one aggregated table must be unique for that table not to be repeated); a finding is dismissed
+    # when any group holds.
+    group: str | None = None
 
 
 @dataclass

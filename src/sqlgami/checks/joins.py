@@ -88,21 +88,76 @@ def _repeat_state(model: SelectModel, aliases: Iterable[str]) -> tuple[str, list
     return state, culprits, aliases
 
 
+def _derived_duplicates_query(ctx: CheckContext, source, columns: list[str]) -> exp.Expression | None:
+    """A query that returns a row if the derived table ``source`` has two rows with the same ``columns``."""
+    node = source.node
+    if not isinstance(node, exp.Select) or source.scope is None or getattr(source.scope, "external_columns", None):
+        return None
+    inner = exp.Subquery(this=node.copy(), alias=exp.TableAlias(this=exp.to_identifier("sqlgami_d")))
+    keys = [exp.column(exp.to_identifier(c, quoted=True), table=exp.to_identifier("sqlgami_d")) for c in columns]
+    query = exp.select(exp.Literal.number(1)).from_(inner).group_by(*keys).having("COUNT(*) > 1").limit(1)
+    for key in keys:
+        query = query.where(exp.Not(this=exp.Is(this=key.copy(), expression=exp.Null())))
+    root = ctx.analysis.resolved
+    with_ = (root.args.get("with_") or root.args.get("with")) if root is not None else None
+    if with_ is not None:
+        query.set("with_", with_.copy())
+    return query
+
+
+def _a_base_table(model: SelectModel, source):
+    """Some base table a derived source reads, for the probe's size check."""
+    if source.scope is None:
+        return None
+    try:
+        inner = model.cache.model(source.scope)
+    except Exception:
+        return None
+    for alias, inner_source in inner.sources.items():
+        if inner_source.kind == "table" and inner_source.table is not None:
+            return inner_source.table
+        if inner_source.kind == "derived":
+            found = _a_base_table(inner, inner_source)
+            if found is not None:
+                return found
+    return None
+
+
 def _uniqueness_probes(
     ctx: CheckContext, model: SelectModel, finding: Finding, culprits: list[str], aliases: list[str]
 ) -> None:
-    """Ask the data whether the join columns of each repeating source are in fact unique."""
-    visited = set(aliases)
-    for culprit in culprits:
-        source = model.sources.get(culprit)
-        if source is None or source.table is None:
-            return  # cannot probe a derived source; leave the finding as it is
-    for culprit in culprits:
-        source = model.sources[culprit]
-        columns = sorted(model.bound_columns(culprit, visited | (set(model.sources) - {culprit}), per_group=True))
-        if not columns:
-            return
-        ctx.probes.append(Probe(PROBE_UNIQUE, source.table, tuple(columns), finding))
+    """Ask the data whether the join columns of each repeating source are in fact unique.
+
+    The aggregate is safe once any one of the tables it reads turns out not to be repeated,
+    so the probes are grouped by the table read: a group holds when every source that
+    repeats that table is unique on its join columns. A base table is asked directly; a
+    derived table, CTE or expanded view is asked by running it as a subquery and grouping
+    by its join columns.
+    """
+    planned: list[Probe] = []
+    for alias in aliases:
+        repeaters = model.multiplied(alias, per_group=True).culprits or culprits
+        group: list[Probe] = []
+        for culprit in repeaters:
+            source = model.sources.get(culprit)
+            if source is None:
+                return
+            others = (set(model.sources) - {culprit}) | {alias}
+            columns = sorted(model.bound_columns(culprit, others, per_group=True))
+            if not columns:
+                return
+            if source.kind == "table" and source.table is not None:
+                group.append(Probe(PROBE_UNIQUE, source.table, tuple(columns), finding, group=alias))
+            elif source.kind == "derived":
+                query = _derived_duplicates_query(ctx, source, columns)
+                table = _a_base_table(model, source)
+                if query is None or table is None:
+                    return
+                group.append(Probe(PROBE_UNIQUE, table, tuple(columns), finding, query=query, snippet=culprit, group=alias))
+            else:
+                return  # cannot probe this kind of source; leave the finding as it is
+        planned.extend(group)
+    ctx.probes.extend(planned)
 
 
 def _repeated_inside(model: SelectModel, column: exp.Column, depth: int = 0):
@@ -132,8 +187,29 @@ def _repeated_inside(model: SelectModel, column: exp.Column, depth: int = 0):
         # subscription, each carrying its plan's price), repeating the looked-up value is
         # the point. Only a subquery whose rows have no identity of their own is suspect.
         if repeated.state == YES and not inner.output_keys().keys:
-            return inner, defining.table, repeated.culprits
+            looked_up = inner.sources[defining.table]
+            leaf = looked_up.kind == "table" and looked_up.table is not None and not looked_up.table.foreign_keys
+            per_row_value = leaf or bool(_RATE_LIKE.search(defining.name))
+            if not (per_row_value and _projects_a_key_of(inner, repeated.culprits)):
+                return inner, defining.table, repeated.culprits
     return _repeated_inside(inner, defining, depth + 1)
+
+
+# A looked-up value that is meant to apply once per row of the table that refers to it (a plan's
+# price per subscription, a tax rate per invoice), as opposed to a parent's own total.
+_RATE_LIKE = re.compile(r"(price|rate|cost|fee|weight|pct|percent|ratio|multiplier|factor|unit_|per_|coefficient|tax)", re.I)
+
+
+def _projects_a_key_of(inner: SelectModel, aliases: list[str]) -> bool:
+    """The subquery returns a whole key of one of ``aliases``: its rows are about that source's rows
+    (one row per subscription, each carrying its plan's price), so repeating a looked-up value is the
+    point. Only trusted when the value is a per-row rate (see _RATE_LIKE) or the looked-up table is a
+    leaf with no foreign keys of its own: a parent fact's total repeated per child row is still a fan-out."""
+    for alias in aliases:
+        for key in inner.key_info(alias).keys:
+            if key and all(inner._projection_name_for_ref((alias, column)) for column in key):
+                return True
+    return False
 
 
 def _window_aggregates(model: SelectModel) -> list[exp.AggFunc]:
@@ -172,8 +248,12 @@ def fan_out(ctx: CheckContext) -> Iterable[Finding]:
             if state == NO:
                 # Not repeated here. The rows may have been repeated already, inside a
                 # subquery or CTE this SELECT reads from.
-                for column in columns:
-                    hidden = _repeated_inside(model, column)
+                traced = [(column, _repeated_inside(model, column)) for column in columns]
+                if any(found is None for _, found in traced):
+                    # The aggregate also reads a value at the rows' own grain (price * quantity,
+                    # amount * rate): the looked-up value is applied once per row, which is the point.
+                    continue
+                for column, hidden in traced:
                     if hidden is None:
                         continue
                     inner, inner_alias, inner_culprits = hidden
@@ -182,7 +262,7 @@ def fan_out(ctx: CheckContext) -> Iterable[Finding]:
                         break
                     reported.add(key)
                     by = ", ".join(inner.sources[c].label for c in inner_culprits) or "another table"
-                    yield ctx.finding(
+                    finding = ctx.finding(
                         "fan_out",
                         Severity.MEDIUM if isinstance(agg, exp.Count) else Severity.HIGH,
                         f"{ctx.snippet(agg)} reads {column.table}.{column.name}, which comes from "
@@ -196,6 +276,8 @@ def fan_out(ctx: CheckContext) -> Iterable[Finding]:
                         certainty=YES,
                         inside_subquery=True,
                     )
+                    _uniqueness_probes(ctx, inner, finding, inner_culprits, [inner_alias])
+                    yield finding
                     break
                 continue
             key = ("rows" if counts_rows else ",".join(read), tuple(culprits))

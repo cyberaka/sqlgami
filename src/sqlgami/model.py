@@ -254,6 +254,9 @@ class SelectModel:
         self.conjuncts: list[Conjunct] = []
         self.equalities: list[tuple[ColRef, ColRef, Conjunct]] = []
         self.bound: dict[ColRef, exp.Expression] = {}
+        # A column equated to an expression over other sources' columns (t.m = c.month + INTERVAL 1 MONTH):
+        # one value per row of those sources.
+        self.functional: list[tuple[ColRef, frozenset[str]]] = []
         self.restricted: set[ColRef] = set()
         self.links: list[frozenset[str]] = []
         # Columns equated to another column of the same source (f.snap_dt = f.period_end_dt).
@@ -380,6 +383,10 @@ class SelectModel:
                 self._bind(left_col, right, conjunct)
             elif right_col and self._is_constant(left):
                 self._bind(right_col, left, conjunct)
+            elif left_col and not right_col and self._function_of_others(right, left_col[0]):
+                self.functional.append((left_col, self.aliases_in(right)))
+            elif right_col and not left_col and self._function_of_others(left, right_col[0]):
+                self.functional.append((right_col, self.aliases_in(left)))
             else:
                 # USING (k) ... WHERE k = 7 is resolved to COALESCE(a.k, b.k) = 7: both are pinned.
                 for merged, value in ((left, right), (right, left)):
@@ -427,6 +434,15 @@ class SelectModel:
             ref = self._local_ref(strip(expr.this))
             if ref:
                 self._bind(ref, exp.false(), conjunct)
+
+    def _function_of_others(self, node: exp.Expression, alias: str) -> bool:
+        """``node`` is a plain expression over columns of sources other than ``alias``."""
+        aliases = self.aliases_in(node)
+        if not aliases or alias in aliases:
+            return False
+        if any(isinstance(n, (exp.AggFunc, exp.Window, exp.Select, exp.Subquery)) for n in node.walk()):
+            return False
+        return all(c.table for c in node.find_all(exp.Column))
 
     def _local_ref(self, node: exp.Expression) -> ColRef | None:
         if isinstance(node, exp.Column) and node.table in self.sources:
@@ -596,6 +612,9 @@ class SelectModel:
                 if member in fixed or (member[0] != alias and member[0] in visited):
                     columns.add(ref[1])
                     break
+        for ref, aliases in self.functional:
+            if ref[0] == alias and aliases <= visited:
+                columns.add(ref[1])
         return columns
 
     def joins_at_most_one(self, alias: str, visited: set[str], per_group: bool = False) -> bool:
