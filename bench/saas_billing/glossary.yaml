@@ -1,9 +1,27 @@
 rules:
   soft_delete_default: >
-    Unless a question says "including deleted", soft-deleted rows
-    (deleted_at IS NOT NULL) are EXCLUDED everywhere: tenants, users,
-    subscriptions, invoices, payment_methods. Gold SQL follows this
-    rule even when the question text does not spell it out.
+    Unless a question says otherwise, soft-deleted rows
+    (deleted_at IS NOT NULL) are EXCLUDED from any table whose rows the
+    question directly counts, lists, or aggregates. The rule is NOT
+    transitive: a count of invoices does NOT additionally check the
+    tenant's deleted_at; a count of memberships does NOT check the
+    user's deleted_at; a count of subscription_items does NOT check
+    the subscription's deleted_at. When the question text explicitly
+    says "non-deleted tenants" / "non-deleted users" / similar, the
+    gold applies deleted_at on that outer entity too. When both the
+    outer entity and a joined entity are explicitly scoped, both get
+    filtered. Tables without a deleted_at column (plans, roles,
+    features, PlanFeatures, coupons, promotions, tax_jurisdictions,
+    addresses, subscription_items, line_items, etc.) have no such
+    filter applied at all.
+  ordered_default: >
+    Every question whose English text asks for order carries
+    ordered: true, and its gold ORDER BY includes a deterministic
+    tie-break (usually the row's primary key ASC). Row-order of the
+    returned rows matters only for questions with ordered: true.
+  columns_default: >
+    Column names in a question are intent, not required output names.
+    The validator compares row-sets by position, not by column label.
 
 terms:
   active_subscription: >

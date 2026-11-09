@@ -1257,26 +1257,121 @@ class Gen:
                 "deleted_at": iso(datetime(2026, 6, 20, tzinfo=timezone.utc)),
             })
 
-        # Soft-deleted invoices (3)
+        # Soft-deleted invoices (3) — give them line items too, so q043 (invoice line items
+        # via PlanFeatures) and q032 (MIN/MAX of total_cents per status over non-deleted
+        # invoices) have a drop-soft-delete attack that actually diverges.
+        soft_del_inv_ids = []
         for i, t in enumerate(self.data["tenants"][:3]):
             inv_id = pool.next()
+            soft_del_inv_ids.append(inv_id)
+            # Make the first one a BIG USD invoice in Q2 (May 2026): lifts q030 (>50000),
+            # q042 (Q2 2026 window), q032 (max total). Others stay small.
+            if i == 0:
+                total = 65000  # >50000 triggers q030 attack
+                issued = datetime(2026, 5, 15, 10, 0, tzinfo=timezone.utc)
+                period_start = date(2026, 5, 1)
+                period_end = date(2026, 6, 1)
+            else:
+                total = 7500
+                issued = datetime(2026, 1, 15, tzinfo=timezone.utc)
+                period_start = date(2026, 1, 1)
+                period_end = date(2026, 2, 1)
             self.writer.write("billing", "invoices", {
                 "invoice_id": inv_id,
                 "tenant_id": t["tenant_id"],
                 "subscription_id": None,
                 "invoice_number": f"INV-DELETED-{inv_id:07d}",
-                "issued_at": iso(datetime(2026, 1, 15, tzinfo=timezone.utc)),
-                "period_start": iso_date(date(2026, 1, 1)),
-                "period_end":   iso_date(date(2026, 2, 1)),
+                "issued_at": iso(issued),
+                "period_start": iso_date(period_start),
+                "period_end":   iso_date(period_end),
                 "currency_code": t["currency_code"],
-                "subtotal_cents": 7500,
+                "subtotal_cents": total,
                 "tax_cents": 0,
-                "total_cents": 7500,
+                "total_cents": total,
                 "status": "paid",
                 "IsAutoBilled": True,
-                "due_date": iso_date(date(2026, 2, 15)),
+                "due_date": iso_date(period_end + timedelta(days=14)),
+                "created_at": iso(issued),
+                "deleted_at": iso(issued + timedelta(days=5)),
+            })
+
+        # Line items on the soft-deleted invoices (q043 attack)
+        line_pool = self._pool("line_nasty", 9_100_000)
+        for inv_id in soft_del_inv_ids:
+            line_id = line_pool.next()
+            self.writer.write("billing", "invoice_line_items", {
+                "line_item_id": line_id,
+                "invoice_id": inv_id,
+                "subscription_item_seq": 1,
+                "subscription_id": None,
+                "description": "Deleted-invoice line (nasty)",
+                "quantity": 1,
+                "unit_price_e4": 100000,
+                "amount_cents": 1000,
+                "tax_rate_id": None,
+                "coupon_redemption_id": None,
                 "created_at": iso(datetime(2026, 1, 15, tzinfo=timezone.utc)),
-                "deleted_at": iso(datetime(2026, 1, 20, tzinfo=timezone.utc)),
+            })
+
+        # Promotion application on the first soft-deleted invoice (q025 attack)
+        if self.data.get("promotions") and soft_del_inv_ids:
+            self.writer.write("billing", "promotion_applications", {
+                "promotion_id": self.data["promotions"][0],
+                "invoice_id": soft_del_inv_ids[0],
+                "amount_cents": 500,
+                "applied_at": iso(datetime(2026, 5, 15, 11, 0, tzinfo=timezone.utc)),
+            })
+
+        # Soft-deleted subscription on same (tenant, plan) as an existing non-deleted sub
+        # — q034 attack. Pick tenant[0]'s first existing subscription if we recorded it.
+        tenants_with_subs = {s["tenant_id"]: s for s in self.data.get("subscriptions", [])}
+        if self.data["tenants"] and tenants_with_subs:
+            t = self.data["tenants"][0]
+            existing = tenants_with_subs.get(t["tenant_id"])
+            if existing:
+                dup_sub = pool.next()
+                self.writer.write("billing", "subscriptions", {
+                    "subscription_id": dup_sub,
+                    "tenant_id": t["tenant_id"],
+                    "plan_id": existing["plan_id"],
+                    "started_at": iso(datetime(2026, 4, 1, tzinfo=timezone.utc)),
+                    "ended_at": None,
+                    "status": "active",
+                    "created_at": iso(datetime(2026, 4, 1, tzinfo=timezone.utc)),
+                    "deleted_at": iso(datetime(2026, 4, 15, tzinfo=timezone.utc)),
+                })
+
+        # Soft-deleted payment in a non-tenant currency — q033 attack. Tenant 10001's
+        # currency is USD; add a GBP payment (which doesn't match tenant currency).
+        pay_nasty = self._pool("pay_nasty", 9_200_000)
+        if self.data["tenants"]:
+            t = self.data["tenants"][0]
+            self.writer.write("billing", "payments", {
+                "payment_id": pay_nasty.next(),
+                "tenant_id": t["tenant_id"],
+                "invoice_id": None,
+                "payment_method_id": None,
+                "amount_cents": 1234,
+                "currency_code": "GBP" if t["currency_code"] != "GBP" else "EUR",
+                "status": "succeeded",
+                "paid_at": iso(datetime(2026, 5, 20, tzinfo=timezone.utc)),
+                "created_at": iso(datetime(2026, 5, 20, tzinfo=timezone.utc)),
+            })
+
+        # A subscription with ended_at STRICTLY AFTER as_of (2026-06-30). This lets
+        # Batch 3 questions that use the glossary's full active_subscription definition
+        # (ended_at > as_of) diverge from the inline "ended_at IS NULL" definition.
+        if self.data["tenants"] and self.data["plans"]:
+            future_sub = pool.next()
+            self.writer.write("billing", "subscriptions", {
+                "subscription_id": future_sub,
+                "tenant_id": self.data["tenants"][0]["tenant_id"],
+                "plan_id": self.data["plans"][2]["plan_id"],
+                "started_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                "ended_at": iso(datetime(2027, 1, 1, tzinfo=timezone.utc)),
+                "status": "active",
+                "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                "deleted_at": None,
             })
 
         # Invoice with total_cents = exactly 50000 (triggers >= 50000 bug)
