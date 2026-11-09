@@ -22,6 +22,13 @@ rules:
   columns_default: >
     Column names in a question are intent, not required output names.
     The validator compares row-sets by position, not by column label.
+  zero_rows_default: >
+    Questions of the form "For each X, return …" or "per X …" return
+    one row per qualifying X, with 0 for count/SUM measures and NULL
+    for other measures when nothing matches that X. Questions of the
+    form "X that have …" or "X with at least one …" return only
+    matching X. Gold SQL follows this rule even when the question text
+    does not spell it out.
 
 terms:
   active_subscription: >

@@ -432,6 +432,10 @@ def _database_stages(
         _not_run(report, ("sample",), "the dry run did not complete")
         return
     _stage(report, "dry_run", StageStatus.PASSED, None, elapsed)
+    if adapter.dialect not in ("sqlite", "mysql"):
+        # These engines reject a query with an ungrouped column. This one was accepted,
+        # so a static finding that predicted a rejection was mistaken.
+        report.findings = [f for f in report.findings if f.code != "missing_group_by"]
 
     if schema_findings:
         # The database is the authority on what exists. If it accepts the statement,

@@ -22,6 +22,20 @@ from .report import Finding, Severity
 
 STAGE = "question"
 
+LONG_QUESTION_WORDS = 45
+_WORD_MATCHING = {
+    "question_value_unused",
+    "number_unused",
+    "negation_missing",
+    "aggregate_mismatch",
+    "output_columns",
+    "grouping_missing",
+    "time_filter_missing",
+    "pattern_match_missing",
+    "question_flag_unused",
+    "superlative_unhandled",
+}
+
 _NEGATED_BEFORE = re.compile(r"\b(not|no|non|excluding|except|without|exclude|other than|never)\W*$", re.IGNORECASE)
 _PARENTHETICAL = re.compile(r"\([^()]*\)")
 
@@ -45,7 +59,10 @@ _STRONG_DIRECTION = {
     "bottom", "smallest", "lowest", "least", "fewest", "minimum", "min",
 }
 
-_COUNT_PHRASE = re.compile(r"\b(how many|number of|count of|count)\b", re.IGNORECASE)
+_COUNT_PHRASE = re.compile(
+    r"\b(how many|number of(?!\s+(?:days|hours|minutes|seconds|weeks|months|years|periods)\b)|count of|count)\b",
+    re.IGNORECASE,
+)
 _TOTAL_WORD = re.compile(r"\b(total|sum)\b(?!\s+(?:number|count)\b)", re.IGNORECASE)
 _AVG_WORD = re.compile(r"\b(average|avg|mean)\b", re.IGNORECASE)
 _MEDIAN_WORD = re.compile(r"\bmedian\b", re.IGNORECASE)
@@ -69,7 +86,7 @@ _TIME_PHRASE = re.compile(
 _YEAR = re.compile(r"\b((?:19|20)\d{2})\b")
 _QUESTION_NUMBER = re.compile(r"(?<![\w.,-])\$?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?![\w-]|\.\d)")
 _TEMPORAL_NAME = re.compile(r"(_at|_date|_time|_ts|_on|_day|_month|_year|date|timestamp|effective_|valid_|period)", re.IGNORECASE)
-_SCALES = (1, 100, 1_000, 10_000, 1_000_000, 100_000_000)
+_SCALES = (1, 10, 100, 1_000, 10_000, 1_000_000, 100_000_000)
 
 
 def run_question_checks(ctx: CheckContext, question: str, glossary: str | None = None) -> list[Finding]:
@@ -79,6 +96,7 @@ def run_question_checks(ctx: CheckContext, question: str, glossary: str | None =
         return []
     asked = _Asked(ctx, text, glossary or "")
     findings: list[Finding] = []
+    long_question = len(text.split()) > LONG_QUESTION_WORDS
     for check in (
         _values_named_but_unused,
         _filters_not_asked_for,
@@ -96,9 +114,16 @@ def run_question_checks(ctx: CheckContext, question: str, glossary: str | None =
         _output_columns,
     ):
         try:
-            findings.extend(check(asked) or [])
+            found = check(asked) or []
         except Exception:  # a heuristic must never break scoring
             continue
+        for finding in found:
+            if long_question and finding.code in _WORD_MATCHING and finding.severity == Severity.MEDIUM:
+                # Matching words between a long specification and the SQL goes wrong often
+                # enough that these are notes, not doubts, on such questions.
+                finding.severity = Severity.LOW
+                finding.evidence["long_question"] = True
+        findings.extend(found)
     return findings
 
 
@@ -180,6 +205,29 @@ def _categorical_columns(asked: _Asked) -> Iterable[tuple[Any, Any]]:
             yield table, column
 
 
+def _names_value_pointedly(asked: _Asked, value: str, table_name: str) -> bool:
+    """Whether the question uses a stored value as a filter: quoted, or right before its table's noun.
+
+    "paid invoices" and "status='paid'" are filters. "negative for credits" and
+    "country + its regions" merely contain words that also happen to be stored values.
+    """
+    raw = str(value).strip()
+    if re.search(rf"['\"`]\s*{re.escape(raw)}\s*['\"`]", asked.text, re.IGNORECASE):
+        return True
+    if len(raw) <= 2:
+        return True  # short codes are matched case-sensitively already
+    folded = raw.lower()
+    forms = {folded, folded.replace("_", " "), folded.replace("-", " ")}
+    for noun in _name_forms(table_name):
+        head, _, last = noun.rpartition(" ")
+        stem = re.escape(_singular(last))
+        noun_pattern = (re.escape(head) + r"\s+" if head else "") + stem + r"(?:s|es|ies)?"
+        for form in forms:
+            if re.search(rf"(?<![a-z0-9_]){re.escape(form)}\s+(?:[a-z-]+\s+)?{noun_pattern}(?![a-z])", asked.lower):
+                return True
+    return False
+
+
 def _column_is_broken_out(asked: _Asked, table: Any, column: Any) -> bool:
     """True when the query groups by or returns the column, i.e. shows every value of it."""
     key = asked.ctx.catalog.column_key(column.name)
@@ -207,6 +255,8 @@ def _values_named_but_unused(asked: _Asked) -> list[Finding]:
             if not folded or folded in _GENERIC_VALUES or folded in reported:
                 continue
             if not asked.mentions(value):
+                continue
+            if not _names_value_pointedly(asked, value, table.name):
                 continue
             if folded in asked.string_literals_lower:
                 continue
@@ -444,7 +494,11 @@ def _top_n(asked: _Asked) -> list[Finding]:
     asc_words = {w for w in words if re.fullmatch(_ASC_WORDS, w)}
     select = asked.tree
     order = select.args.get("order") if isinstance(select, exp.Query) else None
-    answered_by_aggregate = (desc_words and asked.has(exp.Max, exp.ArgMax)) or (asc_words and asked.has(exp.Min, exp.ArgMin))
+    answered_by_aggregate = (
+        (desc_words and asked.has(exp.Max, exp.ArgMax))
+        or (asc_words and asked.has(exp.Min, exp.ArgMin))
+        or asked.has(exp.RowNumber, exp.Rank, exp.DenseRank)  # ORDER BY position: the window holds the direction
+    )
     if (
         order is not None
         and limit is not None
@@ -565,6 +619,8 @@ def _numbers(asked: _Asked) -> list[Finding]:
             continue
         if value == 0:
             continue
+        if value < 100 and _bound_phrase(asked, match.start(), match.end()) is None:
+            continue  # "(1 = highest)", "2 = next", "top 3": small numbers that are not bounds
         if any(value * scale in numeric for scale in _SCALES) or value / 100 in numeric:
             continue
         if re.search(rf"(?<!\d){re.escape(raw)}(?!\d)", literal_text):
@@ -619,7 +675,9 @@ _NO_RELATED = re.compile(
 )
 _NOT_A_NEGATION = re.compile(
     r"\b(?:with|has|have)\s+no\s+(?:duplicates?|ties|particular|specific)\b|\bwithout\s+duplicates?\b|"
-    r"\b(?:appear|appears|included|shown|listed|returned)\b[^.]*\b(?:0|zero)\b|\b(?:0|zero)\s+(?:when|if|for)\b",
+    r"\b(?:appear|appears|included|shown|listed|returned)\b[^.]*\b(?:0|zero)\b|\b(?:0|zero)\s+(?:when|if|for)\b|"
+    r"\binclud\w*\b[^.]*\bwith\s+no\b|\bwith\s+no\s+\w+(?:\s+\w+)?\s+(?:get|gets|have|show|return|appear)s?\b|"
+    r"\bnot\s+applied\b|\bno\s+(?:float|rounding|limit|ordering|filter|deleted_at)\b|\bnull\s+if\s+none\b",
     re.IGNORECASE,
 )
 
@@ -962,11 +1020,13 @@ def _listed_outputs(text: str, column_names: set[str] | None = None) -> int | No
     stop = _LIST_STOP.search(listed)
     if stop:
         listed = listed[: stop.start()]
-    listed = _PARENTHETICAL.sub(" ", listed).strip(" ,")
+    if "(" in listed or ")" in listed or " as " in f" {listed.lower()} " or "—" in listed:
+        return None  # a described specification, not a plain list of names
+    listed = listed.strip(" ,")
     if not listed:
         return None
     items = [item.strip() for item in _LIST_SPLIT.split(listed) if item.strip()]
-    if not items or any(len(item.split()) > 7 for item in items):
+    if not items or len(items) > 5 or any(len(item.split()) > 4 for item in items):
         return None  # not a plain list of columns
     if match.re is not _RETURN_LIST:
         # The looser phrasings only count when every item is the name of a real column.
@@ -1013,6 +1073,16 @@ _WANTS_DELETED = re.compile(r"\b(including\s+(?:soft[- ])?deleted|deleted\s+\w+|
 _CURRENT = re.compile(r"\b(current|currently|latest|present|in force|as of now|today's)\b", re.IGNORECASE)
 _EVERY = re.compile(r"\b(for every|for each|every|each|for all)\b", re.IGNORECASE)
 _DISTINCT_WORDS = re.compile(r"\b(distinct|unique|different|de-?duplicated|without duplicates|no duplicates)\b", re.IGNORECASE)
+_DISTINCT_ROWS = re.compile(
+    r"\b(?:return|list|show|give)\s+(?:the\s+|only\s+)?(?:distinct|unique)\b|\b(?:distinct|unique)\s+(?:rows|pairs|values|list)\b|"
+    r"\bwithout duplicates\b|\bno duplicates\b|\bde-?duplicated\b",
+    re.IGNORECASE,
+)
+_ONLY_MATCHED = re.compile(
+    r"\b(?:excluded|omitted|left out|not (?:listed|returned|included)|only (?:those|the ones|\w+) (?:with|that have|having)|"
+    r"that have at least one|with at least one|having at least one)\b",
+    re.IGNORECASE,
+)
 _LISTING = re.compile(r"^\s*(list|which|show|return|give|name|find|what are)\b", re.IGNORECASE)
 
 
@@ -1048,14 +1118,23 @@ def adjust_findings(findings: list[Finding], question: str) -> None:
             finding.severity = Severity.HIGH
             finding.message += " The question asks for the current state."
         elif finding.code == "duplicate_rows":
-            if _DISTINCT_WORDS.search(text):
+            if _DISTINCT_ROWS.search(text):
                 finding.severity = Severity.HIGH
-                finding.message += " The question asks for distinct values."
+                finding.message += " The question asks for distinct rows."
             elif _LISTING.search(text) and finding.severity == Severity.LOW:
                 finding.severity = Severity.MEDIUM
+        elif finding.code == "filter_value" and finding.severity == Severity.HIGH:
+            literal = str(finding.evidence.get("literal") or "")
+            if literal and re.search(rf"(?<![a-z0-9_]){re.escape(literal.lower())}(?![a-z0-9_])", lowered):
+                # The question itself names this value. That it has no rows today is a fact
+                # about the data, not a sign the SQL is wrong.
+                finding.severity = Severity.LOW
+                finding.message += " The question names this value itself, so the filter is as asked."
         elif finding.code == "inner_join_drops_rows":
             if finding.evidence.get("limited"):
                 continue  # a top-N query: things with nothing to count would rank last anyway
+            if _ONLY_MATCHED.search(text):
+                continue  # the question says things without a match are left out
             every = [m for m in _EVERY.finditer(text)]
             entity_table = str(finding.evidence.get("entity_table") or "")
             if not any(_entity_position(lowered[m.end(): m.end() + 40], entity_table) is not None for m in every):

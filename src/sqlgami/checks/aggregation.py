@@ -46,6 +46,9 @@ def _ungrouped_columns(model: SelectModel) -> list[exp.Column]:
             return
         if isinstance(node, exp.AggFunc) and not is_window_function(node):
             return
+        if isinstance(node, (exp.Filter, exp.WithinGroup)) and isinstance(node.this, exp.AggFunc):
+            if not is_window_function(node.this):
+                return  # COUNT(*) FILTER (WHERE status = 'paid'): the condition is part of the aggregate
         if isinstance(node, exp.Column):
             if node.table in model.sources and (node.table, node.name) not in grouped:
                 if node.table not in determined:

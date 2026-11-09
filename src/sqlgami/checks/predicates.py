@@ -301,6 +301,8 @@ def type_mismatch(ctx: CheckContext) -> Iterable[Finding]:
                     other = other.this
                 if not isinstance(other, exp.Literal):
                     continue
+                if column_info(ctx, model, column) is None:
+                    continue  # a computed column: its inferred type is too uncertain to judge on
                 fcol = family(ctx, model, column)
                 text = other.name
                 problem: tuple[Severity, str] | None = None

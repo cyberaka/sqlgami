@@ -507,20 +507,6 @@ FALSE_ALARMS = [
     # missing_group_by
     (
         'missing_group_by',
-        'filter_clause',
-        "SELECT o.customer_id, COUNT(*) FILTER (WHERE o.status = 'paid') FROM orders o GROUP BY o.customer_id",
-        {},
-        "the column is inside the aggregate's FILTER clause, which is part of the aggregate",
-    ),
-    (
-        'missing_group_by',
-        'within_group',
-        "SELECT o.customer_id, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.total) FROM orders o GROUP BY o.customer_id",
-        {'dialects': ('duckdb', 'postgres')},
-        "the column is inside WITHIN GROUP (ORDER BY ...), which is part of the aggregate",
-    ),
-    (
-        'missing_group_by',
         'sqlite_bare_column_with_max',
         "SELECT o.customer_id, o.status, MAX(o.created_at) FROM orders o GROUP BY o.customer_id",
         {'dialects': ('sqlite',)},
@@ -1379,6 +1365,18 @@ STILL_FIRES = [
 ]
 
 STILL_QUIET = [
+    (
+        'missing_group_by',
+        'within_group',
+        "SELECT o.customer_id, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.total) FROM orders o GROUP BY o.customer_id",
+        {'dialects': ('duckdb', 'postgres')},
+    ),
+    (
+        'missing_group_by',
+        'filter_clause',
+        "SELECT o.customer_id, COUNT(*) FILTER (WHERE o.status = 'paid') FROM orders o GROUP BY o.customer_id",
+        {},
+    ),
     (
         'distinct_masking',
         'distinct_dimension_list',
