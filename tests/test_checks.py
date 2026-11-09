@@ -318,9 +318,19 @@ def test_check_fires(dialect, name, sql, code):
     assert not [c for c in report.checks_not_run if "internal error" in c.reason], report.summary()
 
 
+# Cases in NEGATIVE that one engine does not accept.
+ENGINE_REJECTS = {
+    # DuckDB does not infer a table's other columns from a grouped primary key:
+    # "column "name" must appear in the GROUP BY clause" (checked on DuckDB 1.5.6).
+    ("group_by_primary_key", "duckdb"),
+}
+
+
 @pytest.mark.parametrize("dialect", DIALECTS)
 @pytest.mark.parametrize("name,sql", NEGATIVE, ids=[n[0] for n in NEGATIVE])
 def test_correct_sql_raises_no_alarm(dialect, name, sql):
+    if (name, dialect) in ENGINE_REJECTS:
+        pytest.skip("this engine rejects the statement, so reporting it is right")
     report = _scorer(dialect).explain(sql)
     assert report.stage("schema").status.value == "passed", report.summary()
     assert not report.findings_at_least(Severity.MEDIUM), report.summary()
