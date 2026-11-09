@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import build
-from .compare import Outcome, run_sql, same_outcome
+from .compare import Outcome, run_sql, same_outcome, same_rows
 from .suite import Question, Seed, Suite, Variant
 
 BUG_CLASSES = {
@@ -23,6 +23,7 @@ BUG_CLASSES = {
     "syntax_error", "bq_no_partition_filter", "bq_unnest", "bq_struct_path", "bq_legacy_sql",
     "bq_current_date_utc", "cosmos_cross_container_join", "cosmos_missing_partition_key",
     "cosmos_array_vs_scalar", "cosmos_missing_field", "other",
+    "snapshot_grain", "missing_required_predicate", "template_list_param", "scalar_subquery_multirow",
 }
 OUTCOMES = {"error", "wrong_on_all_seeds", "wrong_on_nasty_only"}
 
@@ -93,7 +94,7 @@ class Runner:
             return None
         key = (question.id, engine, seed.label)
         if key not in self._gold:
-            self._gold[key] = self.run(engine, seed, sql)
+            self._gold[key] = self.run(engine, seed, question.render(sql))
         return self._gold[key]
 
     def matches_gold(self, question: Question, engine: str, sql: str) -> dict[str, tuple[bool, str]]:
@@ -103,7 +104,7 @@ class Runner:
             gold = self.gold(question, engine, seed)
             if gold is None:
                 continue
-            outcome = self.run(engine, seed, sql)
+            outcome = self.run(engine, seed, question.render(sql))
             result[seed.label] = same_outcome(gold, outcome, question.ordered)
         return result
 
@@ -236,14 +237,27 @@ def _check_question(suite: Suite, runner: Runner, question: Question, engines: l
             if outcome.rows and seed.profile == "clean":
                 non_empty_on_clean = True
             columns = shape.get("columns")
-            if isinstance(columns, list) and outcome.columns and len(columns) != len(outcome.columns):
+            wanted = len(columns) if isinstance(columns, list) else columns if isinstance(columns, int) else None
+            if wanted is not None and outcome.columns and wanted != len(outcome.columns):
                 result.add(
                     WARNING,
                     f"{question.id} {engine}",
-                    f"expected_answer_shape lists {len(columns)} columns, gold returns {len(outcome.columns)}",
+                    f"expected_answer_shape says {wanted} columns, gold returns {len(outcome.columns)}",
+                )
+            if (
+                isinstance(row_range, (list, tuple))
+                and len(row_range) == 2
+                and not (row_range[0] <= len(outcome.rows) <= row_range[1])
+            ):
+                result.add(
+                    WARNING,
+                    f"{question.id} {engine} {seed.label}",
+                    f"gold returns {len(outcome.rows)} rows, outside expected_answer_shape {list(row_range)}",
                 )
         if not non_empty_on_clean and not allows_empty:
             result.add(ERROR, f"{question.id} {engine}", "gold SQL returns no rows on any clean seed")
+
+    _check_anchor(suite, runner, question, engines, result)
 
     present = [e for e in engines if question.gold(e)]
     for seed in suite.seeds:
@@ -261,6 +275,32 @@ def _check_question(suite: Suite, runner: Runner, question: Question, engines: l
                     f"{question.id} {seed.label}",
                     f"gold differs between {present[0]} and {other}: {why}",
                 )
+
+
+def _check_anchor(suite: Suite, runner: Runner, question: Question, engines: list[str], result: Validation) -> None:
+    """Run a question's hand-verified probe and compare it with the rows written down for it."""
+    check = question.check
+    if not check:
+        return
+    seed = next((s for s in suite.seeds if s.seed == check.get("seed")), None)
+    if seed is None:
+        result.add(ERROR, question.id, f"check names seed {check.get('seed')!r}, which the suite does not have")
+        return
+    expected = [tuple(row) if isinstance(row, (list, tuple)) else (row,) for row in check.get("expected") or []]
+    for engine, sql in (check.get("probe_sql") or {}).items():
+        if engine not in engines:
+            continue
+        outcome = runner.run(engine, seed, question.render(sql))
+        if not outcome.ok:
+            result.add(ERROR, f"{question.id} {engine} check", f"probe fails: {outcome.error}")
+            continue
+        equal, why = same_rows(outcome.rows, expected, ordered=False)
+        if not equal:
+            result.add(
+                ERROR,
+                f"{question.id} {engine} check",
+                f"probe for \"{check.get('fact', '')}\" does not return the expected rows: {why}",
+            )
 
 
 def _check_variant(suite: Suite, runner: Runner, variant: Variant, engines: list[str], result: Validation) -> None:
@@ -287,7 +327,7 @@ def _check_variant(suite: Suite, runner: Runner, variant: Variant, engines: list
         return
     errors = []
     for seed in suite.seeds:
-        outcome = runner.run(variant.engine, seed, variant.sql)
+        outcome = runner.run(variant.engine, seed, question.render(variant.sql))
         errors.append(not outcome.ok)
     expected = variant.expected_outcome
     if expected == "error" and not all(errors):

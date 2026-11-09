@@ -44,9 +44,30 @@ class Question:
     difficulty: str = ""
     notes: str = ""
     expected_answer_shape: dict[str, Any] | None = None
+    # A hand-verified anchor: {"seed": int, "fact": str, "probe_sql": {engine: sql}, "expected": [[...]]}
+    check: dict[str, Any] | None = None
+    # Values for templated gold: {name: {"type": ..., "value": ...}}
+    params: dict[str, Any] | None = None
 
     def gold(self, engine: str) -> str | None:
         return (self.gold_sql or {}).get(engine)
+
+    def param_values(self) -> dict[str, Any]:
+        """Template values in the plain ``{name: value}`` form sqlgami accepts."""
+        values = {}
+        for name, spec in (self.params or {}).items():
+            values[name] = spec.get("value") if isinstance(spec, dict) else spec
+        return values
+
+    def render(self, sql: str) -> str:
+        """Fill a templated statement the way the host application would, with ``str.format`` rules."""
+        values = self.param_values()
+        if not values:
+            return sql
+        from sqlgami.template import prepare
+
+        prepared = prepare(sql, "duckdb", values)
+        return prepared.executable_sql or sql
 
 
 @dataclass
@@ -146,6 +167,8 @@ def load_suite(name_or_path: str | Path) -> Suite:
                     difficulty=row.get("difficulty") or "",
                     notes=row.get("notes") or "",
                     expected_answer_shape=row.get("expected_answer_shape"),
+                    check=row.get("check"),
+                    params=row.get("params"),
                 )
             )
         except KeyError as exc:

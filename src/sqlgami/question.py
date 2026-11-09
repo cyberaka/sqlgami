@@ -162,7 +162,7 @@ def _categorical_columns(asked: _Asked) -> Iterable[tuple[Any, Any]]:
 
 def _column_is_broken_out(asked: _Asked, table: Any, column: Any) -> bool:
     """True when the query groups by or returns the column, i.e. shows every value of it."""
-    key = asked.ctx.catalog.storage_key(column.name)
+    key = asked.ctx.catalog.column_key(column.name)
     for model in asked.ctx.cache.models():
         nodes: list[exp.Expression] = list(model.select.expressions)
         if model.group is not None:

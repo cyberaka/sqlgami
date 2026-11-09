@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 
 from .calibration import IsotonicCalibrator
-from .catalog import Catalog, Column, ForeignKey, Table
+from .catalog import Catalog, Column, ForeignKey, RequiredPredicate, Table
 from .errors import (
     AdapterError,
     CatalogError,
@@ -64,6 +64,7 @@ __all__ = [
     "MissingDependencyError",
     "Options",
     "Report",
+    "RequiredPredicate",
     "Scorer",
     "Severity",
     "SqlgamiError",

@@ -1160,10 +1160,49 @@ class Gen:
 
     def apply_nasty(self):
         """Add hazard rows to specific tables for the nasty profile."""
-        # 1) NULLs: add users with NULL display_name — wait, display_name is NOT NULL.
-        #    Add tenant_settings with partially-null settings instead? settings is NOT NULL.
-        #    Add webhook deliveries with NULL response_code and empty-string event_kind.
         pool = self._pool("nasty", 9_000_000)
+
+        # A fresh active tenant with no disputes, no subs, no invoices — ensures
+        # that LEFT/INNER JOIN semantics on dispute/subscription-aware queries
+        # diverge on the nasty seed. Also triggers plan-has-zero-active-subs cases.
+        clean_tid = pool.next()
+        self.writer.write("billing", "tenants", {
+            "tenant_id": clean_tid,
+            "name": "Quiet Holdings",
+            "slug": "quiet-holdings",
+            "billing_timezone": "America/Los_Angeles",
+            "currency_code": "USD",
+            "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+        # Plus a tenant with ONLY an enterprise sub (used alongside its also-pro
+        # sub below to trigger q045/b043: tenant on both pro and enterprise).
+        both_tid = pool.next()
+        self.writer.write("billing", "tenants", {
+            "tenant_id": both_tid,
+            "name": "Both Pro and Enterprise Inc",
+            "slug": "both-pro-and-enterprise-inc",
+            "billing_timezone": "Europe/London",
+            "currency_code": "USD",
+            "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            "deleted_at": None,
+        })
+        # Give this tenant one pro sub and one enterprise sub.
+        pro_plan = next((p for p in self.data["plans"] if p["code"] == "pro"), None)
+        ent_plan = next((p for p in self.data["plans"] if p["code"] == "enterprise"), None)
+        if pro_plan and ent_plan:
+            for plan in (pro_plan, ent_plan):
+                sub_id = pool.next()
+                self.writer.write("billing", "subscriptions", {
+                    "subscription_id": sub_id,
+                    "tenant_id": both_tid,
+                    "plan_id": plan["plan_id"],
+                    "started_at": iso(datetime(2026, 2, 1, tzinfo=timezone.utc)),
+                    "ended_at": None,
+                    "status": "active",
+                    "created_at": iso(datetime(2026, 2, 1, tzinfo=timezone.utc)),
+                    "deleted_at": None,
+                })
 
         # Users with trailing whitespace in email (nasty variant of a real user)
         for u in self.data["users"][:3]:
@@ -1176,14 +1215,41 @@ class Gen:
                 "deleted_at": None,
             })
 
+        # Soft-deleted users (2) — triggers user-count soft_delete bug
+        for u in self.data["users"][3:5]:
+            uid = pool.next()
+            self.writer.write("billing", "users", {
+                "user_id": uid,
+                "email": f"deleted_{uid}@example.test",
+                "display_name": "Deleted User",
+                "created_at": iso(datetime(2025, 10, 1, tzinfo=timezone.utc)),
+                "deleted_at": iso(datetime(2026, 4, 1, tzinfo=timezone.utc)),
+            })
+
+        # Soft-deleted payment methods (1 per first two tenants)
+        for t in self.data["tenants"][:2]:
+            pmid = pool.next()
+            self.writer.write("billing", "payment_methods", {
+                "payment_method_id": pmid,
+                "tenant_id": t["tenant_id"],
+                "kind": "card",
+                "brand": "visa",
+                "last4": "0000",
+                "is_default": False,
+                "created_at": iso(datetime(2025, 6, 1, tzinfo=timezone.utc)),
+                "deleted_at": iso(datetime(2026, 2, 1, tzinfo=timezone.utc)),
+            })
+
         # Soft-deleted subscription that's the newest-updated for its tenant
-        if self.data["tenants"]:
-            t = self.data["tenants"][0]
+        # (spread across 3 different plans so it affects b027 rankings)
+        for i, t in enumerate(self.data["tenants"][:3]):
+            # pick a different plan for each tenant
+            plan = self.data["plans"][(i * 2) % len(self.data["plans"])]
             sub_id = pool.next()
             self.writer.write("billing", "subscriptions", {
                 "subscription_id": sub_id,
                 "tenant_id": t["tenant_id"],
-                "plan_id": self.data["plans"][1]["plan_id"],
+                "plan_id": plan["plan_id"],
                 "started_at": iso(datetime(2026, 5, 15, tzinfo=timezone.utc)),
                 "ended_at": None,
                 "status": "active",
@@ -1191,7 +1257,97 @@ class Gen:
                 "deleted_at": iso(datetime(2026, 6, 20, tzinfo=timezone.utc)),
             })
 
-        # Cross-tenant invoice number collision (no unique constraint on invoice_number)
+        # Soft-deleted invoices (3)
+        for i, t in enumerate(self.data["tenants"][:3]):
+            inv_id = pool.next()
+            self.writer.write("billing", "invoices", {
+                "invoice_id": inv_id,
+                "tenant_id": t["tenant_id"],
+                "subscription_id": None,
+                "invoice_number": f"INV-DELETED-{inv_id:07d}",
+                "issued_at": iso(datetime(2026, 1, 15, tzinfo=timezone.utc)),
+                "period_start": iso_date(date(2026, 1, 1)),
+                "period_end":   iso_date(date(2026, 2, 1)),
+                "currency_code": t["currency_code"],
+                "subtotal_cents": 7500,
+                "tax_cents": 0,
+                "total_cents": 7500,
+                "status": "paid",
+                "IsAutoBilled": True,
+                "due_date": iso_date(date(2026, 2, 15)),
+                "created_at": iso(datetime(2026, 1, 15, tzinfo=timezone.utc)),
+                "deleted_at": iso(datetime(2026, 1, 20, tzinfo=timezone.utc)),
+            })
+
+        # Invoice with total_cents = exactly 50000 (triggers >= 50000 bug)
+        if self.data["tenants"]:
+            t = self.data["tenants"][0]
+            inv_id = pool.next()
+            self.writer.write("billing", "invoices", {
+                "invoice_id": inv_id,
+                "tenant_id": t["tenant_id"],
+                "subscription_id": None,
+                "invoice_number": f"INV-BOUNDARY50K-{inv_id:07d}",
+                "issued_at": iso(datetime(2026, 5, 1, tzinfo=timezone.utc)),
+                "period_start": iso_date(date(2026, 5, 1)),
+                "period_end":   iso_date(date(2026, 6, 1)),
+                "currency_code": t["currency_code"],
+                "subtotal_cents": 50000,
+                "tax_cents": 0,
+                "total_cents": 50000,
+                "status": "paid",
+                "IsAutoBilled": True,
+                "due_date": iso_date(date(2026, 6, 15)),
+                "created_at": iso(datetime(2026, 5, 1, tzinfo=timezone.utc)),
+                "deleted_at": None,
+            })
+
+        # Invoice issued at exactly 2026-07-01 00:00:00 (upper boundary of Q2)
+        if self.data["tenants"]:
+            t = self.data["tenants"][0]
+            inv_id = pool.next()
+            self.writer.write("billing", "invoices", {
+                "invoice_id": inv_id,
+                "tenant_id": t["tenant_id"],
+                "subscription_id": None,
+                "invoice_number": f"INV-Q2-BOUNDARY-{inv_id:07d}",
+                "issued_at": iso(datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)),
+                "period_start": iso_date(date(2026, 7, 1)),
+                "period_end":   iso_date(date(2026, 8, 1)),
+                "currency_code": t["currency_code"],
+                "subtotal_cents": 12000,
+                "tax_cents": 0,
+                "total_cents": 12000,
+                "status": "open",
+                "IsAutoBilled": True,
+                "due_date": iso_date(date(2026, 7, 15)),
+                "created_at": iso(datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)),
+                "deleted_at": None,
+            })
+
+        # Credit expiring exactly at 2026-07-01 00:00:00+00:00
+        if self.data["tenants"]:
+            t = self.data["tenants"][0]
+            cid = pool.next()
+            self.writer.write("billing", "credits", {
+                "credit_id": cid,
+                "tenant_id": t["tenant_id"],
+                "subscription_id": None,
+                "kind": "promo",
+                "amount_cents": 1000,
+                "currency_code": t["currency_code"],
+                "expires_at": iso(datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)),
+                "created_at": iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            })
+
+        # Dispute pattern: create a situation where at least one active tenant
+        # has zero open disputes but another has many (triggers outer_to_inner bugs).
+        # Done by removing all disputes from the last active tenant — we don't
+        # delete here; instead we add many disputes for the first two tenants to
+        # make the "zero-dispute tenant" property more pronounced on all engines.
+        # (Base generator already biases disputes to random tenants.)
+
+        # Cross-tenant invoice number collision
         if len(self.data["tenants"]) >= 3:
             t1, t2, t3 = self.data["tenants"][:3]
             common_num = "INV-SHARED-0001"
@@ -1238,7 +1394,7 @@ class Gen:
                     "payload": None,
                 })
 
-        # Ties in commonly-ORDER-BY'd columns: two invoices with identical total_cents
+        # Ties at the TOP of total_cents (for q017-style highest-paid queries)
         if len(self.data["tenants"]) >= 2:
             t = self.data["tenants"][0]
             for _ in range(2):
@@ -1247,20 +1403,44 @@ class Gen:
                     "invoice_id": inv_id,
                     "tenant_id": t["tenant_id"],
                     "subscription_id": None,
-                    "invoice_number": f"INV-TIE-{inv_id:05d}",
+                    "invoice_number": f"INV-TOPTIE-{inv_id:05d}",
                     "issued_at": iso(datetime(2026, 4, 15, tzinfo=timezone.utc)),
                     "period_start": iso_date(date(2026, 4, 1)),
                     "period_end":   iso_date(date(2026, 5, 1)),
                     "currency_code": t["currency_code"],
-                    "subtotal_cents": 42000,
+                    "subtotal_cents": 9_999_900,
                     "tax_cents": 0,
-                    "total_cents": 42000,
+                    "total_cents": 9_999_900,
                     "status": "paid",
                     "IsAutoBilled": True,
                     "due_date": iso_date(date(2026, 5, 15)),
                     "created_at": iso(datetime(2026, 4, 15, tzinfo=timezone.utc)),
                     "deleted_at": None,
                 })
+        # Mid-tier ties in paid_count across tenants[1] and tenants[2] to trigger
+        # non-deterministic top-N bugs (b006).
+        if len(self.data["tenants"]) >= 3:
+            for t in self.data["tenants"][1:3]:
+                for i in range(4):
+                    inv_id = pool.next()
+                    self.writer.write("billing", "invoices", {
+                        "invoice_id": inv_id,
+                        "tenant_id": t["tenant_id"],
+                        "subscription_id": None,
+                        "invoice_number": f"INV-PAIDTIE-{inv_id:05d}",
+                        "issued_at": iso(datetime(2026, 3, 1 + i, tzinfo=timezone.utc)),
+                        "period_start": iso_date(date(2026, 3, 1)),
+                        "period_end":   iso_date(date(2026, 4, 1)),
+                        "currency_code": t["currency_code"],
+                        "subtotal_cents": 3000,
+                        "tax_cents": 0,
+                        "total_cents": 3000,
+                        "status": "paid",
+                        "IsAutoBilled": True,
+                        "due_date": iso_date(date(2026, 4, 15)),
+                        "created_at": iso(datetime(2026, 3, 1 + i, tzinfo=timezone.utc)),
+                        "deleted_at": None,
+                    })
 
         # Empty-string vs NULL: a billing_contact with empty-string email
         if self.data["tenants"]:

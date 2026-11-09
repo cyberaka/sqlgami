@@ -17,6 +17,7 @@ from typing import Any
 from sqlglot import exp
 
 from . import analysis as A
+from . import template
 from . import types as T
 from .catalog import Catalog, Table
 from .checks import CheckContext, Probe, run_static_checks
@@ -80,10 +81,11 @@ def run(
     options: Options | None = None,
     calibrator: Calibrator | None = None,
     glossary: str | None = None,
+    params: dict[str, Any] | None = None,
 ) -> Report:
     options = options or Options()
     report = Report(engine=engine, mode=mode, sql=sql, question=question)
-    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options)
+    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params)
     scored = score_report(report, calibrator)
     report.confidence = scored.confidence
     report.verdict = scored.verdict
@@ -109,11 +111,22 @@ def _run(
     question: str | None,
     glossary: str | None,
     options: Options,
+    params: dict[str, Any] | None = None,
 ) -> None:
     clock = _Clock()
 
     # ------------------------------------------------------------- parse
-    analysis = A.analyse(sql, catalog, dialect)
+    prepared = template.prepare(sql, dialect, params)
+    if prepared.params:
+        report.signals["template_parameters"] = [p.to_dict() for p in prepared.params]
+    if prepared.disabled_filters:
+        report.signals["disabled_filters"] = list(prepared.disabled_filters)
+    analysis = A.analyse(prepared.analysis_sql, catalog, dialect)
+    if analysis.script_statements:
+        report.signals["script"] = {
+            "statements": list(analysis.script_statements),
+            "variables": dict(analysis.variables),
+        }
     elapsed = clock.lap()
     if analysis.parse_error is not None:
         report.findings.append(
@@ -171,6 +184,19 @@ def _run(
         _not_run(report, ("schema", "static", "dry_run", "sample", "question"), "the statement is not a plain read-only query")
         return
     _stage(report, "statement", StageStatus.PASSED, None, clock.lap())
+    report.findings.extend(prepared.findings)
+    for name in analysis.shadowed_variables:
+        report.findings.append(
+            Finding(
+                "variable_shadowed",
+                Severity.MEDIUM,
+                f"The script declares a variable named {name}, but a table in the query has a column "
+                f"of the same name, and the column wins. A condition such as {name} = {name} then "
+                "compares the column with itself.",
+                "statement",
+                suggestion="Give the variable a name no column has.",
+            )
+        )
 
     # ------------------------------------------------------------ schema
     schema_passed = False
@@ -255,7 +281,19 @@ def _run(
     else:
         _stage(report, "static", StageStatus.NOT_RUN, "needs a resolved schema")
 
-    _database_stages(report, sql, mode, adapter, analysis, ctx, schema_findings, options, clock)
+    blocked: str | None = None
+    if prepared.executable_sql is None:
+        missing = ", ".join(p.name for p in prepared.params if not p.supplied)
+        blocked = f"the SQL is a template and no value was given for: {missing}"
+    elif analysis.script_statements and not getattr(adapter, "supports_scripts", False):
+        blocked = "the SQL is a multi-statement script, which is not sent to this engine"
+    if blocked is not None and adapter is not None and mode != "static":
+        _stage(report, "dry_run", StageStatus.SKIPPED, blocked)
+        _stage(report, "sample", StageStatus.SKIPPED, blocked + "; unverified beyond static checks")
+    else:
+        _database_stages(
+            report, prepared.executable_sql or sql, mode, adapter, analysis, ctx, schema_findings, options, clock
+        )
     _question_stage(report, ctx, adapter, question, glossary, mode, options)
 
 

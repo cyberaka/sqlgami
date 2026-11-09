@@ -67,7 +67,7 @@ class _Tracer:
                 ]
                 if not present:
                     continue
-                refs = [(alias, self.ctx.catalog.storage_key(c.name)) for c in present]
+                refs = [(alias, self.ctx.catalog.column_key(c.name)) for c in present]
                 node_id = id(source.node)
                 if any(ref in covered for ref in refs):
                     self.satisfied.add(node_id)

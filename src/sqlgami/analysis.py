@@ -21,7 +21,7 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, build_scope
 from sqlglot.schema import MappingSchema
 
-from .catalog import Catalog, Table, view_query_from_sql
+from .catalog import Catalog, Table, schema_name_of, view_query_from_sql
 from .types import sqlglot_type_name
 
 logger = logging.getLogger("sqlgami")
@@ -106,6 +106,10 @@ class Analysis:
     unsafe_functions: list[str] = field(default_factory=list)
     string_identifiers: list[str] = field(default_factory=list)
     types_annotated: bool = False
+    # For a script (DECLARE ...; SET ...; SELECT ...): what came before the query.
+    script_statements: list[str] = field(default_factory=list)
+    variables: dict[str, str] = field(default_factory=dict)  # lower-cased name -> declared type
+    shadowed_variables: list[str] = field(default_factory=list)
 
     @property
     def parsed(self) -> bool:
@@ -157,6 +161,19 @@ def analyse(sql: str, catalog: Catalog | None, dialect: str | None = None) -> An
     if not statements:
         analysis.kind = EMPTY
         return analysis
+    if len(statements) > 1 and dialect in _SCRIPT_DIALECTS and _is_script(statements):
+        # A script: variable declarations and assignments, then the query that answers the question.
+        for statement in statements[:-1]:
+            analysis.script_statements.append(type(statement).__name__.upper())
+            if isinstance(statement, exp.Declare):
+                for item in statement.expressions:
+                    kind = item.args.get("kind")
+                    names = item.this if isinstance(item.this, list) else [item.this]
+                    for name in names:
+                        if name is not None:
+                            analysis.variables[name.name.lower()] = kind.sql(dialect=dialect) if kind else ""
+        analysis.script_statements.append("SELECT")
+        statements = statements[-1:]
     if len(statements) > 1:
         analysis.kind = MULTIPLE
         analysis.tree = statements[0]
@@ -214,6 +231,22 @@ def _unsafe_functions(tree: exp.Expression) -> list[str]:
     return sorted(found)
 
 
+_SCRIPT_DIALECTS = {"bigquery"}
+
+
+def _is_script(statements: list[exp.Expression]) -> bool:
+    """Declarations and assignments followed by exactly one query."""
+    *head, last = statements
+    if not isinstance(last, exp.Query) or _mutation_kinds(last):
+        return False
+    for statement in head:
+        if not isinstance(statement, (exp.Declare, exp.Set)):
+            return False
+        if any(isinstance(node, _MUTATING_NODES) for node in statement.walk()):
+            return False
+    return True
+
+
 def _clean_error(exc: Exception) -> str:
     text = str(exc)
     # sqlglot underlines the offending token with terminal escape codes.
@@ -254,6 +287,8 @@ class _Resolver:
             return
         if self.dialect == "sqlite":
             self._sqlite_string_identifiers(tree)
+        if analysis.variables:
+            self._bind_variables(tree)
 
         schema = self._mapping_schema()
         try:
@@ -325,7 +360,7 @@ class _Resolver:
         db_ident = node.args.get("db")
         table = catalog.resolve(
             name,
-            db_ident.name if isinstance(db_ident, exp.Identifier) else None,
+            schema_name_of(node, self.dialect) if isinstance(db_ident, exp.Identifier) else None,
             quoted=bool(ident.args.get("quoted")),
             schema_quoted=bool(isinstance(db_ident, exp.Identifier) and db_ident.args.get("quoted")),
             search_path=search_path,
@@ -395,11 +430,36 @@ class _Resolver:
         mapping: dict[str, dict[str, dict[str, str]]] = {}
         for (schema_key, name_key), table in self.analysis.tables.items():
             columns = {
-                catalog.storage_key(c.name): sqlglot_type_name(c.type, self.dialect)
+                catalog.column_key(c.name): sqlglot_type_name(c.type, self.dialect)
                 for c in table.columns
             }
             mapping.setdefault(schema_key, {})[name_key] = columns
         return MappingSchema(mapping or None, dialect=self.dialect, normalize=False)
+
+    # ------------------------------------------------------ script variables
+
+    def _bind_variables(self, tree: exp.Expression) -> None:
+        """Turn references to declared script variables into parameters.
+
+        A column of a table in the query takes precedence over a variable of the
+        same name, as it does in the engine; that case is recorded, since it is
+        rarely what the author meant.
+        """
+        analysis = self.analysis
+        column_names: set[str] = set()
+        for table in analysis.tables.values():
+            column_names |= {c.name.lower() for c in table.columns}
+        for column in list(tree.find_all(exp.Column)):
+            if column.table:
+                continue
+            name = column.name.lower()
+            if name not in analysis.variables:
+                continue
+            if name in column_names:
+                if name not in analysis.shadowed_variables:
+                    analysis.shadowed_variables.append(name)
+                continue
+            column.replace(exp.Parameter(this=exp.Var(this=column.name)))
 
     # ------------------------------------------------ SQLite "string" quirk
 
