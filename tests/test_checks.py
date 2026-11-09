@@ -493,3 +493,23 @@ def test_history_table_read_without_choosing_a_version(dialect):
         report = scorer.explain(sql)
         assert not report.has("history_rows"), sql + "\n" + report.summary()
         assert not report.has("date_boundary"), sql + "\n" + report.summary()
+
+
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_fan_out_inside_a_subquery_depends_on_whether_its_rows_have_an_identity(dialect):
+    scorer = _scorer(dialect)
+    # The subquery returns only order totals, once per item: nothing says which row is which.
+    hidden = scorer.explain(
+        "SELECT SUM(x.total) FROM (SELECT o.total FROM orders o JOIN items i ON i.order_id = o.id) x"
+    )
+    assert hidden.has("fan_out"), hidden.summary()
+    # One row per item, identified by the item's key, each carrying its order's status: a lookup.
+    lookup = scorer.explain(
+        "SELECT x.status, SUM(x.qty) FROM (SELECT i.id, i.qty, o.status FROM items i "
+        "JOIN orders o ON o.id = i.order_id) x GROUP BY x.status"
+    )
+    assert not lookup.has("fan_out"), lookup.summary()
+    carried = scorer.explain(
+        "SELECT SUM(x.total) FROM (SELECT i.id, o.total FROM items i JOIN orders o ON o.id = i.order_id) x"
+    )
+    assert not carried.has("fan_out"), carried.summary()

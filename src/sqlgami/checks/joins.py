@@ -128,7 +128,10 @@ def _repeated_inside(model: SelectModel, column: exp.Column, depth: int = 0):
         return None
     if len(inner.sources) >= 2:
         repeated = inner.multiplied(defining.table)
-        if repeated.state == YES:
+        # If the subquery returns a key of the rows it is really about (one row per
+        # subscription, each carrying its plan's price), repeating the looked-up value is
+        # the point. Only a subquery whose rows have no identity of their own is suspect.
+        if repeated.state == YES and not inner.output_keys().keys:
             return inner, defining.table, repeated.culprits
     return _repeated_inside(inner, defining, depth + 1)
 
