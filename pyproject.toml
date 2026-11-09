@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlgami"
+version = "0.1.0"
+description = "Advisory confidence reports for LLM-written SQL. No guarantee of correctness."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "sqlglot>=27,<29",
+]
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=1.1"]
+postgres = ["psycopg[binary]>=3.2"]
+bigquery = ["google-cloud-bigquery>=3.25"]
+
+[project.scripts]
+sqlgami = "sqlgami.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "duckdb>=1.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlgami"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.DS_Store
+uv.lock.bak
+
+# Generated bench data, downloaded benchmarks and evaluation runs are never committed.
+bench/.data/
+bench/.external/
+bench/.runs/

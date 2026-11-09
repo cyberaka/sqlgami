@@ -1,0 +1,200 @@
+# sqlgami
+
+sqlgami reads a SQL statement that a language model wrote for a plain-English
+question and reports how much confidence the statement deserves, and why.
+
+It is a Python library that other applications embed. You give it the SQL, the
+schema or a database connection, and optionally the question. It returns a
+report as a plain data object that converts to JSON. What to show, and whether
+to show anything, is up to your application.
+
+> **Advisory only.** A sqlgami report is an estimate. It is not a guarantee
+> that a statement is right or wrong, and it comes with no warranty (see
+> sections 7 and 8 of the [license](LICENSE)). Review SQL and its results
+> before relying on them. Every report carries this notice in its `advisory`
+> field.
+
+## Status
+
+Early and private. Working today: the core, the static checks, and adapters
+for SQLite and DuckDB. Planned next, in this order: Postgres, BigQuery, then
+Cosmos DB. The confidence number is a **provisional heuristic** until a
+calibration model has been fitted on labelled data; reports say so with
+`"calibrated": false`.
+
+## Install
+
+```
+pip install sqlgami              # core: SQLite and static analysis
+pip install "sqlgami[duckdb]"    # adds the DuckDB driver
+```
+
+The core depends on one package, [sqlglot](https://github.com/tobymao/sqlglot).
+Database drivers are optional extras. The core imports no web, UI or LLM
+framework.
+
+## Use
+
+```python
+import sqlite3
+from sqlgami import Scorer
+
+conn = sqlite3.connect("shop.db")
+scorer = Scorer("sqlite", db=conn)
+
+report = scorer.sample(
+    "SELECT c.name, SUM(o.total) FROM customers c "
+    "JOIN orders o ON o.customer_id = c.id "
+    "JOIN items i ON i.order_id = o.id GROUP BY c.name",
+    question="Total order value per customer",
+)
+
+report.verdict           # Verdict.LIKELY_WRONG
+report.score             # 0.39
+report.findings[0].code  # "fan_out"
+report.to_dict()         # JSON-serialisable
+print(report.summary())  # short text form
+```
+
+Without a connection, pass the schema instead and sqlgami makes no database
+calls at all:
+
+```python
+scorer = Scorer("postgres", catalog=open("schema.sql").read())
+report = scorer.explain("SELECT * FROM orders WHERE shipped_at = NULL")
+```
+
+`catalog` accepts DDL text (`CREATE TABLE`, `CREATE VIEW`, `CREATE UNIQUE
+INDEX`), a dictionary, or a `Catalog` object.
+
+### How deep to check
+
+| Mode | What runs | Touches the database |
+|---|---|---|
+| `static` | parse, read-only check, schema resolution, static checks | schema lookups only, and only if you passed a connection |
+| `dry` | the above, plus the engine's own planner (`EXPLAIN`) | yes, without running the query |
+| `sample` | the above, plus one read-only run of the query and small probe queries that test findings against the data | yes |
+| `full` | reserved for the optional LLM-backed checks | yes |
+
+The default is `dry` when you pass a connection and `static` when you do not.
+`scorer.explain()`, `scorer.dry_run()` and `scorer.sample()` pick a mode
+directly.
+
+A query is only run in `sample` mode, and only if its estimated cost is under
+`cost_ceiling`. Above the ceiling the report says "unverified beyond static and
+dry-run checks".
+
+### What it looks for
+
+Hard gates, which cap the score near zero:
+
+- the statement does not parse
+- it is not a single read-only query (`INSERT`, `UPDATE`, `DELETE`, DDL,
+  several statements, `SELECT ... INTO`, a writing CTE)
+- it names a table or column that does not exist, or a column that is ambiguous
+- it reaches outside the database (`read_csv`, `pg_read_file`, `dblink`, ...)
+- the database rejects it, or it fails when run
+
+Static checks, each reported as a finding with a severity:
+
+| Code | Catches |
+|---|---|
+| `fan_out` | a `SUM`, `AVG` or `COUNT` over rows that a join has repeated |
+| `distinct_masking` | `DISTINCT` used to paper over repeated rows |
+| `cartesian_join` | tables combined with nothing linking them |
+| `outer_join_nullified` | a `WHERE` or later inner join that turns an outer join into an inner join |
+| `missing_group_by` | a selected column that is neither grouped nor aggregated |
+| `avg_of_avg` | an average of per-group averages or ratios |
+| `limit_without_order` | `LIMIT` with no `ORDER BY` |
+| `null_comparison` | `= NULL`, `<> NULL`, or comparing with the text `'NULL'` |
+| `not_in_nullable` | `NOT IN` against values that can be NULL |
+| `type_mismatch` | comparisons between unlike types |
+| `integer_division` | a ratio computed with integer division |
+| `date_boundary` | date ranges that start or stop one step off, and impossible dates |
+| `filter_value` | a filter on a value the column never holds, such as `'usa'` for `'US'` |
+| `missing_tenant_filter` | a multi-tenant table read without a tenant filter (needs `tenant_column`) |
+| `soft_deleted_rows` | a soft-delete marker that is never looked at (needs `soft_delete_column`) |
+| `natural_join` | `NATURAL JOIN` |
+
+Views are expanded before the checks run, including views built on other
+views, so a check sees the base tables a view reads.
+
+In `sample` mode sqlgami tests several findings against the data. A suspected
+fan-out on columns with no declared key is confirmed if the columns hold
+repeated values and dismissed if they do not. A `NOT IN` warning is confirmed
+if the column really holds NULLs. Filter values are looked up in the column.
+
+### The report
+
+```json
+{
+  "schema_version": "1.0",
+  "advisory": "Advisory only. ...",
+  "engine": "sqlite",
+  "mode": "sample",
+  "question": "Total order value per customer",
+  "sql": "SELECT ...",
+  "verdict": "likely_wrong",
+  "confidence": {
+    "value": 0.39, "low": 0.27, "high": 0.4,
+    "calibrated": false,
+    "cap": 0.4, "cap_reason": "high-severity finding: fan_out",
+    "basis": "sample evidence; provisional heuristic, not calibrated"
+  },
+  "stages": [{"name": "parse", "status": "passed", "detail": null, "duration_ms": 1.2}],
+  "findings": [{"code": "fan_out", "severity": "high", "message": "...", "stage": "static",
+                "snippet": "SUM(o.total)", "suggestion": "...", "evidence": {}}],
+  "checks_not_run": [],
+  "cost": {"unit": "rows", "value": 123.0, "detail": {}},
+  "signals": {"rows_returned": 3},
+  "tables": ["main.customers", "main.items", "main.orders"],
+  "plan": []
+}
+```
+
+Verdicts are `invalid`, `likely_wrong`, `uncertain`, `likely_right` and
+`unverified`. A check that could not run is listed under `checks_not_run`
+rather than counted as passed.
+
+### Safety
+
+- sqlgami sends the database only read-only work: the statement under review
+  (after it has been parsed and confirmed to be a single query), `EXPLAIN` of
+  it, schema lookups, and small probe queries it builds itself.
+- A database opened by path is opened read-only. On a SQLite connection you
+  pass in, writes are disabled for the duration of each call and restored
+  afterwards.
+- Queries run under a time limit and return a bounded number of rows.
+- Nothing is sent to a database, a network service or an LLM unless you pass a
+  connection or function for it.
+
+### Errors
+
+Bad SQL is never an exception; it comes back as a report. Exceptions mean
+misuse or infrastructure trouble, and all derive from `sqlgami.SqlgamiError`:
+`ConfigurationError`, `MissingDependencyError`, `CatalogError`, `AdapterError`,
+`ConnectionFailed`, `UnsafeQueryError`.
+
+The library keeps no global state and configures no logging. It logs to the
+`sqlgami` logger, which is silent unless your application attaches a handler.
+
+## Command line
+
+A thin wrapper over the same API, using the standard library only:
+
+```
+sqlgami score --engine sqlite --db shop.db --mode sample "SELECT ..."
+sqlgami score --engine postgres --schema schema.sql --sql-file q.sql --json
+sqlgami score --engine duckdb --db shop.duckdb --fail-under 0.5 "SELECT ..."
+```
+
+## Development
+
+```
+uv sync
+uv run pytest
+```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
