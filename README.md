@@ -148,7 +148,10 @@ are word-and-structure matching with no language model involved:
 | `question_flag_unused` | "active plans" where the table has an `is_active` column the SQL ignores |
 | `pattern_match_missing` | "starts with" answered by an exact comparison |
 | `order_missing` | sorted output asked for, no `ORDER BY` |
-| `output_columns` | "Return id and name" answered with a different number of columns |
+| `output_columns` | "Return (tenant_id, name, n_orders)" answered with another number of columns, or without the named ones |
+| `column_order` | the question lists the columns in an order the SELECT does not follow |
+| `column_default` | "country_code (UNKNOWN if none)" returned without a `COALESCE`, or "NULL when none" replaced by a value |
+| `label_format` | labels the question defines ('Q1', 'Q2' or "like 'Q1 2026'") written another way |
 
 The question also firms up earlier findings: a missing soft-delete filter is
 raised when the question says "non-deleted" and dropped when it asks about

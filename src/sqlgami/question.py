@@ -19,6 +19,7 @@ from .checks.base import CheckContext
 from .checks.policy import inside_view
 from .model import NO, YES, SelectModel, strip, walk_own
 from .report import Finding, Severity
+from .shape import check_shape, parse_column_list
 
 STAGE = "question"
 
@@ -112,13 +113,19 @@ def run_question_checks(ctx: CheckContext, question: str, glossary: str | None =
         _pattern_match,
         _sorting,
         _output_columns,
+        _shape,
     ):
         try:
             found = check(asked) or []
         except Exception:  # a heuristic must never break scoring
             continue
         for finding in found:
-            if long_question and finding.code in _WORD_MATCHING and finding.severity == Severity.MEDIUM:
+            if (
+                long_question
+                and finding.code in _WORD_MATCHING
+                and finding.severity == Severity.MEDIUM
+                and not finding.evidence.get("explicit")
+            ):
                 # Matching words between a long specification and the SQL goes wrong often
                 # enough that these are notes, not doubts, on such questions.
                 finding.severity = Severity.LOW
@@ -1038,7 +1045,14 @@ def _listed_outputs(text: str, column_names: set[str] | None = None) -> int | No
     return len(items)
 
 
+def _shape(asked: _Asked) -> list[Finding]:
+    """Explicit column lists, per-column defaults and label formats the question spells out."""
+    return check_shape(asked.ctx, asked.text, asked.root)
+
+
 def _output_columns(asked: _Asked) -> list[Finding]:
+    if parse_column_list(asked.text) is not None:
+        return []  # the explicit list is checked by _shape, names and order included
     column_names = {c.name.lower() for t in asked.ctx.analysis.tables.values() for c in t.columns}
     wanted = _listed_outputs(asked.text, column_names)
     root = asked.tree
