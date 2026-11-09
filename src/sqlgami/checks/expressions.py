@@ -164,7 +164,7 @@ def scalar_subquery_rows(ctx: CheckContext) -> Iterable[Finding]:
             if frozenset() in keys.keys:
                 continue
             lenient = ctx.dialect in ("sqlite", "mysql")
-            yield ctx.finding(
+            finding = ctx.finding(
                 "scalar_subquery_rows",
                 Severity.MEDIUM,
                 f"{ctx.snippet(node, 120)} is used as a single value, but nothing in the schema says it "
@@ -178,6 +178,35 @@ def scalar_subquery_rows(ctx: CheckContext) -> Iterable[Finding]:
                 suggestion="Aggregate it (MAX/MIN), add LIMIT 1 with an ORDER BY, or filter on a unique key.",
                 lenient=lenient,
             )
+            sub_model = ctx.cache.model(sub_scope)
+            correlated = any(
+                c.table and c.table not in sub_model.sources for c in walk_own(inner) if isinstance(c, exp.Column)
+            )
+            tables = [src.table for src in sub_model.sources.values() if src.table is not None]
+            if not correlated and tables and len(tables) == len(sub_model.sources):
+                # It stands on its own, so the data can settle the question: ask for two rows.
+                ctx.probes.append(
+                    Probe(
+                        PROBE_QUERY,
+                        tables[0],
+                        (),
+                        finding,
+                        query=inner.copy().limit(2),
+                        min_rows=2,
+                        on_rows=(
+                            Severity.HIGH,
+                            " Checked against the data: it returns more than one row today.",
+                            "several_rows",
+                        ),
+                        on_empty=(
+                            Severity.INFO,
+                            " Checked against the data: it returns at most one row today. Nothing in the "
+                            "schema keeps it that way.",
+                            "one_row",
+                        ),
+                    )
+                )
+            yield finding
 
 
 def _is_whole_number(node: exp.Expression) -> bool:

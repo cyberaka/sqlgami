@@ -37,6 +37,7 @@ class Probe:
     # For PROBE_QUERY: the query, and what to do with the finding in each outcome.
     # Each outcome is (new severity or None to leave it, text appended to the message, data_check tag).
     query: Any = None
+    min_rows: int = 1  # "rows" means at least this many came back
     on_rows: tuple[Severity | None, str, str] | None = None
     on_empty: tuple[Severity | None, str, str] | None = None
 

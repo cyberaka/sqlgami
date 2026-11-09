@@ -49,6 +49,11 @@ HALF_WIDTH = {"static": 0.20, "dry": 0.17, "sample": 0.12}
 
 LIKELY_RIGHT_AT = 0.70
 LIKELY_WRONG_AT = 0.40
+# "Likely wrong" is a strong statement. It takes high-severity evidence or a failed run to make
+# it; doubts of medium and low severity alone leave the score in the "uncertain" band. Scores
+# below SOFT_KNEE are squeezed into (SOFT_FLOOR, SOFT_KNEE), which keeps their order.
+SOFT_FLOOR = 0.42
+SOFT_KNEE = 0.60
 
 # Finding codes that mean the statement cannot produce an answer at all.
 GATE_CODES = {
@@ -180,6 +185,9 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
         logit -= weight
     logit += _clean_bonus(report, depth, analysed)
     raw = _sigmoid(logit)
+    strong = any(f.severity in (Severity.HIGH, Severity.ERROR) for f in findings)
+    if not strong and raw < SOFT_KNEE:
+        raw = SOFT_FLOOR + (raw / SOFT_KNEE) * (SOFT_KNEE - SOFT_FLOOR)
     if cap is not None:
         raw = min(raw, cap)
 
@@ -203,7 +211,13 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
         high = min(high, cap)
         low = min(low, high)
 
-    parts = [f"{depth} evidence"]
+    parts = [
+        {
+            "static": "static checks only: the query was not planned or run against a database",
+            "dry": "static checks and the engine's planner: the query was not run",
+            "sample": "static checks, the engine's planner and one read-only run",
+        }[depth]
+    ]
     if not analysed:
         parts.append("static checks did not run")
     sample = report.stage("sample")

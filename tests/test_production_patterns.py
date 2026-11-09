@@ -266,7 +266,8 @@ def test_scalar_subquery_bounds():
     )
     assert risky.stage("schema").status.value == "passed", risky.summary()
     found = [f for f in risky.findings if f.code == "scalar_subquery_rows"]
-    assert len(found) == 2 and found[0].severity == Severity.MEDIUM
+    # The same subquery appears as both bounds: one risk, reported once.
+    assert len(found) == 1 and found[0].severity == Severity.MEDIUM and found[0].evidence["occurrences"] == 2
     assert not risky.has("date_arithmetic")  # DATE minus a number of days is defined in BigQuery
     partition = next(f for f in risky.findings if f.code == "partition_filter")
     assert partition.severity == Severity.LOW and partition.evidence["kind"] == "non_constant"

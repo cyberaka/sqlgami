@@ -431,6 +431,26 @@ class Catalog:
     def unique_key_sets(self, table: Table) -> list[frozenset[str]]:
         return [frozenset(self.column_key(c) for c in key) for key in table.all_unique_keys()]
 
+    def declare_unique(self, table: str, columns: Iterable[str], schema: str | None = None) -> None:
+        """Tell sqlgami that these columns identify a row, where the database does not enforce it.
+
+        Warehouses often have no enforced keys. Declaring them lets checks about
+        repeated rows and single-row subqueries reason properly.
+        """
+        found = self.resolve(table, schema, quoted=True) or self.resolve(table, schema)
+        if found is None:
+            raise CatalogError(f"cannot declare a key on unknown table {table!r}")
+        names = []
+        for name in columns:
+            column = self.column(found, name)
+            if column is None:
+                raise CatalogError(f"table {found.qualified_name} has no column {name!r}")
+            names.append(column.name)
+        key = tuple(names)
+        if key and key != tuple(found.primary_key) and key not in found.unique_keys:
+            found.unique_keys.append(key)
+        found.keys_known = True
+
     def snapshot_column_of(self, table: Table) -> Column | None:
         """The snapshot date column of a periodic snapshot table, if one is declared for it."""
         name = table.snapshot_column

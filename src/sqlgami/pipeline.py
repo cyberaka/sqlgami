@@ -86,10 +86,29 @@ def run(
     options = options or Options()
     report = Report(engine=engine, mode=mode, sql=sql, question=question)
     _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params)
+    report.findings = _dedupe(report.findings)
     scored = score_report(report, calibrator)
     report.confidence = scored.confidence
     report.verdict = scored.verdict
     return report
+
+
+def _dedupe(findings: list[Finding]) -> list[Finding]:
+    """One risk, one finding: the same check on the same text is reported once, with a count."""
+    kept: dict[tuple[str, str, str], Finding] = {}
+    for finding in findings:
+        if finding.snippet is None:
+            key = (finding.code, "", finding.message)
+        else:
+            key = (finding.code, " ".join(finding.snippet.split()).lower(), "")
+        first = kept.get(key)
+        if first is None:
+            kept[key] = finding
+            continue
+        first.evidence["occurrences"] = first.evidence.get("occurrences", 1) + 1
+        if finding.severity.rank > first.severity.rank:
+            first.severity = finding.severity
+    return list(kept.values())
 
 
 def _stage(report: Report, name: str, status: StageStatus, detail: str | None = None, ms: float | None = None) -> None:
@@ -473,6 +492,8 @@ def _database_stages(
         else:
             _result_signals(report, result, ctx)
             for finding in report.findings:
+                if finding.evidence.get("data_check"):
+                    continue  # already settled by running the subquery itself
                 if finding.code == "scalar_subquery_rows" and not finding.evidence.get("lenient"):
                     finding.severity = Severity.LOW
                     finding.evidence["data_check"] = "ran"
@@ -705,8 +726,8 @@ def _probe_query(adapter: Adapter, probe: Probe, options: Options) -> None:
     """Run a query a check prepared, and adjust its finding by whether a row comes back."""
     if probe.query is None or probe.finding is None:
         return
-    rows = adapter.query(probe.query, max_rows=1, timeout_s=options.probe_timeout_s)
-    outcome = probe.on_rows if rows else probe.on_empty
+    rows = adapter.query(probe.query, max_rows=probe.min_rows, timeout_s=options.probe_timeout_s)
+    outcome = probe.on_rows if len(rows) >= probe.min_rows else probe.on_empty
     if outcome is None:
         return
     severity, text, tag = outcome
