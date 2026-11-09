@@ -187,6 +187,12 @@ class Catalog:
             return name
         return name.lower()
 
+    def written(self, name: str) -> str:
+        """How a stored name must be written in a query: quoted when its case would otherwise be lost."""
+        if self.case_sensitive_when_quoted and name != name.lower():
+            return '"' + name.replace('"', '""') + '"'
+        return name
+
     # ---------------------------------------------------------------- filling
 
     def add(self, table: Table) -> Table:
@@ -302,12 +308,12 @@ class Catalog:
         index = self._ensure_index()
         by_lower: dict[str, str] = {}
         for schema, table in index.values():
-            by_lower.setdefault(table.lower(), f"{schema}.{table}" if schema else table)
+            by_lower.setdefault(table.lower(), ".".join(self.written(p) for p in (schema, table) if p))
         close = difflib.get_close_matches(name.lower(), list(by_lower), n=limit, cutoff=0.6)
         return [by_lower[c] for c in close]
 
     def suggest_columns(self, table: Table, name: str, limit: int = 3) -> list[str]:
-        by_lower = {c.name.lower(): c.name for c in table.columns}
+        by_lower = {c.name.lower(): self.written(c.name) for c in table.columns}
         close = difflib.get_close_matches(name.lower(), list(by_lower), n=limit, cutoff=0.6)
         return [by_lower[c] for c in close]
 

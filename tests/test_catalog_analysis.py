@@ -98,7 +98,10 @@ def test_postgres_identifier_case_rules():
     scorer = Scorer("postgres", catalog=Catalog.from_ddl(ddl, "postgres", search_path=["billing"]))
     ok = scorer.explain('SELECT "IsOn", PLAN_ID FROM "PlanFeatures"')
     assert ok.stage("schema").status.value == "passed", ok.summary()
-    assert scorer.explain("SELECT plan_id FROM PlanFeatures").has("unknown_table")
+    unquoted = scorer.explain("SELECT plan_id FROM PlanFeatures")
+    assert unquoted.has("unknown_table")
+    # The hint shows the name the way it has to be written.
+    assert 'billing."PlanFeatures"' in next(f.message for f in unquoted.findings if f.code == "unknown_table")
     assert scorer.explain('SELECT IsOn FROM "PlanFeatures"').has("unknown_column")
     assert scorer.explain('SELECT plan_id FROM billing."PlanFeatures"').stage("schema").status.value == "passed"
 
