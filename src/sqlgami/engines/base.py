@@ -104,6 +104,10 @@ class Adapter(abc.ABC):
         """A cheap estimate of the number of rows, or ``None``."""
         return table.row_count
 
+    def version(self) -> str | None:
+        """The version of the engine being talked to, for the report."""
+        return None
+
     def close(self) -> None:
         """Release anything the adapter opened itself. Borrowed connections are left alone."""
 

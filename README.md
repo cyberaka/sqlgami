@@ -16,9 +16,9 @@ to show anything, is up to your application.
 
 ## Status
 
-Early and private. Working today: the core, the static checks, and adapters
-for SQLite and DuckDB. Planned next, in this order: Postgres, BigQuery, then
-Cosmos DB. The confidence number is a **provisional heuristic** until a
+Early and private. Working today: the core, the static and question checks,
+and adapters for SQLite, DuckDB and Postgres. Planned next, in this order:
+BigQuery, then Cosmos DB. The confidence number is a **provisional heuristic** until a
 calibration model has been fitted on labelled data; reports say so with
 `"calibrated": false`.
 
@@ -27,6 +27,7 @@ calibration model has been fitted on labelled data; reports say so with
 ```
 pip install sqlgami              # core: SQLite and static analysis
 pip install "sqlgami[duckdb]"    # adds the DuckDB driver
+pip install "sqlgami[postgres]"  # adds psycopg 3 for Postgres
 ```
 
 The core depends on one package, [sqlglot](https://github.com/tobymao/sqlglot).
@@ -188,6 +189,11 @@ rather than counted as passed.
 - A database opened by path is opened read-only. On a SQLite connection you
   pass in, writes are disabled for the duration of each call and restored
   afterwards.
+- On Postgres every statement runs in its own `READ ONLY` transaction, so a
+  function with side effects cannot write. If the connection you pass in is
+  already inside a transaction, sqlgami works under a savepoint and leaves your
+  transaction as it found it; the statement gate still applies, but the
+  read-only setting is then yours to make.
 - Queries run under a time limit and return a bounded number of rows.
 - Nothing is sent to a database, a network service or an LLM unless you pass a
   connection or function for it.
@@ -219,6 +225,15 @@ uv sync
 uv run pytest
 ```
 
+Postgres tests are skipped unless a test server is named. Any throwaway
+Postgres 16 will do:
+
+```
+SQLGAMI_TEST_PG_DSN=postgresql://USER:PASSWORD@127.0.0.1:5440/DBNAME uv run pytest
+```
+
+The tests create and drop their own schemas in that database.
+
 ### Bench
 
 `bench/` holds test suites: realistic schemas, deterministic data generators,
@@ -231,6 +246,12 @@ uv run python -m benchkit validate saas_billing    # check gold, bugs and equiva
 uv run python -m benchkit evaluate saas_billing    # score everything with sqlgami, print metrics
 uv run python -m benchkit label saas_billing bench/.runs/<run-id>   # label candidates.jsonl by execution
 ```
+
+SQLite and DuckDB databases are files. Postgres databases are built only when
+`SQLGAMI_BENCH_PG_DSN` names a server; one database per suite and seed is
+created there, named `sqlgami_bench_<suite>_<seed>`. `validate --strict` fails
+on an empty suite and on engines the suite declares but the machine cannot
+check.
 
 A suite can be named by its directory under `bench/` or by a path. Generated
 data, downloaded benchmarks and run output live under `bench/.data/`,

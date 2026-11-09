@@ -240,6 +240,9 @@ class DuckDBAdapter(Adapter):
             raise AdapterError(f"probe query failed: {_first_lines(str(exc))}") from exc
         return rows
 
+    def version(self) -> str | None:
+        return getattr(self._duckdb, "__version__", None)
+
     def close(self) -> None:
         try:
             self.conn.close()  # closes our own cursor; a borrowed connection stays open

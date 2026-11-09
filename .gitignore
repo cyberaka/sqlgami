@@ -12,3 +12,8 @@ uv.lock.bak
 bench/.data/
 bench/.external/
 bench/.runs/
+
+# secrets
+.env
+.env.*
+!.env.example

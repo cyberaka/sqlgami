@@ -34,6 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     p_validate = sub.add_parser("validate", help="check the suite's gold, bugs and equivalents")
     p_validate.add_argument("suite")
     p_validate.add_argument("--engine", action="append")
+    p_validate.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail on an empty suite and on engines the suite declares but this machine cannot check",
+    )
 
     p_eval = sub.add_parser("evaluate", help="score the suite with sqlgami and print metrics")
     p_eval.add_argument("suite")
@@ -71,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "validate":
-            result = validate(suite, engines)
+            result = validate(suite, args.engine, strict=args.strict)
             print(result.summary())
             return 0 if result.ok else 1
 

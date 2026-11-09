@@ -106,6 +106,8 @@ def fan_out(ctx: CheckContext) -> Iterable[Finding]:
         aggregates = [a for a in model.own_aggregates() if not isinstance(a, _REPEAT_SAFE)]
         if not aggregates or _group_pins_one_row(model):
             continue
+        if all(source.kind == "function" for source in model.sources.values()):
+            continue  # generate_series and friends: combining them is the point
         reported: set[tuple[str, tuple[str, ...]]] = set()
         for agg in aggregates:
             if _is_distinct(agg):

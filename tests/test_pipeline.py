@@ -24,7 +24,7 @@ from sqlgami import (
 from sqlgami.engines import get_adapter
 from sqlgami.engines.base import assert_read_only
 
-from conftest import make_db
+from conftest import make_db, schema_of
 
 GOOD = (
     "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id "
@@ -54,6 +54,12 @@ def test_default_mode_is_dry_with_a_connection(scorer):
     assert report.verdict.value == "uncertain"
     assert report.confidence.calibrated is False
     assert report.plan
+
+
+def test_engine_version_is_reported(scorer):
+    version = scorer.score(GOOD).signals["engine_version"]
+    assert version and version[0].isdigit()
+    assert "engine_version" not in scorer.explain(GOOD).signals
 
 
 def test_static_mode_never_plans_or_runs(scorer):
@@ -313,20 +319,24 @@ def test_introspection_reads_keys_and_views(engine, db):
     assert view.is_view and "order_totals" in view.definition
     assert catalog.resolve("ORDERS") is orders
     assert catalog.resolve("nope") is None
-    assert "main.orders" in catalog.table_names() and "main.big_customers" in catalog.table_names()
+    schema = schema_of(engine, db)
+    assert f"{schema}.orders" in catalog.table_names() and f"{schema}.big_customers" in catalog.table_names()
 
 
-def test_view_on_view_through_a_live_database(scorer):
+def test_view_on_view_through_a_live_database(scorer, engine, db):
+    schema = schema_of(engine, db)
     report = scorer.sample(
         "SELECT c.name, b.spend FROM big_customers b JOIN customers c ON c.id = b.cid ORDER BY b.spend DESC"
     )
     assert stages(report)["schema"] == "passed"
     assert not report.findings_at_least(Severity.MEDIUM), report.summary()
-    assert report.tables == ["main.customers", "main.items", "main.orders"]
-    assert set(report.signals["views_expanded"]) == {"main.big_customers", "main.order_totals"}
+    assert report.tables == [f"{schema}.customers", f"{schema}.items", f"{schema}.orders"]
+    assert set(report.signals["views_expanded"]) == {f"{schema}.big_customers", f"{schema}.order_totals"}
 
 
 def test_open_by_path_is_read_only(tmp_path, engine):
+    if engine == "postgres":
+        pytest.skip("file databases only")
     path = tmp_path / f"shop.{engine}"
     if engine == "sqlite":
         conn = sqlite3.connect(path)

@@ -339,6 +339,12 @@ def _database_stages(
         _not_run(report, ("dry_run", "sample"), "no database connection was supplied")
         return
 
+    try:
+        engine_version = adapter.version()
+    except Exception:
+        engine_version = None
+    if engine_version:
+        report.signals["engine_version"] = engine_version
     dry = adapter.dry_run(sql)
     elapsed = clock.lap()
     report.plan = dry.plan

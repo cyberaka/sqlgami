@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -16,7 +17,102 @@ from typing import Any, Iterable
 
 from .suite import DATA_DIR, Seed, Suite, SuiteError
 
-SUPPORTED = ("sqlite", "duckdb")
+# Postgres databases are built only when a server is named, for example a local container:
+#   SQLGAMI_BENCH_PG_DSN=postgresql://user:password@127.0.0.1:5440/postgres
+# One database is created per suite and seed, named sqlgami_bench_<suite>_<seed>.
+PG_DSN_ENV = "SQLGAMI_BENCH_PG_DSN"
+
+
+def pg_dsn() -> str | None:
+    return os.environ.get(PG_DSN_ENV) or os.environ.get("SQLGAMI_TEST_PG_DSN")
+
+
+class _Supported:
+    """Engines benchkit can build right now. Postgres counts only when a server is configured."""
+
+    def _engines(self) -> tuple[str, ...]:
+        return ("sqlite", "duckdb") + (("postgres",) if pg_dsn() else ())
+
+    def __contains__(self, engine: object) -> bool:
+        return engine in self._engines()
+
+    def __iter__(self):
+        return iter(self._engines())
+
+    def __repr__(self) -> str:
+        return repr(self._engines())
+
+
+SUPPORTED = _Supported()
+
+
+def why_unsupported(engine: str) -> str:
+    if engine == "postgres":
+        return f"no server configured; set {PG_DSN_ENV}"
+    return "benchkit has no builder for this engine yet"
+
+
+def pg_database(suite: Suite, seed: Seed) -> str:
+    return re.sub(r"[^a-z0-9_]", "_", f"sqlgami_bench_{suite.name}_{seed.label}".lower())
+
+
+def _pg_connect(database: str | None = None, read_only: bool = False) -> Any:
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    dsn = pg_dsn()
+    if not dsn:
+        raise SuiteError(f"set {PG_DSN_ENV} to build or use Postgres bench databases")
+    params = conninfo_to_dict(dsn)
+    if database:
+        params["dbname"] = database
+    options = "-c TimeZone=UTC" + (" -c default_transaction_read_only=on" if read_only else "")
+    params["options"] = options
+    try:
+        return psycopg.connect(make_conninfo(**params), autocommit=True)
+    except psycopg.Error as exc:
+        raise SuiteError(f"could not connect to Postgres database {database or ''}: {exc}") from exc
+
+
+def _build_postgres(suite: Suite, seed: Seed, statements: list[str], order: list[str], by_key: dict[str, Path], force: bool) -> str:
+    name = pg_database(suite, seed)
+    admin = _pg_connect()
+    try:
+        exists = admin.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone()
+        if exists and not force:
+            marker = None
+            try:
+                check = _pg_connect(name)
+                marker = check.execute("SELECT to_regclass('public.sqlgami_bench_complete')").fetchone()[0]
+                check.close()
+            except SuiteError:
+                marker = None
+            if marker:
+                return name
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        admin.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        admin.close()
+    conn = _pg_connect(name)
+    try:
+        for statement in statements:
+            try:
+                conn.execute(statement)
+            except Exception as exc:
+                raise SuiteError(f"postgres schema statement failed: {exc}\n{statement[:200]}") from exc
+        # Foreign keys are switched off for the load so that deliberately orphaned rows survive.
+        conn.execute("SET session_replication_role = replica")
+        with conn.transaction():
+            for key in order:
+                _load_file(conn, "postgres", by_key[key])
+        conn.execute("SET session_replication_role = DEFAULT")
+        for schema, view in conn.execute("SELECT schemaname, matviewname FROM pg_matviews").fetchall():
+            conn.execute(f'REFRESH MATERIALIZED VIEW "{schema}"."{view}"')
+        conn.execute("ANALYZE")
+        conn.execute("CREATE TABLE public.sqlgami_bench_complete (built_at timestamptz DEFAULT now())")
+    finally:
+        conn.close()
+    return name
 
 
 def data_dir(suite: Suite, seed: Seed) -> Path:
@@ -24,6 +120,7 @@ def data_dir(suite: Suite, seed: Seed) -> Path:
 
 
 def db_path(suite: Suite, engine: str, seed: Seed) -> Path:
+    """Where a file database lives. (Postgres databases live on the server; see ``pg_database``.)"""
     suffix = {"sqlite": "sqlite", "duckdb": "duckdb"}[engine]
     return DATA_DIR / suite.name / "db" / f"{seed.label}.{suffix}"
 
@@ -194,13 +291,19 @@ def build(suite: Suite, engine: str, seed: Seed, force: bool = False) -> Path:
     """Create and fill the database for one engine and seed. Returns its path."""
     if engine not in SUPPORTED:
         raise SuiteError(f"benchkit cannot build {engine} databases yet")
+    schema_file = suite.schema_file(engine)
+    if not schema_file.exists():
+        raise SuiteError(f"{suite.name} has no schema for {engine}")
+    if engine == "postgres":
+        rows_dir = generate(suite, seed)
+        statements = split_statements(schema_file.read_text(encoding="utf-8"))
+        by_key = {_stem_key(engine, p.stem): p for p in sorted(rows_dir.glob("*.jsonl"))}
+        order = _insert_order(sorted(by_key), _references(statements, engine))
+        return Path(_build_postgres(suite, seed, statements, order, by_key, force))
     path = db_path(suite, engine, seed)
     if path.exists() and not force:
         return path
     rows_dir = generate(suite, seed)
-    schema_file = suite.schema_file(engine)
-    if not schema_file.exists():
-        raise SuiteError(f"{suite.name} has no schema for {engine}")
     statements = split_statements(schema_file.read_text(encoding="utf-8"))
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".partial")
@@ -271,11 +374,16 @@ def _load_file(conn: Any, engine: str, path: Path) -> None:
                 columns.append(key)
     target = table_name(engine, path.stem)
     names = ", ".join('"' + c.replace('"', '""') + '"' for c in columns)
-    marks = ", ".join("?" for _ in columns)
+    mark = "%s" if engine == "postgres" else "?"
+    marks = ", ".join(mark for _ in columns)
     statement = f"INSERT INTO {target} ({names}) VALUES ({marks})"
     values = [[_encode(row.get(c), engine) for c in columns] for row in rows]
     try:
-        conn.executemany(statement, values)
+        if engine == "postgres":
+            with conn.cursor() as cursor:
+                cursor.executemany(statement, values)
+        else:
+            conn.executemany(statement, values)
     except Exception as exc:
         raise SuiteError(f"loading {path.name} into {engine} failed: {exc}") from exc
 
@@ -283,6 +391,8 @@ def _load_file(conn: Any, engine: str, path: Path) -> None:
 def connect(suite: Suite, engine: str, seed: Seed) -> Any:
     """A read-only connection to a built database, with the session pinned to UTC."""
     path = build(suite, engine, seed)
+    if engine == "postgres":
+        return _pg_connect(str(path), read_only=True)
     if engine == "sqlite":
         return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     import duckdb

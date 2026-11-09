@@ -46,6 +46,7 @@ class Validation:
     engines: list[str]
     problems: list[Problem] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
+    skipped_engines: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -62,6 +63,8 @@ class Validation:
             + ", ".join(f"{v} {k}" for k, v in self.counts.items())
             + f"; {errors} error(s), {warnings} warning(s)"
         ]
+        for engine, why in self.skipped_engines.items():
+            lines.append(f"skipped: {engine} ({why})")
         lines.extend(str(p) for p in self.problems)
         return "\n".join(lines)
 
@@ -120,14 +123,28 @@ class Runner:
         self._conns.clear()
 
 
-def validate(suite: Suite, engines: list[str] | None = None, check_determinism: bool = True) -> Validation:
-    engines = [e for e in (engines or suite.engines) if e in build.SUPPORTED and e in suite.engines]
+def validate(
+    suite: Suite,
+    engines: list[str] | None = None,
+    check_determinism: bool = True,
+    strict: bool = False,
+) -> Validation:
+    wanted = [e for e in (engines or suite.engines) if e in suite.engines]
+    engines = [e for e in wanted if e in build.SUPPORTED]
     result = Validation(suite.name, engines)
+    result.skipped_engines = {e: build.why_unsupported(e) for e in wanted if e not in engines}
     result.counts = {
         "questions": len(suite.questions),
         "bugs": len(suite.bugs),
         "equivalents": len(suite.equivalents),
     }
+    # A suite with nothing in it validates trivially, which says nothing about sqlgami.
+    for kind, count in result.counts.items():
+        if count == 0:
+            result.add(ERROR if strict else WARNING, f"{kind}.jsonl", f"the suite has no {kind}")
+    for engine, why in result.skipped_engines.items():
+        if strict:
+            result.add(ERROR, engine, f"declared in suite.yaml but not checked: {why}")
 
     profiles = [s.profile for s in suite.seeds]
     if profiles.count("clean") < 3:

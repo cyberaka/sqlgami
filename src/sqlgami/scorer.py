@@ -60,8 +60,8 @@ class Scorer:
         options: Options | None = None,
         glossary: str | dict | None = None,
     ) -> None:
-        self.engine = engine.lower()
-        self.dialect = dialect_for(self.engine)
+        self.dialect = dialect_for(engine.lower())
+        self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
         self._owns_adapter = False
         if db is None:
             self.adapter: Adapter | None = None

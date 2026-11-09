@@ -251,6 +251,11 @@ class SQLiteAdapter(Adapter):
             self._row_counts[key] = count
         return self._row_counts[key]
 
+    def version(self) -> str | None:
+        # The SQLite library in this process, which decides what syntax is accepted
+        # (RIGHT and FULL JOIN, for example, need 3.39 or later).
+        return sqlite3.sqlite_version
+
     def close(self) -> None:
         if self._owned:
             try:

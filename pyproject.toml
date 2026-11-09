@@ -16,7 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 duckdb = ["duckdb>=1.1"]
-postgres = ["psycopg[binary]>=3.2"]
+postgres = [
+    "psycopg[binary]>=3.2",
+]
 bigquery = ["google-cloud-bigquery>=3.25"]
 
 [project.scripts]
@@ -28,6 +30,7 @@ dev = [
     "duckdb>=1.1",
     "pyyaml>=6.0.3",
     "pytz>=2026.6",
+    "psycopg[binary]>=3.2",
 ]
 
 [tool.hatch.build.targets.wheel]

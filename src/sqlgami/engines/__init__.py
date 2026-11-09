@@ -13,7 +13,10 @@ __all__ = ["Adapter", "DryRunResult", "ExecutionResult", "assert_read_only", "ge
 _ADAPTERS = {
     "sqlite": ("sqlgami.engines.sqlite", "SQLiteAdapter", "sqlite"),
     "duckdb": ("sqlgami.engines.duckdb", "DuckDBAdapter", "duckdb"),
+    "postgres": ("sqlgami.engines.postgres", "PostgresAdapter", "postgres"),
 }
+
+_ALIASES = {"postgresql": "postgres", "pg": "postgres"}
 
 # Engines sqlgami can analyse statically even where no adapter exists yet.
 _DIALECTS = {
@@ -21,6 +24,7 @@ _DIALECTS = {
     "duckdb": "duckdb",
     "postgres": "postgres",
     "postgresql": "postgres",
+    "pg": "postgres",
     "bigquery": "bigquery",
 }
 
@@ -39,6 +43,7 @@ def dialect_for(engine: str) -> str:
 def get_adapter(engine: str, db: Any) -> Adapter:
     """Build the adapter for ``engine`` around a connection or a path."""
     key = engine.lower()
+    key = _ALIASES.get(key, key)
     if key not in _ADAPTERS:
         raise ConfigurationError(
             f"no database adapter for {engine!r} yet; adapters exist for {', '.join(SUPPORTED)}. "

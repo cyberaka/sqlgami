@@ -197,3 +197,22 @@ def test_label_candidates(suite, tmp_path):
     assert labels[0]["per_seed"] == {"clean-1": True, "clean-2": True, "clean-3": True, "nasty-42": True}
     assert labels[2]["runs"] is False and labels[1]["runs"] is True
     assert "no gold" in labels[3]["note"] and "unknown question" in labels[4]["note"]
+
+
+def test_validator_warns_on_an_empty_suite_and_names_skipped_engines(tmp_path, monkeypatch):
+    monkeypatch.delenv("SQLGAMI_BENCH_PG_DSN", raising=False)
+    monkeypatch.delenv("SQLGAMI_TEST_PG_DSN", raising=False)
+
+    def mutate(root):
+        for name in ("questions", "bugs", "equivalents"):
+            (root / f"{name}.jsonl").write_text("")
+        config = (root / "suite.yaml").read_text().replace("engines: [sqlite, duckdb]", "engines: [sqlite, duckdb, postgres]")
+        (root / "suite.yaml").write_text(config)
+
+    broken = load_suite(_broken_copy(tmp_path, mutate))
+    lenient = validate.validate(broken, check_determinism=False)
+    assert lenient.ok
+    text = lenient.summary()
+    assert "the suite has no questions" in text and "skipped: postgres" in text
+    strict = validate.validate(broken, check_determinism=False, strict=True)
+    assert not strict.ok

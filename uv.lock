@@ -1043,6 +1043,7 @@ postgres = [
 dev = [
     { name = "duckdb", version = "1.5.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "duckdb", version = "2.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "psycopg", extra = ["binary"] },
     { name = "pytest" },
     { name = "pytz" },
     { name = "pyyaml" },
@@ -1060,6 +1061,7 @@ provides-extras = ["duckdb", "postgres", "bigquery"]
 [package.metadata.requires-dev]
 dev = [
     { name = "duckdb", specifier = ">=1.1" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytz", specifier = ">=2026.6" },
     { name = "pyyaml", specifier = ">=6.0.3" },

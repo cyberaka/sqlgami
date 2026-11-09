@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+import os
 import sqlite3
 
 import pytest
@@ -78,7 +80,13 @@ INSERT INTO payments VALUES
 INSERT INTO profiles VALUES (1, 'first'), (2, 'second'), (3, 'third');
 """
 
-ENGINES = ("sqlite", "duckdb")
+# Postgres tests run only when a test server is named, for example a local container:
+#   SQLGAMI_TEST_PG_DSN=postgresql://user:password@127.0.0.1:5440/dbname
+PG_DSN = os.environ.get("SQLGAMI_TEST_PG_DSN")
+
+ENGINES = ("sqlite", "duckdb") + (("postgres",) if PG_DSN else ())
+
+_pg_schema_counter = itertools.count()
 
 
 def make_sqlite() -> sqlite3.Connection:
@@ -95,8 +103,41 @@ def make_duckdb():
     return conn
 
 
+def make_postgres():
+    """A connection whose search_path is a fresh schema holding the shop tables."""
+    psycopg = pytest.importorskip("psycopg")
+    conn = psycopg.connect(PG_DSN, autocommit=True)
+    schema = f"sqlgami_test_{os.getpid()}_{next(_pg_schema_counter)}"
+    conn.execute(f'CREATE SCHEMA "{schema}"')
+    conn.execute(f'SET search_path = "{schema}"')
+    conn.execute(SHOP_DDL)
+    conn.execute(SHOP_DATA)
+    conn.execute("ANALYZE")
+    conn.sqlgami_test_schema = schema
+    return conn
+
+
+def drop_db(conn) -> None:
+    schema = getattr(conn, "sqlgami_test_schema", None)
+    try:
+        if schema:
+            conn.rollback()
+            conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    finally:
+        conn.close()
+
+
+def schema_of(engine: str, conn) -> str:
+    """The schema the shop tables live in for this connection."""
+    return getattr(conn, "sqlgami_test_schema", "main")
+
+
 def make_db(engine: str):
-    return make_sqlite() if engine == "sqlite" else make_duckdb()
+    if engine == "sqlite":
+        return make_sqlite()
+    if engine == "duckdb":
+        return make_duckdb()
+    return make_postgres()
 
 
 @pytest.fixture(params=ENGINES)
@@ -108,7 +149,7 @@ def engine(request) -> str:
 def db(engine):
     conn = make_db(engine)
     yield conn
-    conn.close()
+    drop_db(conn)
 
 
 @pytest.fixture
