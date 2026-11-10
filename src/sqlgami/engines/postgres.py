@@ -227,7 +227,7 @@ class PostgresAdapter(Adapter):
     # -------------------------------------------------------------- adapter
 
     def dry_run(self, sql: str) -> DryRunResult:
-        assert_read_only(sql, self.dialect, self.allowed_functions)
+        assert_read_only(sql, self.dialect, self.allowed_functions, allowed_tables=self.allowed_tables)
         try:
             _, rows, _ = self._guarded(f"EXPLAIN (FORMAT JSON) {sql}", None, 15.0)
         except self._psycopg.Error as exc:
@@ -236,7 +236,7 @@ class PostgresAdapter(Adapter):
         return DryRunResult(ok=True, plan=plan)
 
     def execute(self, sql: str, *, max_rows: int, timeout_s: float) -> ExecutionResult:
-        assert_read_only(sql, self.dialect, self.allowed_functions)
+        assert_read_only(sql, self.dialect, self.allowed_functions, allowed_tables=self.allowed_tables)
         started = time.perf_counter()
         try:
             columns, rows, truncated = self._guarded(sql, max_rows, timeout_s)

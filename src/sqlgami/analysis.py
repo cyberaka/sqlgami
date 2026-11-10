@@ -150,6 +150,7 @@ def analyse(
     catalog: Catalog | None,
     dialect: str | None = None,
     allowed_functions: Iterable[str] = (),
+    allowed_tables: Iterable[str] = (),
 ) -> Analysis:
     """Parse ``sql`` and, if a catalog is given, resolve it against the schema."""
     dialect = dialect or (catalog.dialect if catalog is not None else None)
@@ -205,7 +206,7 @@ def analyse(
         analysis.kind = OTHER
         return analysis
     analysis.kind = QUERY
-    review = safety.review(sql, tree, dialect, allowed_functions)
+    review = safety.review(sql, tree, dialect, allowed_functions, allowed_tables)
     analysis.unsafe_functions = review.refused
     analysis.unlisted_functions = review.unlisted
 

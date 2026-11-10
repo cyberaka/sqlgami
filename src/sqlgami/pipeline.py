@@ -80,6 +80,8 @@ class Options:
     # calls anything outside the engine's built-in allow-list and this list is not sent to
     # the database.
     allowed_functions: tuple[str, ...] = ()
+    # System relations (catalogues, settings, sessions) a statement may read. None by default.
+    allowed_tables: tuple[str, ...] = ()
     # Wall-clock bound on everything one report sends to the database, all stages together.
     # Statements that would overrun it are cut short or not sent; the report says so.
     budget_s: float = 120.0
@@ -225,7 +227,7 @@ def _run(
         report.signals["template_parameters"] = [p.to_dict() for p in prepared.params]
     if prepared.disabled_filters:
         report.signals["disabled_filters"] = list(prepared.disabled_filters)
-    analysis = A.analyse(prepared.analysis_sql, catalog, dialect, options.allowed_functions)
+    analysis = A.analyse(prepared.analysis_sql, catalog, dialect, options.allowed_functions, options.allowed_tables)
     if analysis.script_statements:
         report.signals["script"] = {
             "statements": list(analysis.script_statements),
@@ -386,7 +388,12 @@ def _run(
         _stage(report, "static", StageStatus.NOT_RUN, "needs a resolved schema")
 
     blocked: str | None = None
-    if prepared.executable_sql is None:
+    if analysis.unknown_tables and catalog is not None:
+        # The catalogue is the allow-list of what a query may read: a table outside it is not
+        # sent, whatever the database would say about it.
+        names = ", ".join(dict.fromkeys(item["name"] for item in analysis.unknown_tables))
+        blocked = f"the query reads {names}, which the catalogue does not list"
+    elif prepared.executable_sql is None:
         missing = ", ".join(p.name for p in prepared.params if not p.supplied)
         blocked = f"the SQL is a template and no value was given for: {missing}"
     elif analysis.script_statements and not getattr(adapter, "supports_scripts", False):
@@ -520,6 +527,7 @@ def _consistency_stage(
         budget_s=options.consistency_budget_s,
         ordered=options.consistency_ordered,
         allowed_functions=options.allowed_functions,
+        allowed_tables=options.allowed_tables,
     )
     report.signals["consistency"] = outcome.to_dict()
     if not outcome.ran:

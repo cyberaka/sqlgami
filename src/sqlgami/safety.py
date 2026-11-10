@@ -211,11 +211,64 @@ def review_text(sql: str, tree: exp.Expression, dialect: str | None, allowed: It
     return FunctionReview(sorted(refused), [])
 
 
-def review(sql: str, tree: exp.Expression, dialect: str | None, allowed: Iterable[str] = ()) -> FunctionReview:
-    """Both nets together: the parsed tree, then the text."""
+# Relations an engine keeps about itself: settings, credentials, sessions, file paths. A query
+# that reads them is not answering a business question, so they are refused unless the host
+# names them in ``allowed_tables``. Matched on the lower-cased schema and name.
+_SYSTEM_TABLE_SCHEMAS = {
+    "postgres": {"pg_catalog", "information_schema", "pg_toast"},
+    "duckdb": {"information_schema", "pg_catalog", "system"},
+    "sqlite": set(),
+    "bigquery": {"information_schema"},
+}
+_SYSTEM_TABLE_PREFIXES = {
+    "postgres": ("pg_",),
+    "duckdb": ("duckdb_", "pragma_", "sqlite_", "pg_"),
+    "sqlite": ("sqlite_", "pragma_"),
+    "bigquery": (),
+}
+
+
+def review_tables(tree: exp.Expression, dialect: str | None, allowed: Iterable[str] = ()) -> list[str]:
+    """Reads of the engine's own catalogues and settings, written as plain table names.
+
+    ``SELECT * FROM pragma_database_list`` (SQLite, no parentheses) or ``FROM pg_shadow``
+    (Postgres) are table reads to the parser, so the function gate never sees them. Names the
+    statement itself defines (CTEs, aliases) are not tables. ``allowed`` may hold ``name``,
+    ``schema.name`` or ``schema.*``.
+    """
+    schemas = _SYSTEM_TABLE_SCHEMAS.get(dialect or "")
+    prefixes = _SYSTEM_TABLE_PREFIXES.get(dialect or "", ())
+    if schemas is None and not prefixes:
+        return []
+    host = {name.lower() for name in allowed}
+    defined = _defined_names(tree)
+    refused: set[str] = set()
+    for node in tree.find_all(exp.Table):
+        if not isinstance(node.this, exp.Identifier):
+            continue
+        name = node.name.lower()
+        schema = (node.db or "").lower()
+        if not schema and name in defined:
+            continue
+        full = f"{schema}.{name}" if schema else name
+        if full in host or name in host or (schema and f"{schema}.*" in host):
+            continue
+        if (schema and schemas and schema in schemas) or name.startswith(prefixes) or name.upper() == "INFORMATION_SCHEMA" or schema.upper() == "INFORMATION_SCHEMA":
+            refused.add(f"table {full}")
+    return sorted(refused)
+
+
+def review(
+    sql: str,
+    tree: exp.Expression,
+    dialect: str | None,
+    allowed: Iterable[str] = (),
+    allowed_tables: Iterable[str] = (),
+) -> FunctionReview:
+    """Both nets together: the parsed tree, then the text; and the tables the statement reads."""
     first = review_functions(tree, dialect, allowed)
     second = review_text(sql, tree, dialect, allowed)
-    refused = sorted(set(first.refused) | set(second.refused))
+    refused = sorted(set(first.refused) | set(second.refused) | set(review_tables(tree, dialect, allowed_tables)))
     unlisted = sorted((set(first.unlisted) | set(second.unlisted)) - set(refused))
     # "schema.name" from the tree and bare "name" from the text are one call.
     qualified = {name.rsplit(".", 1)[-1] for name in unlisted if "." in name}

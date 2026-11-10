@@ -55,6 +55,7 @@ def assert_read_only(
     allowed_functions: Iterable[str] = (),
     *,
     check_functions: bool = True,
+    allowed_tables: Iterable[str] = (),
 ) -> exp.Expression:
     """Parse ``sql`` and refuse it unless it is exactly one read-only query.
 
@@ -75,7 +76,7 @@ def assert_read_only(
         what = ", ".join(kinds) or type(statement).__name__.upper()
         raise UnsafeQueryError(f"only read-only queries are sent to the database (found {what})")
     if check_functions:
-        review = safety.review(sql, statement, dialect, allowed_functions)
+        review = safety.review(sql, statement, dialect, allowed_functions, allowed_tables)
         if review.refused:
             raise UnsafeQueryError(
                 f"the query reaches outside the tables ({', '.join(review.refused)}), so it was not sent"
@@ -96,6 +97,8 @@ class Adapter(abc.ABC):
     cost_unit: str = "rows"
     # Functions the host vouches for, beyond the engine's built-in allow-list.
     allowed_functions: frozenset[str] = frozenset()
+    # System relations (catalogues, settings) the host allows a query to read.
+    allowed_tables: frozenset[str] = frozenset()
 
     @abc.abstractmethod
     def loader(self) -> CatalogLoader:

@@ -56,6 +56,10 @@ class Scorer:
         Names of functions you vouch for as read-only, such as your own user-defined
         functions. sqlgami sends a statement to the database only if every function it
         calls is a built-in known to be read-only or is named here.
+    allowed_tables:
+        System relations a query may read (``"information_schema.*"``,
+        ``"pg_catalog.pg_tables"``, ``"pragma_table_info"``). By default a statement that
+        reads the engine's own catalogues or settings is refused and not sent.
     glossary:
         Business definitions, as text or a ``{term: meaning}`` dictionary. Values
         named here are not reported as filters the question never asked for.
@@ -85,6 +89,7 @@ class Scorer:
         default_project: str | None = None,
         generator: Any = None,
         allowed_functions: Sequence[str] | None = None,
+        allowed_tables: Sequence[str] | None = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -132,6 +137,12 @@ class Scorer:
         if self.adapter is not None and self.options.allowed_functions:
             self.adapter.allowed_functions = frozenset(self.adapter.allowed_functions) | {
                 name.lower() for name in self.options.allowed_functions
+            }
+        if allowed_tables:
+            self.options.allowed_tables = tuple(dict.fromkeys([*self.options.allowed_tables, *allowed_tables]))
+        if self.adapter is not None and self.options.allowed_tables:
+            self.adapter.allowed_tables = frozenset(self.adapter.allowed_tables) | {
+                name.lower() for name in self.options.allowed_tables
             }
         if cost_ceiling is not None:
             self.options.cost_ceiling = cost_ceiling

@@ -400,6 +400,14 @@ one from bench suites and prints its error on questions held out of the fit.
     Vouch for it with `Scorer(..., allowed_functions=["my_schema.my_function"])`.
   - `SELECT ... FOR UPDATE` and `FOR SHARE` are refused, as are DuckDB file
     paths written where a table name belongs.
+- Which tables a query may read is an allow-list too. With a catalog (DDL or a
+  connection), a table the catalog does not list is `unknown_table` and the
+  statement is not sent. The engine's own relations are refused by default
+  whatever the catalog says: `pg_catalog.*`, `information_schema.*`, bare
+  `pg_*` names, `sqlite_*` and `pragma_*` (with or without parentheses),
+  `duckdb_*`; a read of `pg_shadow` or `pragma_database_list` is
+  `external_access`. Vouch for what you need with
+  `Scorer(..., allowed_tables=["information_schema.*"])`.
 - These checks rest on parsing the statement. They are a strong filter, not a
   sandbox: give sqlgami a database role that can only read what it should.
 - A database opened by path is opened read-only. On a SQLite connection you

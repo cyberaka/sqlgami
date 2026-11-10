@@ -348,6 +348,7 @@ def run(
     budget_s: float | None = 30.0,
     ordered: bool = False,
     allowed_functions: Iterable[str] = (),
+    allowed_tables: Iterable[str] = (),
 ) -> Outcome:
     """Run the candidate and each alternative, and compare what they return.
 
@@ -407,7 +408,7 @@ def run(
         outcome.reason = f"the candidate returns more than {max_rows} rows, too many to compare"
         return outcome
     try:
-        own_analysis = A.analyse(sql, catalog, dialect, allowed_functions)
+        own_analysis = A.analyse(sql, catalog, dialect, allowed_functions, allowed_tables)
     except Exception:
         own_analysis = None
     if own_analysis is not None:
@@ -430,7 +431,7 @@ def run(
         entry = Alternative(sql=alt, status=INVALID, source=source)
         outcome.alternatives.append(entry)
         try:
-            checked = A.analyse(alt, catalog, dialect, allowed_functions)
+            checked = A.analyse(alt, catalog, dialect, allowed_functions, allowed_tables)
         except Exception as exc:  # an alternative must never break scoring
             entry.detail = f"could not be analysed: {type(exc).__name__}"
             continue

@@ -11,9 +11,9 @@ These tests are STATIC: they call analysis.analyse() and read the verdict. Nothi
 executed. The one runtime check (pragma disclosure) uses a throwaway temp database with no
 sensitive content, purely to show the parser-differential is real and not theoretical.
 
-CONTAINED / SAFE are regression guards that pass today. BYPASS cases are confirmed holes,
-marked xfail(strict): each turns green when the gate closes it, at which point move it to
-CONTAINED. ``pytest --runxfail`` shows them as plain failures.
+CONTAINED / SAFE are regression guards. The BYPASS cases were confirmed holes when this file
+was written (plain table reads the function gate never saw); the table gate in
+safety.review_tables closes them, and they are kept here as regression guards.
 """
 
 from __future__ import annotations
@@ -116,25 +116,21 @@ BYPASS_CATALOG = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="table-valued pragma without parentheses bypasses the function gate and discloses internals (e.g. the database file path)")
 @pytest.mark.parametrize("label,sql,dialect", BYPASS_PRAGMA, ids=[c[0] for c in BYPASS_PRAGMA])
 def test_bare_table_valued_pragma_is_not_sent(label, sql, dialect):
     assert not _sent(sql, dialect)
 
 
-@pytest.mark.xfail(strict=True, reason="a plain read of a credential- or settings-bearing system catalog is sent; the gate does not restrict which tables are read")
 @pytest.mark.parametrize("label,sql,dialect", BYPASS_CATALOG, ids=[c[0] for c in BYPASS_CATALOG])
 def test_system_catalog_disclosure_is_not_sent(label, sql, dialect):
     assert not _sent(sql, dialect)
 
 
 def test_bare_pragma_really_discloses_the_file_path():
-    """Runtime proof the pragma bypass is real, on a throwaway temp database with no secrets.
-
-    The gate passes `SELECT * FROM pragma_database_list`, and SQLite runs it and returns the
-    database's path on disk. xfail until the gate refuses the bare table-valued pragma.
-    """
-    assert _sent("SELECT * FROM pragma_database_list", "sqlite"), "precondition: gate sends it today"
+    """Why the bare pragma matters, shown on a throwaway temp database with no secrets: SQLite
+    runs `SELECT * FROM pragma_database_list` and returns the database's path on disk. The gate
+    now refuses the statement, so it never gets that far through sqlgami."""
+    assert not _sent("SELECT * FROM pragma_database_list", "sqlite")
     tmp = tempfile.mkdtemp()
     path = os.path.join(tmp, "throwaway.db")
     try:
@@ -143,10 +139,52 @@ def test_bare_pragma_really_discloses_the_file_path():
         rows = conn.execute("SELECT * FROM pragma_database_list").fetchall()
         conn.close()
         disclosed_path = any(path in str(cell) for row in rows for cell in row)
-        if _sent("SELECT * FROM pragma_database_list", "sqlite") and disclosed_path:
-            pytest.xfail("gate sends the bare pragma and it discloses the on-disk path")
-        assert not disclosed_path
+        assert disclosed_path  # the engine does disclose it; sqlgami's gate is what stands in the way
     finally:
         import shutil
 
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---- the table gate must not over-block ordinary reads, and the host can opt in. ----
+TABLE_SAFE = [
+    ("cte_named_like_a_catalog", "WITH pg_x AS (SELECT 1 AS a) SELECT a FROM pg_x", "postgres"),
+    ("alias_named_like_a_catalog", "SELECT pg_t.a FROM t AS pg_t", "postgres"),
+    ("plain_schema", "SELECT a FROM hr.employee_dim", "postgres"),
+    ("sqlite_plain", "SELECT a FROM hr_employee_dim", "sqlite"),
+]
+
+
+@pytest.mark.parametrize("label,sql,dialect", TABLE_SAFE, ids=[c[0] for c in TABLE_SAFE])
+def test_table_gate_leaves_ordinary_reads_alone(label, sql, dialect):
+    assert _sent(sql, dialect)
+
+
+def test_host_can_allow_a_system_relation():
+    allowed = ["information_schema.*", "pragma_table_info"]
+    for sql, dialect in (
+        ("SELECT table_name FROM information_schema.tables", "postgres"),
+        ("SELECT * FROM pragma_table_info('t')", "sqlite"),
+    ):
+        a = A.analyse(sql, None, dialect, allowed_tables=allowed, allowed_functions=["pragma_table_info"])
+        assert a.kind == A.QUERY and not a.unsafe_functions, (sql, a.unsafe_functions)
+    # the opt-in is narrow
+    a = A.analyse("SELECT passwd FROM pg_shadow", None, "postgres", allowed_tables=allowed)
+    assert a.unsafe_functions == ["table pg_shadow"]
+
+
+def test_a_table_outside_the_catalogue_is_not_sent():
+    from sqlgami import Scorer
+
+    with Scorer("sqlite", catalog="CREATE TABLE t (a INTEGER)") as scorer:
+        report = scorer.explain("SELECT a FROM elsewhere", "a")
+    assert report.has("unknown_table") and report.score <= 0.1
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (a INTEGER)")
+    conn.execute("CREATE TABLE elsewhere (a INTEGER)")
+    with Scorer("sqlite", db=conn, catalog="CREATE TABLE t (a INTEGER)") as scorer:
+        report = scorer.sample("SELECT a FROM elsewhere", "a")
+    assert report.stage("dry_run").status.value == "skipped" and "catalogue" in (report.stage("dry_run").detail or "")
+    assert report.stage("sample").status.value != "passed"
