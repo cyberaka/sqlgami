@@ -1,6 +1,6 @@
 # ADR 0001: the term catalogue — business terms as host metadata
 
-Status: proposed (awaiting the owner's OK). No code yet.
+Status: accepted by the owner; built (14dd2f6). Authoring format amended below.
 
 ## Context
 
@@ -181,3 +181,30 @@ what the prose already says; the auditor checks the two agree. Terms with no rep
 2. For held-out waves the suite's author writes the bench `terms:` sections from the frozen
    prose **before** the wave is scored, the auditor checks them against the prose, and nobody
    edits them after scoring.
+
+## Amendment: the spreadsheet is the authoring format (owner direction)
+
+Terms and KPIs are written by business stakeholders and data engineers in Excel. The primary
+format is one `.xlsx` with the sheets below, or the same sheets as CSV files in a folder (the
+form to keep in git, since it diffs). YAML and the Python API carry the same rows for advanced
+use only. Everything is text: ids keep leading zeros, nothing is read as a date, Excel's quote
+escaping is handled by the CSV reader.
+
+| sheet | columns |
+|---|---|
+| Terms | `term` · `phrases` (separated by `;`, with `{n}`/`{m}` for a number and `{param}` for a template parameter) · `kind` (`filter` · `formula` · `window` · `source` · `chain`) · `table` · `sql` (the data-level meaning; blank = documentation only) · `nulls` (`include` · `exclude` · `separate`) · `description` |
+| KPIs | `kpi` · `phrases` · `formula` (over `{terms}`, `{inputs}` or plain SQL) · `format` (e.g. `integer floor`, `integer bp`) · `reference_sql` (for the compile step) · `description` |
+| Examples | `id` · `question` · `params` · `correct_sql` · `expected_result` · `dataset` — training data for the compile step |
+| Parameters | `name` · `type` (`integer`, `text`, …, or `input` for a formula input) · `example_values` |
+
+The minimum entry is a name, phrases, and one of a predicate (`filter`), an expression
+(`formula`) or a reference query (KPI `reference_sql`); windows, NULL rules, sources,
+dialect overrides (`sql_<dialect>` columns) and formats are optional sugar. A row with a blank
+`sql` is documentation only: matched, so the term is not "undefined", but not enforced, and the
+score is capped as for an undefined term.
+
+The validator (`Catalogue.load(path).validate()`) reports problems by sheet, row and column
+("Terms row 14: sql: does not parse: …", "KPIs row 3: formula: unknown term 'leaver'"); a
+catalogue with problems is refused by `Scorer(terms=...)`. `openpyxl` is an optional extra
+(`sqlgami[excel]`); CSV needs nothing. The HR example ships as `examples/terms/hr/*.csv` and
+`examples/terms/hr_terms.xlsx`. `sqlgami compile` (ADR 0002) will read the workbook.
