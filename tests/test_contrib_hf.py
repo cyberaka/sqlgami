@@ -118,3 +118,35 @@ def test_core_import_does_not_load_the_network_client():
     code = "import sys, sqlgami; print('sqlgami.contrib.hf' in sys.modules, 'urllib.request' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split()
     assert out == ["False", "False"]
+
+
+def test_prober_in_full_mode(engine, db):
+    import json
+
+    from sqlgami.contrib.hf import HFProber
+
+    reply = json.dumps(
+        [
+            {"probe_sql": "SELECT SUM(total) FROM orders", "relation": "equals_sum", "column": "spend", "description": "all orders"},
+            {"probe_sql": "SELECT COUNT(DISTINCT customer_id) FROM orders", "relation": "equals_row_count", "column": None, "description": "customers"},
+            {"probe_sql": "DELETE FROM orders", "relation": "equals_row_count"},
+        ]
+    )
+    seen = []
+
+    def transport(url, headers, payload, timeout):
+        seen.append(payload)
+        return {"choices": [{"message": {"content": "Here:\n```json\n" + reply + "\n```"}}]}
+
+    prober = HFProber("google/gemma-3-27b-it", dialect=engine, token=TOKEN, transport=transport)
+    right = "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name"
+    fanned = right.replace("GROUP BY", "JOIN items i ON i.order_id = o.id GROUP BY")
+    with Scorer(engine, db=db, prober=prober) as scorer:
+        backed = scorer.score(right, "Total order value per customer", mode="full")
+        caught = scorer.score(fanned, "Total order value per customer", mode="full")
+    assert backed.signals["reconciliation"]["satisfied"] == 2 and backed.signals["reconciliation"]["violated"] == 0
+    assert caught.has("reconciliation_mismatch")
+    statuses = [p["status"] for p in caught.signals["reconciliation"]["probes"]]
+    assert "invalid" in statuses  # the DELETE never ran
+    assert seen[0]["model"] == "google/gemma-3-27b-it" and "spend" in seen[0]["messages"][1]["content"]
+    assert {p["source"] for p in backed.signals["reconciliation"]["probes"]} == {"google/gemma-3-27b-it"}

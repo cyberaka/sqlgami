@@ -48,6 +48,11 @@ class Scorer:
         access control. See :class:`sqlgami.RequiredPredicate`.
     snapshot_columns:
         ``{table: column}`` for periodic snapshot tables.
+    prober:
+        Optional function ``(question, schema_text, glossary, answer_columns) -> list of probe
+        specs`` that proposes simple anchor queries with a declared relation to the result
+        (see :mod:`sqlgami.reconcile`), used in ``full`` mode. Probe specs can also be passed
+        directly as ``score(..., probes=[...])``.
     generator:
         Optional function ``(question, schema_text, glossary, k) -> list of SQL`` that
         writes alternative queries for the consistency stage in ``full`` mode. sqlgami
@@ -56,6 +61,11 @@ class Scorer:
         Names of functions you vouch for as read-only, such as your own user-defined
         functions. sqlgami sends a statement to the database only if every function it
         calls is a built-in known to be read-only or is named here.
+    source_weights:
+        ``{source name: share of right answers}`` for the generators behind the consistency
+        stage, measured on a labelled set of your own. Agreement from a source right less than
+        half the time earns little; two sources right most of the time that agree with each
+        other against the query make a HIGH finding. Names match by substring.
     allowed_tables:
         System relations a query may read (``"information_schema.*"``,
         ``"pg_catalog.pg_tables"``, ``"pragma_table_info"``). By default a statement that
@@ -90,6 +100,8 @@ class Scorer:
         generator: Any = None,
         allowed_functions: Sequence[str] | None = None,
         allowed_tables: Sequence[str] | None = None,
+        source_weights: dict[str, float] | None = None,
+        prober: Any = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -140,6 +152,8 @@ class Scorer:
             }
         if allowed_tables:
             self.options.allowed_tables = tuple(dict.fromkeys([*self.options.allowed_tables, *allowed_tables]))
+        if source_weights:
+            self.options.source_weights = {**self.options.source_weights, **source_weights}
         if self.adapter is not None and self.options.allowed_tables:
             self.adapter.allowed_tables = frozenset(self.adapter.allowed_tables) | {
                 name.lower() for name in self.options.allowed_tables
@@ -156,6 +170,7 @@ class Scorer:
             calibrator = IsotonicCalibrator.load(calibrator)
         self.calibrator = calibrator
         self.generator = generator
+        self.prober = prober
         if isinstance(glossary, dict):
             glossary = "\n".join(f"{term}: {meaning}" for term, meaning in glossary.items())
         self.glossary: str | None = glossary
@@ -183,6 +198,7 @@ class Scorer:
         cost_ceiling: float | None = None,
         params: dict[str, Any] | None = None,
         alternatives: Sequence[str] | None = None,
+        probes: Sequence[Any] | None = None,
     ) -> Report:
         """Check ``sql`` and return a :class:`Report`.
 
@@ -221,6 +237,8 @@ class Scorer:
             params=params,
             alternatives=alternatives,
             generator=self.generator,
+            probes=probes,
+            prober=self.prober,
         )
 
     def explain(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None) -> Report:
@@ -238,6 +256,7 @@ class Scorer:
         cost_ceiling: float | None = None,
         params: dict[str, Any] | None = None,
         alternatives: Sequence[str] | None = None,
+        probes: Sequence[Any] | None = None,
     ) -> Report:
         """Also runs the query read-only, if its estimated cost is under the ceiling.
 
@@ -245,7 +264,7 @@ class Scorer:
         same question.
         """
         return self.score(
-            sql, question, mode="sample", cost_ceiling=cost_ceiling, params=params, alternatives=alternatives
+            sql, question, mode="sample", cost_ceiling=cost_ceiling, params=params, alternatives=alternatives, probes=probes
         )
 
     # ----------------------------------------------------------- lifecycle

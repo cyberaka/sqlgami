@@ -48,6 +48,14 @@ BONUS_ROWS_RETURNED = 0.15  # the query ran and returned something
 BONUS_CONSISTENT = (0.7, 1.2, 1.6)  # counted in distinct sources (models), not samples
 BONUS_SAME_SOURCE_REPEAT = 0.15
 BONUS_SPLIT_VOTE = 0.2
+# Anchor queries (reconciliation) that the result satisfies, none violated: one, several, or
+# several that two independent sources agreed on.
+BONUS_RECONCILED = (0.4, 0.6, 0.9)
+# With source weights (their known share of right answers) the agreement bonus is scaled by the
+# agreeing sources' average weight, and sources known to be wrong more often than not can
+# together add at most this much: a wrong query agreeing with a wrong alternative is common.
+BONUS_WEAK_AGREEMENT_CAP = 0.4
+WEAK_SOURCE = 0.5
 
 HALF_WIDTH = {"static": 0.20, "dry": 0.17, "sample": 0.12}
 
@@ -130,7 +138,18 @@ def _clean_bonus(report: Report, depth: str, analysed: bool) -> float:
     if report.signals.get("rows_returned"):
         bonus += BONUS_ROWS_RETURNED
     bonus += _consistency_bonus(report)
+    bonus += _reconciliation_bonus(report)
     return bonus
+
+
+def _reconciliation_bonus(report: Report) -> float:
+    signal = report.signals.get("reconciliation") or {}
+    satisfied, violated = signal.get("satisfied") or 0, signal.get("violated") or 0
+    if not satisfied or violated:
+        return 0.0
+    if signal.get("agreed_satisfied"):
+        return BONUS_RECONCILED[2]
+    return BONUS_RECONCILED[1] if satisfied >= 2 else BONUS_RECONCILED[0]
 
 
 def _consistency_bonus(report: Report) -> float:
@@ -145,6 +164,12 @@ def _consistency_bonus(report: Report) -> float:
     bonus = BONUS_CONSISTENT[min(agreeing, len(BONUS_CONSISTENT)) - 1]
     if agreeing == 1 and (signal.get("agreeing") or 0) >= 2:
         bonus += BONUS_SAME_SOURCE_REPEAT  # several samples of one source agree: a little more
+    if signal.get("weighted"):
+        weight = float(signal.get("agreeing_weight") or 0.0)
+        average = weight / agreeing
+        bonus *= min(1.0, average / 0.75)  # sources right three times in four earn the full bonus
+        if average < WEAK_SOURCE:
+            bonus = min(bonus, BONUS_WEAK_AGREEMENT_CAP)
     return bonus
 
 

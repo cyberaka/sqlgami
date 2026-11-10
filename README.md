@@ -75,8 +75,8 @@ INDEX`), a dictionary, or a `Catalog` object.
 |---|---|---|
 | `static` | parse, read-only check, schema resolution, static checks | schema lookups only, and only if you passed a connection |
 | `dry` | the above, plus the engine's own planner (`EXPLAIN`) | yes, without running the query |
-| `sample` | the above, plus one read-only run of the query and small probe queries that test findings against the data | yes |
-| `full` | the above, plus the consistency stage using a generator you supply | yes |
+| `sample` | the above, plus one read-only run of the query and small probe queries that test findings against the data; anchor probes you pass in | yes |
+| `full` | the above, plus the consistency and reconciliation stages using a generator or prober you supply | yes |
 
 The default is `dry` when you pass a connection and `static` when you do not.
 `scorer.explain()`, `scorer.dry_run()` and `scorer.sample()` pick a mode
@@ -283,6 +283,32 @@ How results are compared:
 The value of this signal depends on how independent and how capable the
 alternatives are. Samples from the same model and prompt as the candidate tend
 to share its mistakes; a different model, or a different prompt, is better.
+If you know how often each source is right (measure it on labelled queries of
+your own), say so with `Scorer(..., source_weights={"gemma": 0.2,
+"opus": 0.8})` (names match by substring). Then agreement is credited in
+proportion to the agreeing sources' reliability, sources right less than half
+the time can add little together, a lone disagreement from such a source is
+only a note, and two reliable sources that agree with each other against the
+query are a HIGH finding whatever the `consistency_role`.
+
+### Reconciliation: anchor queries with a declared relation
+
+The consistency stage asks "does another query give the same answer?". The
+reconciliation stage asks something a weaker model can get right: "what
+simple number must this answer agree with?" A probe is a one-value query plus
+a relation to the candidate's result, for example `SELECT SUM(total) FROM
+orders` with `equals_sum` over the answer's `spend` column, or `SELECT
+COUNT(DISTINCT customer_id) FROM orders` with `equals_row_count`. Relations:
+`equals_row_count`, `equals_sum`, `equals_count_distinct`, `equals_value`
+(one answer row chosen by a `filter`), `equals_max`, `equals_min`,
+`upper_bound`, `lower_bound`. Pass probes directly as
+`scorer.sample(sql, question, probes=[...])`, or give the scorer a
+`prober(question, schema_text, glossary, answer_columns)` that proposes them
+in `full` mode (`sqlgami.contrib.hf.HFProber` is one). Probes are held to the
+same gate as everything else and are never run if they are not single
+read-only queries over known tables and functions. An anchor the result
+violates is `reconciliation_mismatch` (MEDIUM; HIGH when two independent
+sources proposed the same anchor value); anchors it satisfies add support.
 
 sqlgami ships no model and calls none on its own. `sqlgami.contrib.hf` is an
 optional generator for Hugging Face Inference, using only the standard

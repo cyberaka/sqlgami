@@ -236,3 +236,39 @@ def test_combined_generators_tag_their_alternatives(engine, db):
     signal = consistency(report)
     assert signal["sources"] == 2 and signal["agreeing_sources"] == 2 and signal["comparable"] == 3
     assert {a["source"] for a in signal["alternatives"]} == {"a", "b"}
+
+
+# ------------------------------------------------------------------ source weights
+
+
+def test_two_reliable_sources_agreeing_against_the_candidate_is_a_verdict(engine, db):
+    weights = {"strong-a": 0.85, "strong-b": 0.8, "weak": 0.25}
+    with Scorer(engine, db=db, source_weights=weights) as scorer:
+        caught = scorer.sample(ONLY_PAID, QUESTION, alternatives=[(RIGHT, "strong-a"), (SAME_1, "strong-b")])
+        finding = next(f for f in caught.findings if f.code == "consistency_disagreement")
+        assert finding.severity == Severity.HIGH and caught.score <= 0.4
+        # the same two queries from weak sources: a doubt, as before, not a verdict
+        doubted = scorer.sample(ONLY_PAID, QUESTION, alternatives=[(RIGHT, "weak"), (SAME_1, "weak-2")])
+        finding = next(f for f in doubted.findings if f.code == "consistency_disagreement")
+        assert finding.severity == Severity.MEDIUM
+
+
+def test_one_weak_source_disagreeing_costs_little(engine, db):
+    with Scorer(engine, db=db, source_weights={"weak": 0.25}) as scorer:
+        alone = scorer.sample(RIGHT, QUESTION)
+        doubted = scorer.sample(RIGHT, QUESTION, alternatives=[(ONLY_PAID, "weak")])
+        finding = next(f for f in doubted.findings if f.code == "consistency_disagreement")
+        assert finding.severity == Severity.LOW
+        assert alone.score - doubted.score < 0.08
+    with Scorer(engine, db=db) as unweighted:
+        plain = unweighted.sample(RIGHT, QUESTION, alternatives=[(ONLY_PAID, "weak")])
+        assert next(f for f in plain.findings if f.code == "consistency_disagreement").severity == Severity.MEDIUM
+
+
+def test_agreement_from_weak_sources_is_capped(engine, db):
+    with Scorer(engine, db=db, source_weights={"strong": 0.85, "weak": 0.25}) as scorer:
+        alone = scorer.sample(RIGHT, QUESTION)
+        weak = scorer.sample(RIGHT, QUESTION, alternatives=[(SAME_1, "weak-1"), (SAME_2, "weak-2")])
+        strong = scorer.sample(RIGHT, QUESTION, alternatives=[(SAME_1, "strong-1"), (SAME_2, "strong-2")])
+        assert alone.score < weak.score < strong.score
+        assert weak.score - alone.score < 0.12, (alone.score, weak.score)

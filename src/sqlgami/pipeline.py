@@ -11,13 +11,13 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from sqlglot import exp
 
 from . import analysis as A
-from . import consistency
+from . import consistency, reconcile
 from . import template
 from . import types as T
 from .catalog import Catalog, Table
@@ -71,6 +71,9 @@ class Options:
     # "judge": two or more independent sources agreeing against the candidate is strong
     # evidence against it. Only for alternatives at least as capable as the candidate's author.
     consistency_role: str = "confirm"
+    # Reconciliation stage: anchor queries with a declared relation to the result.
+    reconcile_max_probes: int = 12
+    reconcile_budget_s: float = 30.0
     # The most time the whole consistency stage may take, however many alternatives there are.
     consistency_budget_s: float = 30.0
     # True when the question asks for rows in a particular order: an alternative that returns
@@ -82,6 +85,11 @@ class Options:
     allowed_functions: tuple[str, ...] = ()
     # System relations (catalogues, settings, sessions) a statement may read. None by default.
     allowed_tables: tuple[str, ...] = ()
+    # How reliable each alternative-writing source is, as its share of right answers measured on
+    # a labelled set (0..1), keyed by source name or a distinctive part of it. Weighs the
+    # consistency stage: agreement from weak sources earns little, two reliable sources agreeing
+    # against the candidate is a verdict.
+    source_weights: dict[str, float] = field(default_factory=dict)
     # Wall-clock bound on everything one report sends to the database, all stages together.
     # Statements that would overrun it are cut short or not sent; the report says so.
     budget_s: float = 120.0
@@ -165,10 +173,12 @@ def run(
     params: dict[str, Any] | None = None,
     alternatives: Sequence[str] | None = None,
     generator: Any = None,
+    probes: Sequence[Any] | None = None,
+    prober: Any = None,
 ) -> Report:
     options = options or Options()
     report = Report(engine=engine, mode=mode, sql=sql, question=question)
-    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator)
+    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober)
     report.findings = _dedupe(report.findings)
     scored = score_report(report, calibrator)
     report.confidence = scored.confidence
@@ -216,6 +226,8 @@ def _run(
     params: dict[str, Any] | None = None,
     alternatives: Sequence[str] | None = None,
     generator: Any = None,
+    probes: Sequence[Any] | None = None,
+    prober: Any = None,
 ) -> None:
     clock = _Clock()
     bounded: _Bounded | None = _Bounded(adapter, options.budget_s) if adapter is not None else None
@@ -239,12 +251,12 @@ def _run(
             Finding("parse_error", Severity.ERROR, f"The statement does not parse: {analysis.parse_error}", "parse")
         )
         _stage(report, "parse", StageStatus.FAILED, analysis.parse_error, elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "question"), "the statement does not parse")
+        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "reconciliation", "question"), "the statement does not parse")
         return
     if analysis.kind == A.EMPTY:
         report.findings.append(Finding("empty_statement", Severity.ERROR, "There is no statement to check.", "parse"))
         _stage(report, "parse", StageStatus.FAILED, "empty input", elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "question"), "empty input")
+        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "reconciliation", "question"), "empty input")
         return
     _stage(report, "parse", StageStatus.PASSED, None, elapsed)
 
@@ -287,7 +299,7 @@ def _run(
     if problem is not None:
         report.findings.append(problem)
         _stage(report, "statement", StageStatus.FAILED, problem.message, clock.lap())
-        _not_run(report, ("schema", "static", "dry_run", "sample", "consistency", "question"), "the statement is not a plain read-only query")
+        _not_run(report, ("schema", "static", "dry_run", "sample", "consistency", "reconciliation", "question"), "the statement is not a plain read-only query")
         return
     _stage(report, "statement", StageStatus.PASSED, None, clock.lap())
     report.findings.extend(prepared.findings)
@@ -418,7 +430,7 @@ def _run(
             )
             _stage(report, "dry_run", StageStatus.FAILED, f"function {names} does not exist")
             _stage(report, "sample", StageStatus.NOT_RUN, "the query cannot run")
-            _not_run(report, ("consistency", "question"), "the query cannot run")
+            _not_run(report, ("consistency", "reconciliation", "question"), "the query cannot run")
             return
         names = ", ".join(analysis.unlisted_functions)
         blocked = f"the query calls a function sqlgami does not know to be read-only ({names})"
@@ -455,6 +467,7 @@ def _run(
         generator,
         params,
     )
+    _reconcile_stage(report, prepared.executable_sql or sql, dialect, mode, catalog, adapter, question, glossary, options, probes, prober, params)
     _question_stage(report, ctx, adapter, question, glossary, mode, options)
     if bounded is not None and bounded.spent:
         report.findings.append(
@@ -528,6 +541,7 @@ def _consistency_stage(
         ordered=options.consistency_ordered,
         allowed_functions=options.allowed_functions,
         allowed_tables=options.allowed_tables,
+        weights=options.source_weights or None,
     )
     report.signals["consistency"] = outcome.to_dict()
     if not outcome.ran:
@@ -539,6 +553,78 @@ def _consistency_stage(
         name,
         StageStatus.PASSED,
         f"{outcome.agreeing} of {outcome.comparable} alternative(s) return the same result",
+        clock.lap(),
+    )
+
+
+def _reconcile_stage(
+    report: Report,
+    sql: str,
+    dialect: str,
+    mode: str,
+    catalog: Catalog | None,
+    adapter: Adapter | None,
+    question: str | None,
+    glossary: str | None,
+    options: Options,
+    probes: Sequence[Any] | None,
+    prober: Any,
+    params: dict[str, Any] | None,
+) -> None:
+    """Check the result against simple anchor queries that carry a declared relation to it."""
+    name = "reconciliation"
+    if probes is None and (prober is None or mode != "full"):
+        why = "no anchor queries were supplied" if mode == "full" else f"mode is {mode}"
+        _stage(report, name, StageStatus.NOT_RUN, why)
+        return
+    sample = report.stage("sample")
+    if adapter is None or sample is None or sample.status != StageStatus.PASSED:
+        _stage(report, name, StageStatus.NOT_RUN, "the query itself was not run")
+        return
+    clock = _Clock()
+    base = adapter.execute(sql, max_rows=options.consistency_rows, timeout_s=options.timeout_s)
+    if not base.ok or base.truncated:
+        _stage(report, name, StageStatus.SKIPPED, "the result could not be fetched whole for comparison", clock.lap())
+        return
+    if probes is None:
+        if not question or not question.strip():
+            _stage(report, name, StageStatus.NOT_RUN, "a prober needs the question")
+            return
+        try:
+            schema_text = consistency.describe_schema(catalog, report.tables) if catalog is not None else ""
+            probes = list(prober(question, schema_text, glossary, list(base.columns)) or [])
+        except Exception as exc:  # the prober is the host's code
+            logger.debug("prober failed", exc_info=True)
+            _stage(report, name, StageStatus.SKIPPED, f"the prober failed ({type(exc).__name__})", clock.lap())
+            return
+    specs = reconcile.parse_specs(probes)
+    if params:
+        for spec in specs:
+            spec.sql = template.prepare(spec.sql, dialect, params).executable_sql or spec.sql
+    outcome = reconcile.run(
+        base.columns,
+        base.rows,
+        specs,
+        dialect=dialect,
+        catalog=catalog,
+        adapter=adapter,
+        timeout_s=options.timeout_s,
+        budget_s=options.reconcile_budget_s,
+        cost_ceiling=options.cost_ceiling,
+        max_probes=options.reconcile_max_probes,
+        allowed_functions=options.allowed_functions,
+        allowed_tables=options.allowed_tables,
+    )
+    report.signals["reconciliation"] = outcome.to_dict()
+    if not outcome.ran:
+        _stage(report, name, StageStatus.SKIPPED, outcome.reason, clock.lap())
+        return
+    report.findings.extend(outcome.findings)
+    _stage(
+        report,
+        name,
+        StageStatus.PASSED,
+        f"{outcome.satisfied} anchor(s) agree with the result, {outcome.violated} disagree",
         clock.lap(),
     )
 

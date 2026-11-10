@@ -50,6 +50,7 @@ def test_default_mode_is_dry_with_a_connection(scorer):
         "dry_run": "passed",
         "sample": "not_run",
         "consistency": "not_run",
+        "reconciliation": "not_run",
         "question": "not_run",
     }
     assert report.verdict.value == "uncertain"
@@ -419,7 +420,7 @@ def test_report_is_json_and_keeps_its_shape(scorer):
         assert finding["severity"] in {"error", "high", "medium", "low", "info"}
     for stage in data["stages"]:
         assert set(stage) == {"name", "status", "detail", "duration_ms"}
-    assert [s["name"] for s in data["stages"]] == ["parse", "statement", "schema", "static", "dry_run", "sample", "consistency", "question"]
+    assert [s["name"] for s in data["stages"]] == ["parse", "statement", "schema", "static", "dry_run", "sample", "consistency", "reconciliation", "question"]
     assert data == report.to_dict() or json.loads(json.dumps(report.to_dict())) == data
 
 

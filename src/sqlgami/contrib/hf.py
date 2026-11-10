@@ -177,3 +177,73 @@ class HFGenerator:
             if sql and sql not in [f[0] for f in found]:
                 found.append((sql, self.model))  # tagged, so samples of one model count as one voice
         return found
+
+
+_PROBE_RELATIONS = """
+equals_row_count      -> the value equals the number of rows the answer has
+equals_sum            -> the value equals SUM(<column>) over the answer's rows (or those matching "filter")
+equals_count_distinct -> the value equals COUNT(DISTINCT <column>) over the answer's rows
+equals_value          -> the value equals <column> in the single answer row matching "filter"
+equals_max / equals_min -> the value equals the largest / smallest <column> in the answer
+upper_bound / lower_bound -> every <column> in the answer is <= / >= the value
+""".strip()
+
+
+class HFProber:
+    """Asks a model for simple anchor queries with a declared relation to the answer. Usable as
+    ``Scorer(prober=...)``. Same model rules and token handling as :class:`HFGenerator`."""
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        dialect: str,
+        token: str | None = None,
+        endpoint: str = DEFAULT_ENDPOINT,
+        max_tokens: int = 1200,
+        timeout_s: float = 60.0,
+        transport: Callable[..., dict[str, Any]] | None = None,
+        probes: int = 3,
+    ) -> None:
+        self.model = check_model(model)
+        self.dialect = dialect
+        self.endpoint = endpoint
+        self.max_tokens = max_tokens
+        self.timeout_s = timeout_s
+        self.probes = probes
+        self._transport = transport or _post
+        self._token = token or os.environ.get("HF_TOKEN") or ""
+        if not self._token:
+            raise ConfigurationError("no access token: set HF_TOKEN in the environment or pass token=")
+
+    def __call__(self, question: str, schema: str, glossary: str | None, columns: Sequence[str]) -> list[Any]:
+        system = (
+            f"You check another analyst's {self.dialect} SQL answer to a question by writing SIMPLE anchor queries. "
+            "Each anchor query must return exactly one value (one row, one column) and come with the relation that "
+            "value must have to the answer. Prefer totals over all rows, row counts, and distinct counts of key "
+            "columns. Use only the tables and columns in the schema. Do not rewrite the whole question. "
+            f"Reply with a JSON array only, {self.probes} items at most, each an object with keys "
+            '"probe_sql", "relation", "column" (an answer column name, or null for equals_row_count), '
+            '"filter" (an object {answer column: value} selecting answer rows, or null) and "description".\n'
+            "Relations:\n" + _PROBE_RELATIONS
+        )
+        parts = [f"Schema:\n{schema}"]
+        if glossary:
+            parts.append(f"Definitions:\n{glossary}")
+        parts.append(f"Question: {question}")
+        parts.append("The answer's columns, in order: " + ", ".join(columns))
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}],
+            "max_tokens": self.max_tokens,
+            "temperature": 0.0,
+        }
+        headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
+        reply = self._transport(self.endpoint, headers, payload, self.timeout_s)
+        try:
+            text = reply["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise GeneratorError("the model provider returned an unexpected reply") from None
+        from ..reconcile import extract_json, parse_specs
+
+        return parse_specs(extract_json(text if isinstance(text, str) else ""), source=self.model)

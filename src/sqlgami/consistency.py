@@ -23,7 +23,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Callable, Iterable, Sequence
+from typing import Mapping, Any, Callable, Iterable, Sequence
 
 from sqlglot import exp
 
@@ -81,6 +81,12 @@ class Outcome:
     sources: int = 0
     agreeing_sources: int = 0
     largest_other_cluster_sources: int = 0
+    # The same votes weighted by how reliable each source is known to be (see ``weights`` in
+    # :func:`run`): the summed weight of the sources agreeing with the candidate, and of the
+    # largest group of sources agreeing with one another against it.
+    agreeing_weight: float = 0.0
+    largest_other_cluster_weight: float = 0.0
+    weighted: bool = False  # whether any source had a declared weight
     findings: list[Finding] = field(default_factory=list)
 
     @property
@@ -96,6 +102,9 @@ class Outcome:
             "sources": self.sources,
             "agreeing_sources": self.agreeing_sources,
             "largest_disagreeing_cluster_sources": self.largest_other_cluster_sources,
+            "agreeing_weight": round(self.agreeing_weight, 3),
+            "largest_disagreeing_cluster_weight": round(self.largest_other_cluster_weight, 3),
+            "weighted": self.weighted,
             "alternatives": [a.to_dict() for a in self.alternatives],
         }
 
@@ -349,6 +358,7 @@ def run(
     ordered: bool = False,
     allowed_functions: Iterable[str] = (),
     allowed_tables: Iterable[str] = (),
+    weights: Mapping[str, float] | None = None,
 ) -> Outcome:
     """Run the candidate and each alternative, and compare what they return.
 
@@ -535,8 +545,51 @@ def run(
             winner = min(number for number, count in tally.items() if count == top)
             votes_against[winner] = votes_against.get(winner, 0) + 1
     outcome.largest_other_cluster_sources = max(votes_against.values(), default=0)
+    # Weighted votes: a source's weight is its known share of right answers (0..1); a source with
+    # no declared weight counts as DEFAULT_WEIGHT.
+    weights = weights or {}
+    outcome.weighted = any(source_weight(voice, weights) is not None for voice in tallies)
+    against_weight: dict[int, float] = {}
+    for voice, tally in tallies.items():
+        w = source_weight(voice, weights)
+        w = DEFAULT_WEIGHT if w is None else w
+        top = max(tally.values())
+        if tally.get(0, 0) == top:
+            outcome.agreeing_weight += w
+        else:
+            winner = min(number for number, count in tally.items() if count == top)
+            against_weight[winner] = against_weight.get(winner, 0.0) + w
+    outcome.largest_other_cluster_weight = max(against_weight.values(), default=0.0)
     outcome.findings = _judge(outcome, role)
     return outcome
+
+
+DEFAULT_WEIGHT = 0.5  # a source nothing is known about
+WEAK_SOURCE = 0.5  # below this a source's lone disagreement is a note, not a doubt
+STRONG_AGAINST = 1.2  # summed weight of sources agreeing with one another against the candidate that is a verdict
+
+
+def source_weight(voice: str, weights: Mapping[str, float]) -> float | None:
+    """The declared weight for a source name, matched exactly, then by substring either way
+    (``"gemma"`` covers ``"hf:google/gemma-3-27b-it"``), clipped to 0..1."""
+    if not weights:
+        return None
+    key = voice.lower()
+    found = None
+    if voice in weights:
+        found = weights[voice]
+    else:
+        for name, value in weights.items():
+            lowered = str(name).lower()
+            if lowered and (lowered in key or key in lowered):
+                found = value
+                break
+    if found is None:
+        return None
+    try:
+        return min(1.0, max(0.0, float(found)))
+    except (TypeError, ValueError):
+        return None
 
 
 def split_alternative(item: Any) -> tuple[str | None, str | None]:
@@ -588,7 +641,9 @@ def _difference(base: Sequence[Sequence[Any]], other: Sequence[Sequence[Any]]) -
 
 
 def _judge(outcome: Outcome, role: str = "confirm") -> list[Finding]:
-    """Turn the counts into findings. Votes are counted in distinct sources."""
+    """Turn the counts into findings. Votes are counted in distinct sources, and weighed by what
+    is known of each source: two reliable sources agreeing with each other against the candidate
+    is a verdict whatever the role; one unreliable source disagreeing is a note."""
     n, agree, rival = outcome.sources, outcome.agreeing_sources, outcome.largest_other_cluster_sources
     evidence = {
         "comparable": outcome.comparable,
@@ -596,9 +651,35 @@ def _judge(outcome: Outcome, role: str = "confirm") -> list[Finding]:
         "sources": n,
         "agreeing_sources": agree,
         "largest_disagreeing_cluster_sources": rival,
+        "agreeing_weight": round(outcome.agreeing_weight, 3),
+        "largest_disagreeing_cluster_weight": round(outcome.largest_other_cluster_weight, 3),
     }
     if agree and agree >= rival and agree * 2 >= n:
         return []  # the candidate is in the largest group: support, expressed through the score
+    if outcome.weighted and rival >= 2 and rival > agree and outcome.largest_other_cluster_weight >= STRONG_AGAINST:
+        return [
+            Finding(
+                "consistency_disagreement",
+                Severity.HIGH,
+                f"{rival} of {n} independent sources, each known to be right most of the time, wrote "
+                "queries for this question that return the same result as one another, and it is not "
+                "what this query returns" + (f" ({agree} agree with this query)." if agree else "."),
+                "consistency",
+                suggestion="Compare this query with the alternatives listed under signals.consistency.",
+                evidence={**evidence, "role": role, "verdict": "reliable sources agree against the candidate"},
+            )
+        ]
+    if outcome.weighted and n == 1 and outcome.largest_other_cluster_weight < WEAK_SOURCE and not agree:
+        return [
+            Finding(
+                "consistency_disagreement",
+                Severity.LOW,
+                "The one independently written query for this question returns a different result, but "
+                "its source is right less than half the time, so this is a note rather than a doubt.",
+                "consistency",
+                evidence=evidence,
+            )
+        ]
     if rival >= 2 and rival > agree:
         judged = role == "judge"
         return [
