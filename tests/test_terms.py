@@ -209,6 +209,27 @@ def test_point_window_and_frame():
 # ------------------------------------------------------------------ judging: source, KPIs, undefined
 
 
+def test_plural_and_singular_wordings_match_each_other_and_a_source_names_its_column():
+    cat = catalogue()
+    assert [m.name for m in cat.match("headcount over the trailing 3 period moving average window")] == ["headcount", "trailing_moving_average"]
+    assert [m.name for m in cat.match("the last 8 pay period range")] == ["last_n_pay_periods"]  # "pay periods" finds "pay period"
+    assert [m.name for m in cat.match("hired in 2024")] == ["hire_date"]
+    assert [m.name for m in cat.match("people whose hire_dt is in 2024")] == ["hire_date"]  # the source's own column
+
+
+def test_a_number_free_top_n_paraphrase_is_not_the_bare_headcount_question():
+    """A paraphrase of "top N nodes by headcount" with no wording the catalogue knows for the cut
+    must not share a pattern with "the active headcount of my organisation": it names columns the
+    bare question does not (lvl_3_id, headcount_rank), and those are part of the pattern."""
+    cat = load_terms(EXAMPLE)
+    bare = cat.pattern("What is the current active headcount of my organisation?")
+    ranked = cat.pattern("Rank the LVL_3 reporting nodes in my organisation by active headcount, keeping ties; return lvl_3_id, active_n and headcount_rank")
+    assert "top_dense_ranks" not in ranked and ranked != bare
+    assert {t for t in ranked if t.startswith("id:")} >= {"id:lvl_3_id", "id:active_n", "id:headcount_rank"}
+    with_top = cat.pattern("Return the top 3 dense-ranks of LVL_3 nodes in my organisation by active headcount: lvl_3_id, active_n, headcount_rank")
+    assert "top_dense_ranks" in with_top and with_top != bare
+
+
 def test_source_term_flags_a_column_read_from_the_wrong_table():
     question = "People in my organisation hired in the last 13 pay periods"
     wrong = (

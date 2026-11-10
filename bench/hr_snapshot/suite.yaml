@@ -50,11 +50,12 @@ seeds:
   - {seed: 46, profile: nasty}  # pooled person-id hierarchy; 12003 is a manager employee
   - {seed: 47, profile: nasty}  # pooled; fn-only on-leave person
   - {seed: 48, profile: nasty}  # pooled; rep-side on-leave people (lvl_3_id=12003)
+  - {seed: 49, profile: nasty}  # pooled; segment-shift trap under 12003 + 12293 (lvl_7_id_fn)
 
-seed_45_46_47_48_pooling:
+seed_45_46_47_48_49_pooling:
   rule: >
-    On seeds 45, 46, 47 and 48 ONLY, hierarchy node_ids are drawn from a shared pool of
-    person assoc_ids (the same assoc_ids that appear in hr.employee_dim). The reporting
+    On seeds 45, 46, 47, 48 and 49 ONLY, hierarchy node_ids are drawn from a shared pool
+    of person assoc_ids (the same assoc_ids that appear in hr.employee_dim). The reporting
     and functional chains both draw from this pool, so a single person_id can appear as
     a node in BOTH chains at potentially different levels. Employees' assoc_ids on
     these seeds span 12001..12300 (300 employees) instead of the 900001-based range
@@ -63,11 +64,11 @@ seed_45_46_47_48_pooling:
   default_manager_scope:
     manager_id: 12003
     placement: >
-      On seeds 45/46/47/48, 12003 is placed at reporting LVL_3 (big subtree) AND
+      On seeds 45/46/47/48/49, 12003 is placed at reporting LVL_3 (big subtree) AND
       functional LVL_7 (single leaf). Some associates match {manager_id}=12003 only via
       the _fn chain, exposing the missing-_fn-set trap.
   mid_year_churn: >
-    On seeds 45/46/47/48 under 12003's reporting subtree: 10 "long-term loyal", 10
+    On seeds 45/46/47/48/49 under 12003's reporting subtree: 10 "long-term loyal", 10
     "recent layoffs" (term ~100-200 days ago), and 10 mid-year hires at 346-355 days
     ago. The layoffs make year-over-year growth negative on seed 45; the mid-year
     hires span the 350-vs-364-day boundary.
@@ -89,6 +90,26 @@ seed_45_46_47_48_pooling:
     precedence bug variant where the status filter is AND-bound to the LAST disjunct
     (... OR lvl_7_id_fn = m AND status_cd != 'L'), letting these three rep-side
     on-leave people leak through on the rep disjuncts that admit all status codes.
+  seed_49_segment_shift: >
+    On seed 49 ONLY: engineered to exercise the q028 (year-over-year headcount growth
+    by segment) FULL-OUTER-vs-current-LEFT-JOIN-prior trap on BOTH {manager_id}=12003
+    and {manager_id}=12293. Under 12003's rep-chain scope (lvl_3_id = 12003) and under
+    12293's fn-chain leaf (lvl_7_id_fn = 12293) the segment distribution at the two
+    YoY anchors is extreme:
+      - Enterprise: 5 injected associates (hire ~3 years ago, term_dt = current_PPE - 30
+        days) are active on the authoritative period_seq=-26 snapshot and terminated by
+        period_seq=0. The segment goes from active_n=5 at prior to 0 at current; gold
+        q028 emits (Enterprise, 0, 5, growth_bp=-10000).
+      - Mid-Market: 5 injected associates (hire = current_PPE - 30 days, no term) have no
+        snapshot row at period_seq=-26 and are active at period_seq=0. The segment goes
+        from 0 to 5; gold emits (Mid-Market, 5, 0, growth_bp=NULL).
+      - SMB: every other in-scope associate (of 12003 or 12293) is forced to segment='SMB',
+        so SMB is the only natural-population segment under either manager's scope.
+    A gold form that starts from "segments present at current" and LEFT JOINs prior
+    (phi-4's q028b shape) DROPS the Enterprise row entirely because it isn't present at
+    current — the trap is invisible on any seed without this cohort. The authoritative gold
+    (segments drawn from the union of prior/current anchors) catches it, as does a
+    FULL OUTER JOIN auditor. All fixture-visible under either manager.
 
 row_budget:
   clean_seed_1: 35149    # 156 + 1112 + 250 + 33606 + 15 + 10 + 5 (ref)
@@ -98,6 +119,7 @@ row_budget:
   nasty_seed_46: 39772   # 156 + 373 + 301 + 39112 + 30 (ref totals)
   nasty_seed_47: 41439   # 156 + 371 + 301 + 40584 + 27 (ref totals: 12 + 10 + 5)
   nasty_seed_48: 40685   # 156 + 375 + 301 + 39826 + 27 (ref totals: 12 + 10 + 5)
+  nasty_seed_49: 39320   # 156 + 376 + 301 + 38460 + 27 (ref totals: 12 + 10 + 5)
   cap: 50000
 
 session:

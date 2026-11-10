@@ -120,6 +120,7 @@ Static checks, each reported as a finding with a severity:
 | `natural_join` | `NATURAL JOIN` |
 | `snapshot_grain` | a periodic snapshot table read without choosing which snapshots, so everything is counted once per snapshot |
 | `required_predicate` | a filter your policy requires on a table (see below) is missing or incomplete |
+| `access_filter_widened` | the policy's OR chain is present but carries a further branch on another column, admitting rows the policy's columns would not |
 | `or_chain_gap` | `LVL_2 = v OR LVL_3 = v OR LVL_5 = v` where the table also has `LVL_4` |
 | `partition_filter` | a partitioned table read with no partition filter, or only a non-constant one |
 | `duplicate_rows` | a plain listing that repeats rows because of a join |

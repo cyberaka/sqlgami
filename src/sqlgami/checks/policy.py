@@ -545,10 +545,11 @@ def required_predicate(ctx: CheckContext) -> Iterable[Finding]:
 def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severity, what: str) -> Iterable[Finding]:
     catalog = ctx.catalog
     # table -> for each SELECT, the rule columns its OR chains cover
-    chains: dict[str, list[set[str]]] = {}
+    chains: dict[str, list[tuple[set[str], exp.Expression]]] = {}
     for model in ctx.cache.models():
         per_table: dict[str, set[str]] = {}
-        for refs, same_value, _ in model.or_groups:
+        nodes: dict[str, exp.Expression] = {}
+        for refs, same_value, node in model.or_groups:
             if not same_value:
                 continue
             for ref in refs:
@@ -559,8 +560,9 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
                     base = _base_of(model, member)
                     if base is not None:
                         per_table.setdefault(base[0].qualified_name, set()).add(catalog.column_key(base[1]))
+                        nodes.setdefault(base[0].qualified_name, node)
         for name, columns in per_table.items():
-            chains.setdefault(name, []).append(columns)
+            chains.setdefault(name, []).append((columns, nodes[name]))
     for table in ctx.analysis.tables.values():
         if not rule.applies_to(table):
             continue
@@ -573,17 +575,35 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
         if not groups:
             continue
         satisfied = False
+        widened: tuple[set[str], exp.Expression] | None = None
         best: set[str] = set()
         required = groups[0]
-        for columns in chains.get(table.qualified_name, []):
+        for columns, node in chains.get(table.qualified_name, []):
             for group in groups:
                 hit = columns & group
                 if hit == group:
                     satisfied = True
+                    extra = columns - set().union(*groups)
+                    if extra and widened is None:
+                        widened = (extra, node)
                 # Report against the group the chain comes closest to.
                 if len(hit) > len(best) or (len(hit) == len(best) and len(group) < len(required)):
                     best, required = hit, group
         if satisfied:
+            if widened is not None:
+                extra, node = widened
+                yield ctx.finding(
+                    "access_filter_widened",
+                    Severity.MEDIUM,
+                    f"The access filter on {table.name} required by policy \"{what}\" is present, but the same OR chain "
+                    f"has a further branch on {_listed(extra)}, which admits rows the policy's columns alone would not "
+                    "(for example the manager's own row through assoc_id).",
+                    node,
+                    suggestion="Keep the access filter to the policy's columns; add other conditions with AND.",
+                    rule=rule.name,
+                    table=table.qualified_name,
+                    extra=sorted(extra),
+                )
             continue
         if not best:
             yield ctx.finding(
@@ -826,13 +846,20 @@ def snapshot_grain(ctx: CheckContext) -> Iterable[Finding]:
         if _distinct_entity_keys(ctx, miss):
             continue  # SELECT DISTINCT assoc_id FROM snapshot: one row per thing whatever the snapshots
         sure = declared.get(miss.table.qualified_name, False)
+        distinct_keys = _counts_distinct_entity_keys(ctx, miss)
         yield ctx.finding(
             "snapshot_grain",
-            Severity.HIGH if sure else Severity.MEDIUM,
+            Severity.MEDIUM if distinct_keys or not sure else Severity.HIGH,
             (
                 f"{source.label} holds one row per thing for every snapshot ({miss.column.name}). "
                 "The query neither fixes the snapshot, nor ties it to another date column, nor "
                 "groups by it, so every thing is counted once per snapshot."
+                + (
+                    " Here the only aggregate over it is a COUNT(DISTINCT key), which collapses the repeats; "
+                    "what remains is that a row from another snapshot (a restated status, say) can still pass the filters."
+                    if distinct_keys
+                    else ""
+                )
             ),
             suggestion=(
                 f"Pick the snapshot: for example {miss.alias}.{miss.column.name} = a period-end column, "
@@ -842,6 +869,41 @@ def snapshot_grain(ctx: CheckContext) -> Iterable[Finding]:
             alias=miss.alias,
             column=miss.column.name,
         )
+
+
+def _counts_distinct_entity_keys(ctx: CheckContext, miss: Miss) -> bool:
+    """Every aggregate that reads the snapshot table is a COUNT(DISTINCT ...) over its entity key
+    (the key less the snapshot date), and nothing else of the table is projected or grouped by:
+    the per-snapshot repeats cannot inflate the count."""
+    model = miss.model
+    aggregates = model.own_aggregates()
+    if not aggregates:
+        return False
+    snapshot = ctx.catalog.column_key(miss.column.name)
+    keys = [set(k) - {snapshot} for k in ctx.catalog.unique_key_sets(miss.table)]
+    if not keys:
+        return False
+    reads_alias = False
+    for agg in aggregates:
+        columns = [c for c in agg.find_all(exp.Column) if c.table == miss.alias]
+        if not columns:
+            continue
+        reads_alias = True
+        if not isinstance(agg, exp.Count) or not isinstance(agg.this, exp.Distinct):
+            return False
+        counted = {ctx.catalog.column_key(c.name) for c in columns}
+        if not any(counted <= key for key in keys):
+            return False
+    if not reads_alias:
+        return False
+    for projection in model.select.expressions:
+        for node in walk_own(projection):
+            if isinstance(node, exp.Column) and node.table == miss.alias and node.find_ancestor(exp.AggFunc) is None:
+                return False  # a value of the table at row grain: which snapshot's?
+    group = model.select.args.get("group")
+    if group is not None and any(isinstance(c, exp.Column) and c.table == miss.alias for e in group.expressions for c in e.find_all(exp.Column)):
+        return False
+    return True
 
 
 def _distinct_entity_keys(ctx: CheckContext, miss: Miss) -> bool:

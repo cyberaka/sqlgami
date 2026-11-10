@@ -205,3 +205,28 @@ def test_pattern_is_closed_over_what_the_catalogue_declares():
     assert cat.pattern("Paid revenue growth per customer") == ("paid", "revenue", "revenue_growth")  # contained phrases
     assert cat.pattern("Orders per customer") == ()
     assert [m.name for m in cat.match("Paid revenue growth per customer")] == ["revenue_growth"]  # judging still sees the longest phrase only
+    # the identifiers a question names are part of its pattern: "revenue per customer" and
+    # "revenue per customer, returning customer_id and region_code" are not the same question
+    assert cat.pattern("Total revenue per customer, returning customer_id and region_code") == ("id:customer_id", "id:region_code", "paid", "revenue")
+
+
+def test_a_paraphrase_naming_other_columns_is_not_routed_to_a_smaller_pattern(tmp_path):
+    """A question whose only catalogued words are "active headcount of my organisation" must not be
+    compared under a reference for that bare question when it also names lvl_3_id and a rank."""
+    (tmp_path / "schema.sql").write_text(SHOP_DDL)
+    terms = tmp_path / "terms"
+    terms.mkdir()
+    (terms / "Terms.csv").write_text("term,phrases,kind,table,sql,nulls,description\npaid,paid,filter,orders,status = 'paid',,\n")
+    (terms / "Examples.csv").write_text(
+        "id,question,params,correct_sql,expected_result,dataset\n"
+        'total,How many paid orders are there?,,"SELECT COUNT(*) FROM orders WHERE status = \'paid\'",,\n'
+    )
+    (tmp_path / "sqlgami.yaml").write_text("dialect: duckdb\nschema: schema.sql\nterms: terms\nfixtures: {seed: 2, profiles: [clean], values: {orders.status: [paid, open]}}\n")
+    compile_bundle(tmp_path / "sqlgami.yaml", tmp_path / "bundle")
+    with Scorer("duckdb", catalog=SHOP_DDL, bundle=tmp_path / "bundle") as scorer:
+        per_customer = "SELECT customer_id, COUNT(*) AS n FROM orders WHERE status = 'paid' GROUP BY customer_id"
+        report = scorer.explain(per_customer, "Paid orders by customer: return customer_id and the count")
+        assert report.stage("fixtures").status == StageStatus.NOT_RUN and "no reference" in (report.stage("fixtures").detail or "")
+        assert not report.has("fixture_mismatch")
+        bare = scorer.explain("SELECT COUNT(*) FROM orders WHERE status = 'paid'", "Count the paid orders")
+        assert bare.signals["fixtures"]["verdict"] == "match" and bare.signals["fixtures"]["matched_by"] == "pattern"

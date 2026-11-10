@@ -363,13 +363,29 @@ class Catalogue:
                 if required.lower() not in names:
                     names.add(required.lower())
                     pending.append(required.lower())
+        # The identifiers a question names (output columns, schema columns: period_seq, active_n,
+        # lvl_3_id) are exact tokens, not prose: two questions naming different ones are different
+        # questions even when they match the same terms, so they are part of the pattern.
+        covered = [m.span for m in self.match(question)]  # an identifier inside a matched phrase is that term
+        for token in re.finditer(r"\S+", text):
+            word = token.group(0)
+            if "_" in word and "{" not in word and not word.startswith("_") and not word.endswith("_"):
+                if not any(s <= token.start() and token.end() <= e for s, e in covered):
+                    names.add("id:" + word)
         return tuple(sorted(names))
 
     def _compiled(self) -> list[tuple[re.Pattern[str], str, str, str]]:
         if self._patterns is None:
             entries: list[tuple[re.Pattern[str], str, str, str, int]] = []
             for term in self.terms:
-                for phrase in term.phrases:
+                phrases = list(term.phrases)
+                if term.kind == "source" and term.sql.strip():
+                    # A source term names its column: a question that says "assoc_type" names the
+                    # source as surely as one that says "employment type" (declared, not guessed).
+                    column = term.sql.strip().rpartition(".")[2].lower()
+                    if re.fullmatch(r"\w+", column) and column not in {normalise(p).strip() for p in phrases}:
+                        phrases.append(column)
+                for phrase in phrases:
                     entries.append((_phrase_pattern(phrase), term.name, phrase, term.kind if term.enforceable else "", len(phrase)))
             for kpi in self.kpis:
                 for phrase in kpi.phrases:
@@ -434,8 +450,10 @@ def _phrase_pattern(phrase: str) -> re.Pattern[str]:
                 # or underscores, or a quoted/placeholder form — never plain prose
                 parts.append(rf"(?P<{name}>\{{\w+\}}|\d[\w.]*|[a-z]+\d[\w.]*|[a-z]*_[\w.]+)")
         else:
-            word = re.escape(token)
-            parts.append(word + ("(?:s|es)?" if not token.endswith("s") else "(?:es)?"))
+            # Singular and plural match each other: "pay periods" in the catalogue finds "pay
+            # period window" in a question, and "pay period" finds "pay periods".
+            stem = token[:-2] if token.endswith("es") and len(token) > 4 and token[-3] in "sxz" else token[:-1] if token.endswith("s") and len(token) > 3 else token
+            parts.append(re.escape(stem) + "(?:s|es)?")
     return re.compile(r"(?<=\s)" + r"\s+".join(parts) + r"(?=\s)")
 
 

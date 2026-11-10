@@ -221,10 +221,12 @@ def generate(seed: int, profile: str, out_dir: Path):
         })
 
     has_fn_gaps = (profile != "clean")
-    # Seeds 45/46/47/48 use pooled person-id hierarchy; seeds 1-3/42/43/44 are UNCHANGED.
-    use_pooled = seed in (45, 46, 47, 48)
+    # Seeds 45/46/47/48/49 use pooled person-id hierarchy; seeds 1-3/42/43/44 are UNCHANGED.
+    use_pooled = seed in (45, 46, 47, 48, 49)
     seed47_onleave_aid = None
     seed48_rep_onleave_aids = []
+    seed49_vanish_aids = []
+    seed49_new_aids = []
     if use_pooled:
         AID_BASE = 12001
         N_EMP = 300
@@ -375,6 +377,66 @@ def generate(seed: int, profile: str, out_dir: Path):
                     for e in employees:
                         if e["assoc_id"] == aid:
                             e["hire_dt"] = long_hire.isoformat()
+                            e["term_dt"] = None
+                            break
+
+            # Seed 49 ONLY: engineer a q028 FULL-OUTER-vs-current-LEFT-JOIN trap.
+            # Under 12003's scope (and also under 12293's fn-chain scope, since the
+            # injectees carry lvl_7_id_fn = 12293) force two segment extremes:
+            #   - Enterprise VANISHES: 5 associates active at period_seq -26,
+            #     terminated 30 days before current PPE → 0 active at period 0.
+            #   - Mid-Market is NEW: 5 associates hired 30 days before current
+            #     PPE → 0 at period -26 (no snapshot row yet), > 0 at period 0.
+            # Every other in-scope associate (of 12003 or 12293) is forced to
+            # segment='SMB' so the only Enterprise/Mid-Market contributors are the
+            # injectees. A gold that is `current LEFT JOIN prior` on segment
+            # misses the Enterprise disappearance; the FULL-OUTER / anchor-union
+            # gold q028 uses catches it (current_hc=0, prior_hc=5, growth_bp=-10000).
+            if seed == 49 and rep_under_12003:
+                reserved_49 = set(picks) | set(mid_year_aids) | set(fn_only)
+                def _in_scope_of(aid, target):
+                    asgn = assoc_assignments[aid]
+                    for L in range(2, 8):
+                        if asgn["rep_chain"].get(f"lvl_{L}_id") == target: return True
+                        if asgn["fn_chain"].get(f"lvl_{L}_id") == target: return True
+                    return False
+                KEY_MGR_49_FN = 12293
+                for a in assoc_assignments:
+                    if _in_scope_of(a, KEY_MGR) or _in_scope_of(a, KEY_MGR_49_FN):
+                        assoc_assignments[a]["segment"] = "SMB"
+                candidates_49 = sorted([
+                    a for a in assoc_assignments.keys()
+                    if a not in reserved_49
+                    and assoc_assignments[a]["rep_chain"].get("lvl_3_id") == KEY_MGR
+                ])
+                seed49_vanish_aids = candidates_49[:5]
+                seed49_new_aids = candidates_49[5:10]
+                # Put 12293 into the fn-chain leaf (lvl_7_id_fn) so 12293's scope
+                # also sees these injectees. 12293 may or may not be a real
+                # hierarchy_dim node; the gold scope test is direct column equality.
+                for aid in seed49_vanish_aids + seed49_new_aids:
+                    assoc_assignments[aid]["fn_chain"]["lvl_7_id"] = KEY_MGR_49_FN
+                # Enterprise VANISH: hire ~3y ago, term 30d before CURRENT_PPE.
+                v_hire = AS_OF - timedelta(days=365 * 3)
+                v_term = CURRENT_PPE - timedelta(days=30)
+                for aid in seed49_vanish_aids:
+                    assoc_assignments[aid]["segment"] = "Enterprise"
+                    assoc_assignments[aid]["hire_dt_d"] = v_hire
+                    assoc_assignments[aid]["term_dt_d"] = v_term
+                    for e in employees:
+                        if e["assoc_id"] == aid:
+                            e["hire_dt"] = v_hire.isoformat()
+                            e["term_dt"] = v_term.isoformat()
+                            break
+                # Mid-Market NEW: hire 30d before CURRENT_PPE, no term.
+                n_hire = CURRENT_PPE - timedelta(days=30)
+                for aid in seed49_new_aids:
+                    assoc_assignments[aid]["segment"] = "Mid-Market"
+                    assoc_assignments[aid]["hire_dt_d"] = n_hire
+                    assoc_assignments[aid]["term_dt_d"] = None
+                    for e in employees:
+                        if e["assoc_id"] == aid:
+                            e["hire_dt"] = n_hire.isoformat()
                             e["term_dt"] = None
                             break
 

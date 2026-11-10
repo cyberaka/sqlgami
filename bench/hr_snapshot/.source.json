@@ -3,9 +3,9 @@
   {
    "source": "/Users/cyberaka/shared/sqlgami-bench/hr_snapshot",
    "files": {
-    "suite.yaml": "96142a9d4cc1963584ccc72414c5ff96",
+    "suite.yaml": "5fc0cf844db81b360e5b8b4e0203ae5d",
     "glossary.yaml": "2563b87dd0b9429c47c575e8861c7f8a",
-    "generate.py": "903dbec6abe28ebc1df7057b300bd785",
+    "generate.py": "a5e95b5ccf763b9908b437e28d24a9dd",
     "terms/Examples.csv": "1fce79f4154c83d50d419733ad74eb38",
     "terms/KPIs.csv": "05645c9ea0b9540e07512b420d0ca6c1",
     "terms/Parameters.csv": "fe45a23afa3557cdd9f8c675bd54254c",

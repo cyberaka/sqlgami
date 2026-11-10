@@ -198,6 +198,13 @@ def test_snapshot_grain():
     declared = scorer(snapshot_columns={"EMP_SNAPSHOT_FACT": "SNAP_DT"})
     report = declared.explain(f"{base} WHERE f.SNAP_DT >= '2025-01-01' GROUP BY f.REGION_CD")
     assert next(f for f in report.findings if f.code == "snapshot_grain").severity == Severity.HIGH
+    # COUNT(DISTINCT entity key) with nothing else of the table at row grain: the repeats collapse,
+    # only a row from another snapshot passing the filters remains — a MEDIUM with that note
+    collapsed = declared.explain(f"SELECT COUNT(DISTINCT f.EMP_ID) FROM {FACT} f WHERE f.SNAP_DT >= '2025-01-01'")
+    finding = next(f for f in collapsed.findings if f.code == "snapshot_grain")
+    assert finding.severity == Severity.MEDIUM and "COUNT(DISTINCT key)" in finding.message
+    # grouping by one of its own columns reopens the question (which snapshot's region?)
+    assert next(f for f in report.findings if f.code == "snapshot_grain").severity == Severity.HIGH
     assert report.score <= 0.4
 
 
@@ -650,6 +657,22 @@ def test_or_chain_against_a_column_pinned_to_the_parameter():
     assert finding.severity == Severity.HIGH and "leaves out" in finding.message
     unpinned = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s JOIN hierarchy_dim h ON {chain}", "headcount under a manager")
     assert unpinned.has("required_predicate")  # h.node_id is not pinned to anything: no access filter
+
+
+def test_an_or_chain_branch_outside_the_policy_columns_widens_the_access_filter():
+    """... OR s.assoc_id = {manager_id}: the chain covers the policy, and a further branch admits rows
+    the policy's columns would not (the manager's own row). A doubt, not a verdict."""
+    ddl = HIER_DDL
+    levels = [f"lvl_{n}_id" for n in range(2, 8)] + [f"lvl_{n}_id_fn" for n in range(2, 8)]
+    rule = {"name": "hierarchy_access", "tables": ["snap"], "match": "or_chain", "columns": levels}
+    sc = Scorer("duckdb", catalog=ddl, required_predicates=[rule])
+    chain = " OR ".join(f"s.{c} = {{manager_id}}" for c in levels)
+    clean = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s WHERE ({chain})", "headcount under a manager", params={"manager_id": 7})
+    assert not clean.has("access_filter_widened") and not clean.has("required_predicate")
+    widened = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s WHERE ({chain} OR s.assoc_id = {{manager_id}})", "headcount under a manager", params={"manager_id": 7})
+    finding = next(f for f in widened.findings if f.code == "access_filter_widened")
+    assert finding.severity == Severity.MEDIUM and finding.evidence["extra"] == ["assoc_id"]
+    assert not widened.has("required_predicate")
 
 
 def test_or_chain_over_columns_each_joined_to_a_level():
