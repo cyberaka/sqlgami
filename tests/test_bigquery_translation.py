@@ -305,3 +305,42 @@ def test_policies_and_terms_declared_without_a_project_apply_to_three_part_names
     assert [o["status"] for o in report.signals["terms"]["outcomes"] if o["term"] in ("active", "my_org")] == ["satisfied", "satisfied"]
     none = sc.explain("SELECT COUNT(DISTINCT s.assoc_id) FROM `proj-x.hr.current_v` AS s WHERE s.status_cd = 'A'", "active headcount of my organisation", params={"manager_id": 7})
     assert none.has("required_predicate")
+
+
+def test_every_term_kind_and_policy_applies_to_three_part_names():
+    """Every kind of term (filter, window, source, chain, rank) and every policy shape (or_chain,
+    all, any) declared on dataset.table applies to `project.dataset.table`, and the catalogue's own
+    tables in a bench suite are all reached that way."""
+    from sqlgami import Catalog, Scorer
+    from sqlgami.catalog import RequiredPredicate
+    from sqlgami.terms import Catalogue
+
+    ddl = """
+    CREATE TABLE `proj-x.hr.snap` (assoc_id INT64, status_cd STRING, hire_dt DATE, lvl_2_id INT64, lvl_3_id INT64, period_seq INT64, tenant_id INT64, deleted_at DATE);
+    CREATE TABLE `proj-x.hr.periods` (ppe_dt DATE, period_seq INT64);
+    """
+    catalog = Catalog.from_ddl(ddl, "bigquery")
+    for rule in (
+        RequiredPredicate("chain", ("lvl_2_id", "lvl_3_id"), ("hr.snap",), "or_chain", "high", ""),
+        RequiredPredicate("tenant", ("tenant_id",), ("hr.snap",), "all", "high", ""),
+        RequiredPredicate("live", ("deleted_at",), ("`hr.snap`",), "any", "medium", ""),
+    ):
+        table = next(t for t in (catalog.resolve("snap", "proj-x.hr"),) if t is not None)
+        assert rule.applies_to(table), rule.name
+    terms = Catalogue.from_sheets({"terms": (
+        "term,phrases,kind,table,sql,nulls,description\n"
+        "active,active,filter,hr.snap,status_cd = 'A',,\n"
+        "last_n,last {n} periods,window,hr.periods,period_seq BETWEEN -({n}-1) AND 0,,\n"
+        "hire,hire date,source,,hr.snap.hire_dt,,\n"
+        "my_org,my organisation,chain,hr.snap,\"lvl_2_id, lvl_3_id = {manager_id}\",,\n"
+        "top,top {n},rank,,LIMIT {n},,\n"
+    ), "parameters": "name,type,example_values\nmanager_id,integer,7\n"})
+    sc = Scorer("bigquery", catalog=ddl, terms=terms, required_predicates=[{"name": "chain", "tables": ["hr.snap"], "match": "or_chain", "columns": ["lvl_2_id", "lvl_3_id"]}])
+    sql = ("SELECT s.assoc_id, s.hire_dt FROM `proj-x.hr.snap` AS s JOIN `proj-x.hr.periods` AS p ON p.ppe_dt = s.hire_dt "
+           "WHERE s.status_cd = 'A' AND p.period_seq BETWEEN -7 AND 0 AND {manager_id} IN (s.lvl_2_id, s.lvl_3_id) ORDER BY s.hire_dt DESC LIMIT 5")
+    report = sc.explain(sql, "The top 5 active people in my organisation by hire date over the last 8 periods", params={"manager_id": 7})
+    outcomes = {o["term"]: o["status"] for o in report.signals["terms"]["outcomes"]}
+    assert outcomes == {"active": "satisfied", "last_n": "satisfied", "hire": "satisfied", "my_org": "satisfied", "top": "satisfied"}, outcomes
+    assert not report.has("term_source_not_read") and not report.has("required_predicate")
+    # the policy still bites when the chain is absent
+    assert sc.explain(sql.replace(" AND {manager_id} IN (s.lvl_2_id, s.lvl_3_id)", ""), "active people", params={"manager_id": 7}).has("required_predicate")

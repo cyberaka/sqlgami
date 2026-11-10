@@ -222,7 +222,7 @@ sqlgami:
     seed: 47
     profiles: [clean, nulls, duplicates, ties, sparse, edges]
     rows:
-      hr.pay_period_dim: 156            # 52 biweekly + 104 weekly
+      hr.pay_period_dim: 80             # 40 biweekly + 40 weekly covering the 26-period window
       hr.hierarchy_dim: 400             # both chains, lvls 2..7 pooled
       hr.employee_dim: 92               # minimum in-scope cohort from the study
       hr.emp_period_snapshot: 6981      # 92 emps × 27 B-periods × ~2.8 snaps
@@ -234,6 +234,15 @@ sqlgami:
       hr.emp_period_snapshot.country: [US, GB, IN, JP, DE, FR]
       hr.emp_period_snapshot.job_grp: [ENG, DAT, DES, OPS, SAL]
       hr.pay_period_dim.freq_cd: [B, W]
+      # Ratio shaping for the per-row indicator columns so the synthetic draw
+      # mirrors the observed sparsity: ~25% of row-snapshots are new hires,
+      # ~50% of exits are involuntary, ~33% of rows are exit-filtered and
+      # ~33% turnover-filtered (the random generator defaults to 50/50 and
+      # over-populates these).
+      hr.emp_period_snapshot.new_hire_ind: [0, 0, 0, 1]
+      hr.emp_period_snapshot.invol_exit_ind: [0, 1]
+      hr.emp_period_snapshot.exit_filt_ind: [0, 0, 1]
+      hr.emp_period_snapshot.turn_filt_ind: [0, 0, 1]
     null_rate:
       hr.emp_period_snapshot.status_cd: 0.02   # the "~2% NULL status" feature
       hr.emp_period_snapshot.assoc_type: 0.10  # the "10% NULL employment type" feature
@@ -250,6 +259,26 @@ sqlgami:
         # the both-chain coverage the required_predicates rule tests.
         - hr.emp_period_snapshot.lvl_3_id
         - hr.emp_period_snapshot.lvl_7_id_fn
+    # FixtureRules: realism constraints the synthetic generator must honour on
+    # top of the random draw governed by `values` / `null_rate` / `rows`.
+    # Builder declared these at main 6e97eb5/1f1375f; they lifted synthetic-only
+    # fixtures from 0.916 to 0.962 on w4v2 vs 0.981 for the seed subsample.
+    # Each row is checked against the glossary prose: anchor 2026-06-20 is the
+    # current biweekly pay-period end; period_start_dt = ppe_dt - 13 days for B
+    # and ppe_dt - 6 days for W; a term date earlier than hire becomes NULL.
+    rules:
+      - {kind: date_step, column: hr.pay_period_dim.ppe_dt, per: [freq_cd], step: {B: 14 days, W: 7 days}, anchor: "2026-06-20"}
+      - {kind: derive, column: hr.pay_period_dim.period_start_dt, sql: "CASE WHEN freq_cd = 'B' THEN ppe_dt - INTERVAL 13 DAY ELSE ppe_dt - INTERVAL 6 DAY END"}
+      - {kind: derive, column: hr.employee_dim.term_dt, sql: "CASE WHEN term_dt < hire_dt THEN NULL ELSE term_dt END"}
+      - {kind: one_true, column: hr.pay_period_dim.is_current_flag, per: [freq_cd], at: middle}
+      - {kind: sequence, column: hr.pay_period_dim.period_seq, order_by: ppe_dt, per: [freq_cd], zero_where: is_current_flag}
+      - kind: grid
+        table: hr.emp_period_snapshot
+        per: {assoc_id: hr.employee_dim.assoc_id, period_end_dt: hr.pay_period_dim.ppe_dt}
+        where: {hr.pay_period_dim.freq_cd: B}
+        between: {column: period_end_dt, start: hr.employee_dim.hire_dt, end: hr.employee_dim.term_dt}
+        copy: {hire_dt: hr.employee_dim.hire_dt, term_dt: hr.employee_dim.term_dt}
+        snapshot: {column: snap_dt, equals: period_end_dt, restated_rate: 0.3}
     # Rows that MUST exist verbatim so every planted bug has a leak point in the fixture.
     # These are the "critical aids" from the fixtures_study: seed-47's fn-only on-leave
     # person (12028), seed-48's three rep-side on-leave injectees (12170/12221/12236),
@@ -257,6 +286,15 @@ sqlgami:
     # person at the current PPE (2026-06-20) with the chain column that makes the
     # AND/OR precedence bug variants leak.
     critical_rows:
+      # Manager hierarchy anchors. 12003's positions mirror nasty-47 (REP L3
+      # under 12259, FUN L7 under 12084); 12293 mirrors its nasty-47 row
+      # (REP L3 under 12197). 52002 is pinned as an extra REP L3 anchor used
+      # by the synthetic-only subsample path; it has no seed counterpart.
+      hr.hierarchy_dim:
+        - {lvl: 3, node_id: 12003, node_name: "REP-L3-12003", parent_node_id: 12259, hierarchy_kind: reporting}
+        - {lvl: 7, node_id: 12003, node_name: "FUN-L7-12003", parent_node_id: 12084, hierarchy_kind: functional}
+        - {lvl: 3, node_id: 12293, node_name: "REP-L3-12293", parent_node_id: 12197, hierarchy_kind: reporting}
+        - {lvl: 3, node_id: 52002, node_name: "REP-L3-52002", parent_node_id: null,  hierarchy_kind: reporting}
       hr.employee_dim:
         # fn-only on-leave (seed 47 cohort): hire 3y ago, no term, matches 12003 only via fn chain
         - {assoc_id: 12028, given_name: FnOnly, family_name: OnLeave, hire_dt: "2023-06-20", term_dt: null}
