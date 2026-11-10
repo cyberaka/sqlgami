@@ -757,8 +757,8 @@ def _fixture_stage(
         _stage(report, name, StageStatus.NOT_RUN, f"untranslatable: {construct}: the body of {unsupported[0]} uses a construct whose translation to the fixture engine is not verified", clock.lap())
         return
     try:
-        executable = B._executable(sql, dialect, live_params, live_slots, bundle.tables or None, bundle.functions or None)
-        reference_executable = B._executable(reference.sql, dialect, live_params, live_slots, bundle.tables or None, bundle.functions or None) if not same_values else None
+        executable = B._executable(sql, dialect, live_params, live_slots, bundle.tables or None, bundle.functions or None, bundle.column_types or None)
+        reference_executable = B._executable(reference.sql, dialect, live_params, live_slots, bundle.tables or None, bundle.functions or None, bundle.column_types or None) if not same_values else None
     except Untranslatable as exc:
         why = str(exc) if "script variable" in str(exc) else f"{exc}: the translation of this construct to the fixture engine is not verified"
         report.signals["fixtures"] = {**outcome, "verdict": "unverified", "untranslatable": exc.construct, "fixtures": [{"fixture": e["name"], "status": "untranslatable", "reason": str(exc)} for e in bundle.fixture_order()[:1]]}

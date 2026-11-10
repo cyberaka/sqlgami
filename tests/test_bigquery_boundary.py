@@ -9,9 +9,12 @@ same rows through the translation; one it does not vouch for raises ``Untranslat
 check, acknowledged here as a pass — the day its construct is verified, the comparison starts
 running for it automatically); a statement BigQuery rejects must not run to a value on DuckDB.
 
-Cases the translation still gets wrong are strict xfails: they turn red the moment a fix lands,
-so the marker comes off with the fix. With ``SQLGAMI_BQ_LIVE=1`` the native rows are re-derived
-from the sandbox so the stored values cannot rot.
+The 2026-11-10 audit found 45 disagreements (Sunday weeks, WEEK(<DAY>), DATE_TRUNC/DATE_ADD type
+widening, EXTRACT(WEEK), LAST_DAY WEEK, UNNEST WITH OFFSET, float literal typing and rendering,
+NUMERIC scale, ROUND(x, n), SUBSTR 0, SAFE_CAST of decimal strings, LIKE escapes, %e/%Q, GROUP BY
+alias precedence, DATE - DATE); the rewrites in translate.py close them, and the four that remain
+are divergences a translation cannot remove, kept as strict xfails so they stay visible. With
+``SQLGAMI_BQ_LIVE=1`` the native rows are re-derived from the sandbox so the stored values cannot rot.
 """
 
 from __future__ import annotations
@@ -30,34 +33,13 @@ from sqlgami import translate as T
 CASES_PATH = Path(__file__).parent / "data" / "bq_boundary_cases.jsonl"
 CASES = [json.loads(line) for line in CASES_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
 
-# id -> why the translation disagrees today (strict xfail; remove with the fix)
+# id -> a divergence the translation cannot remove (strict xfail, so it stays visible): BigQuery
+# rejects a statement DuckDB runs (its typing is stricter), or the engines' Unicode casing differs.
+# A native dry run (contrib.bigquery) is the check for the first kind; see docs/guarantees.md.
 DISAGREE = {
-    **dict.fromkeys(["trunc_week_sun", "trunc_week_sunday_explicit", "ts_trunc_week", "date_trunc_on_timestamp"],
-                    "DATE_TRUNC(d, WEEK) is Sunday-based in BigQuery; DuckDB's DATE_TRUNC('week') is Monday-based"),
-    **dict.fromkeys(["trunc_week_monday", "trunc_week_tuesday", "trunc_week_wednesday", "trunc_week_thursday",
-                     "trunc_week_friday", "trunc_week_saturday", "ts_trunc_week_monday"],
-                    "DATE_TRUNC(d, WEEK(<DAY>)) is emitted as DATE_TRUNC(WEEK(DAY), d), invalid DuckDB SQL"),
-    **dict.fromkeys(["trunc_month", "trunc_quarter", "trunc_year"],
-                    "DATE_TRUNC on a DATE comes back as TIMESTAMP in DuckDB (value right, type wrong)"),
-    **dict.fromkeys(["add_month_end", "add_quarter", "add_week_day"],
-                    "DATE_ADD/DATE_SUB on a DATE widens to TIMESTAMP in DuckDB (value right, type wrong)"),
-    "extract_week": "EXTRACT(WEEK) is the Sunday-based week number [0, 53] in BigQuery; DuckDB gives the ISO week",
-    "extract_week_monday": "EXTRACT(WEEK(MONDAY)) is emitted verbatim, a DuckDB syntax error",
-    "last_day_week": "LAST_DAY(d, WEEK) is off by one (DuckDB's DAYOFWEEK is 0-based) and LAST_DAY(d, WEEK(MONDAY)) silently becomes the month end",
-    **dict.fromkeys(["unnest_offset", "unnest_offset_noas", "unnest_offset_expr", "unnest_offset_subquery",
-                     "unnest_offset_join", "unnest_offset_correlated", "unnest_offset_nulls"],
-                    "UNNEST ... WITH OFFSET is 0-based; DuckDB's WITH ORDINALITY is 1-based"),
-    **dict.fromkeys(["round_digits", "float_sum", "int_div", "avg_int", "cast_bool_string", "safe_divide", "int_div_dec", "numeric_sum"],
-                    "a numeric literal with a point is FLOAT64 in BigQuery but DECIMAL in DuckDB, and CAST(FLOAT64/NUMERIC AS STRING) renders differently ('3' vs '3.0', %.15g/%.17g vs shortest, NUMERIC scale)"),
-    "substr": "SUBSTR(s, 0, n) treats position 0 as 1 in BigQuery; DuckDB counts it",
-    "cast_string_num": "SAFE_CAST('1.5' AS INT64) is NULL in BigQuery (not an integer string); DuckDB's TRY_CAST rounds to 2",
-    "like": "LIKE treats a backslash as an escape in BigQuery; DuckDB needs ESCAPE '\\'",
-    "format_date_e": "FORMAT_DATE %e is space-padded in BigQuery (DuckDB drops the padding) and %Q is not a DuckDB specifier",
-    "trim_case": "UPPER('straße') is STRASSE under ICU, STRAẞE in DuckDB",
-    "date_minus_date": "DATE - DATE is an INTERVAL in BigQuery, an integer in DuckDB",
-    "group_by_alias_shadow": "GROUP BY <alias> resolves to the projected expression in BigQuery when a source column has the alias's name; DuckDB binds the column",
     **dict.fromkeys(["concat_null", "bool_null_logic", "union_all_distinct"],
-                    "BigQuery rejects the statement (untyped NULL operand, mixed set operators); DuckDB runs it to a value"),
+                    "known divergence: BigQuery rejects the statement (untyped NULL operand, mixed set operators); DuckDB runs it to a value"),
+    "trim_case": "known divergence: UPPER('straße') is STRASSE under ICU, STRAẞE in DuckDB",
 }
 
 

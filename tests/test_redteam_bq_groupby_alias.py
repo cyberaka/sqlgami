@@ -46,9 +46,6 @@ def _duckdb_rows(sql: str):
 _BQ = "SELECT a.v AS k, COUNT(*) AS n FROM (SELECT 1 AS v) a CROSS JOIN (SELECT 2 AS k) b GROUP BY k"
 
 
-@pytest.mark.xfail(strict=True, reason="HIGH: GROUP BY names a SELECT alias that collides with an "
-                                       "in-scope column; BigQuery groups by the alias (returns 1,1) but "
-                                       "the DuckDB translation groups by the column and errors.")
 def test_group_by_alias_colliding_with_column_matches_bigquery():
     duck_sql = T.translate(_BQ, "bigquery").sql
     assert _duckdb_rows(duck_sql) == [("1", "1")]

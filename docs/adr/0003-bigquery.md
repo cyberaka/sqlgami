@@ -100,3 +100,38 @@ are added as fixed cases.
 does not promise, and what each verdict rests on.
 
 Order of work: B4 → B5 → B6 → B7. Nothing here changes the allow-list before w5 is scored.
+
+## Addendum (2026-11-10, later): the checker's red team and the boundary audit
+
+sqlgami-checker's red team of the bigquery dialect (branches merged at 67108c9, eb62b13,
+d94c1e9, d789ab6) found the safety gate had no BigQuery list at all, so an unknown TVF or UDF,
+`EXTERNAL_QUERY`, `ML.*` and `INFORMATION_SCHEMA` behind a region qualifier were sent; that the
+gate ran on the statement before views were expanded, so a view body bypassed it; and that the
+translation disagreed with BigQuery on Sunday-based weeks, `WEEK(<DAY>)`, `UNNEST WITH OFFSET`,
+`LIKE` escapes, NUMERIC scale, `DATE_ADD` widening, division by zero, array subscripts, shadowed
+script variables and `DECLARE STRUCT`. A 145-statement boundary audit run natively on the
+sandbox widened the list (DATE_TRUNC type widening for every part, `EXTRACT(WEEK)`,
+`LAST_DAY(d, WEEK)`, float literal typing, `ROUND(x, n)`, `CAST(FLOAT64 AS STRING)`,
+`SUBSTR(s, 0)`, `SAFE_CAST` of decimal strings, `%e`, `GROUP BY` alias precedence).
+
+Decisions:
+- The gate has a BigQuery allow-list generated like the others, from the function reference;
+  refused namespaces; INFORMATION_SCHEMA on folded and region-qualified names; wildcard tables,
+  time travel and `SESSION_USER` as policy findings the host opts into; and every view and TVF
+  body reached goes through the same gate as the statement.
+- `translate` tracks operators and format specifiers as constructs, not only function names,
+  and carries the schema's column types (in the bundle manifest) so a rewrite can tell a DATE
+  column from a TIMESTAMP one. Where a type is unknown, the common case is assumed and the
+  decision is made per row through DuckDB's `typeof`; the per-row forms are written so every
+  branch binds for any type.
+- Nondeterminism (`safety.nondeterministic`) and `APPROX_COUNT_DISTINCT` make a statement
+  `not_run`; `DATE - DATE` is not verified.
+- Divergences a translation cannot remove — BigQuery's stricter typing, ICU casing — stay
+  strict xfails in the boundary tests and are written up in `docs/guarantees.md` (B7).
+- The boundary audit's 145 cases and the checker's 79 jsonl cases are the B6 native job's seed
+  set (`SQLGAMI_BQ_LIVE=1` re-derives every native row from the sandbox).
+
+The new allow-list entries (`op:LIKE`, `op:/`, `op:[]`, the `fmt:` specifiers) name constructs
+that were already being translated silently; `func:APPROX_DISTINCT` was removed. No construct
+the w5 golds need and the list lacked (ISOWEEK, ARRAY_AGG of STRUCT, DATETIME, TIMESTAMP_ADD,
+JSON) was added: that waits for the w5v score, as directed.

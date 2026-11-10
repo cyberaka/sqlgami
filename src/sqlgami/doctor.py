@@ -174,7 +174,7 @@ def diagnose(config_path: str | Path, queries: str | Path | None = None) -> Diag
                 out.problems.append(f"{file.name}: does not parse as {dialect}: {str(exc)[:120]}")
                 continue
             if len(statements) > 1 and dialect in A._SCRIPT_DIALECTS and A._is_script(statements):
-                statements = [A.bind_script(statements, dialect).query]
+                statements = [A.bind_script(statements, dialect, A._statement_defined_names(statements[-1])).query]
             for index, statement in enumerate(statements):
                 out.statements += 1
                 label = file.name if len(statements) == 1 else f"{file.name}#{index + 1}"

@@ -67,7 +67,18 @@ CASES = [
     ("SELECT id, RANK() OVER (ORDER BY y DESC) AS r, DENSE_RANK() OVER (ORDER BY y DESC) AS dr, LAG(id) OVER (ORDER BY id) AS p, LEAD(id) OVER (ORDER BY id) AS n FROM t ORDER BY id", [(1, 2, 2, None, 2), (2, 4, 4, 1, 3), (3, 1, 1, 2, 4), (4, 3, 3, 3, None)], {"func:RANK", "func:DENSE_RANK", "func:LAG", "func:LEAD"}),
     ("SELECT v FROM UNNEST([1, 2, 3]) AS v ORDER BY v", [(1,), (2,), (3,)], {"clause:unnest", "clause:array", "func:UNNEST", "func:ARRAY"}),
     ("SELECT ARRAY_LENGTH(ARRAY_AGG(STRUCT(id, g))) AS v FROM t", [(4,)], {"func:ARRAY_SIZE", "func:ARRAY_AGG", "func:STRUCT", "clause:struct"}),
-    ("SELECT STRING_AGG(g, ',' ORDER BY id) AS v, ANY_VALUE(g) AS a, APPROX_COUNT_DISTINCT(g) AS c FROM t", [("a,b,a,c", "a", 3)], {"func:GROUP_CONCAT", "func:ANY_VALUE", "func:APPROX_DISTINCT"}),
+    ("SELECT STRING_AGG(g, ',' ORDER BY id) AS v, ANY_VALUE(g) AS a FROM t", [("a,b,a,c", "a")], {"func:GROUP_CONCAT", "func:ANY_VALUE"}),  # APPROX_COUNT_DISTINCT is not verified: the HLL sketches differ between engines
+    # the week starts BigQuery knows, in the type of the argument (a DATE stays a DATE)
+    ("SELECT id, DATE_TRUNC(d, WEEK) AS su, DATE_TRUNC(d, WEEK(MONDAY)) AS mo, DATE_TRUNC(d, WEEK(SATURDAY)) AS sa, EXTRACT(WEEK FROM d) AS wk, LAST_DAY(d, WEEK) AS ld FROM t ORDER BY id", [(1, D(2024, 3, 10), D(2024, 3, 11), D(2024, 3, 9), 10, D(2024, 3, 16)), (2, D(2024, 1, 28), D(2024, 1, 29), D(2024, 1, 27), 4, D(2024, 2, 3)), (3, D(2024, 2, 25), D(2024, 2, 26), D(2024, 2, 24), 8, D(2024, 3, 2)), (4, D(2024, 4, 28), D(2024, 4, 29), D(2024, 4, 27), 17, D(2024, 5, 4))], set()),
+    # UNNEST ... WITH OFFSET counts from 0
+    ("SELECT e, off FROM UNNEST(['x', 'y', 'z']) AS e WITH OFFSET AS off WHERE off > 0 ORDER BY off", [("y", 1), ("z", 2)], set()),
+    # LIKE escapes with a backslash; `/` is floating-point division that raises on zero; a subscript raises out of range
+    ("SELECT id FROM t WHERE g LIKE 'a%' AND 'a_c' LIKE 'a\\\\_c' AND NOT ('axc' LIKE 'a\\\\_c') ORDER BY id", [(1,), (3,)], {"op:LIKE"}),
+    ("SELECT CAST(7 / 2 AS STRING) AS a, CAST(6 / 2 AS STRING) AS b, SAFE_DIVIDE(1, 0) AS c, ['p', 'q'][OFFSET(1)] AS d, ['p', 'q'][SAFE_OFFSET(5)] AS e", [("3.5", "3", None, "q", None)], {"op:/", "op:[]"}),
+    # FORMAT_DATE / PARSE_DATE specifiers proven to render alike
+    ("SELECT FORMAT_DATE('%Y-%m-%d %y %b %B %a %A %j %U %W %V %u %w %%', DATE '2024-01-07') AS v", [("2024-01-07 24 Jan January Sun Sunday 007 01 01 01 7 0 %",)], {"fmt:%Y", "fmt:%m", "fmt:%d", "fmt:%y", "fmt:%b", "fmt:%B", "fmt:%a", "fmt:%A", "fmt:%j", "fmt:%U", "fmt:%W", "fmt:%V", "fmt:%u", "fmt:%w", "fmt:%%"}),
+    # a float literal is FLOAT64, so ROUND rounds the binary value; CAST(FLOAT64 AS STRING) prints as BigQuery does; NUMERIC keeps scale 9
+    ("SELECT CAST(ROUND(2.355, 2) AS STRING) AS a, CAST(ROUND(1.005, 2) AS STRING) AS b, CAST(0.1 + 0.2 AS STRING) AS c, CAST(CAST(10 AS NUMERIC) / 3 AS STRING) AS d, CAST(2.5 AS INT64) AS e, SAFE_CAST('1.5' AS INT64) AS f, SUBSTR('abcdef', 0, 2) AS g", [("2.35", "1", "0.30000000000000004", "3.333333333", 3, None, "ab")], set()),
     ("SELECT SAFE_CAST('x' AS INT64) AS v, CAST(7 AS INT64) AS w, CAST('2024-01-05' AS DATE) AS d, CAST(1.5 AS STRING) AS s", [(None, 7, D(2024, 1, 5), "1.5")], {"func:TRY_CAST", "func:CAST", "type:BIGINT", "type:DATE", "type:TEXT"}),
     ("SELECT CAST(x AS FLOAT64) / 4 AS v, CAST(TRUE AS BOOL) AS b, CAST(1 AS NUMERIC) AS n, CAST('2024-01-05 10:00:00' AS TIMESTAMP) AS ts FROM t WHERE id = 1", [(2.5, True, 1, dt.datetime(2024, 1, 5, 10, 0))], {"type:DOUBLE", "type:BOOLEAN", "type:DECIMAL", "type:TIMESTAMPTZ"}),
     ("SELECT id, LAST_DAY(d) AS v FROM t ORDER BY id", [(1, D(2024, 3, 31)), (2, D(2024, 1, 31)), (3, D(2024, 2, 29)), (4, D(2024, 4, 30))], {"func:LAST_DAY"}),

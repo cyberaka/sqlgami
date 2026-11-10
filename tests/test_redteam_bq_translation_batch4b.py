@@ -109,25 +109,16 @@ def test_tablesample_is_detected_as_nondeterministic():
 
 
 # ---- DISAGREE / must-be-not_run (defects, xfail strict) ---------------------------------------
-@pytest.mark.xfail(strict=True, reason="HIGH: TABLESAMPLE is nondeterministic (safety.nondeterministic "
-                                       "flags it) yet translate accepts it to DuckDB USING SAMPLE, so the "
-                                       "differential compares a random sample. It must come out not_run.")
 def test_tablesample_translation_should_be_not_run():
     with pytest.raises(Untranslatable):
         T.translate("SELECT COUNT(*) FROM UNNEST([1,2,3]) AS v TABLESAMPLE SYSTEM (10 PERCENT)", "bigquery")
 
 
-@pytest.mark.xfail(strict=True, reason="HIGH: APPROX_COUNT_DISTINCT maps to the verified APPROX_DISTINCT "
-                                       "and is translated and compared EXACTLY; different HLL "
-                                       "implementations diverge on real data. It must be not_run or "
-                                       "approximate-aware.")
 def test_approx_count_distinct_should_be_not_run():
     with pytest.raises(Untranslatable):
         T.translate("SELECT APPROX_COUNT_DISTINCT(x) AS v FROM UNNEST([1,1,2,3,3]) AS x", "bigquery")
 
 
-@pytest.mark.xfail(strict=True, reason="MEDIUM: an INTERVAL-typed result renders differently -- BigQuery "
-                                       "'0-0 0 1:30:0' vs DuckDB '01:30:00'. Row mismatch under same_rows.")
 def test_interval_literal_rendering_diverges():
     assert _duckdb_rows(_tq("SELECT CAST(INTERVAL 90 MINUTE AS STRING) AS v")) == _native([["0-0 0 1:30:0"]])
 

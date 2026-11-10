@@ -53,6 +53,7 @@ from .consistency import _norm, fingerprint
 from .errors import ConfigurationError
 from .fixtures import Fixture, FixtureRules, build
 from .terms import Catalogue, load_terms, normalise
+from .translate import column_types_of
 
 BUNDLE_VERSION = 1
 MAX_STORED_ROWS = 50
@@ -248,6 +249,7 @@ def compile_bundle(
                     connections[fixture.name], reference.sql, dialect, reference.params, slots=reference.slots,
                     allowed_functions=config.get("allowed_functions") or (), allowed_tables=config.get("allowed_tables") or (),
                     tables=config.get("tables") or None, functions=catalog.scalar_functions and {k: {"parameters": [list(p) for p in f.parameters], "body": f.body, "language": f.language} for k, f in catalog.scalar_functions.items()} or None,
+                    column_types=column_types_of(catalog) or None,
                 )
                 timings[fixture.name].append((time.perf_counter() - started) * 1000)
                 if outcome.get("error"):
@@ -293,6 +295,7 @@ def compile_bundle(
         # Views and table functions whose body uses a construct the translation has not verified:
         # a statement reading one gets no fixture verdict.
         "untranslatable_views": dict(__import__("sqlgami.fixtures", fromlist=["UNTRANSLATABLE_VIEWS"]).UNTRANSLATABLE_VIEWS),
+        "column_types": column_types_of(catalog),
         # References whose question states a number that no slot or parameter binds ("the two
         # counts"): a question compares under them only when it states the same number, so the
         # host may want to reword the reference, or write that number as a {slot}.
@@ -453,13 +456,13 @@ def _scalar(text: str) -> Any:
         return text
 
 
-def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str, Any] | None = None, tables: Mapping[str, str] | None = None, functions: Mapping[str, Any] | None = None) -> str:
+def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str, Any] | None = None, tables: Mapping[str, str] | None = None, functions: Mapping[str, Any] | None = None, column_types: Mapping[str, str] | None = None) -> str:
     """The statement as DuckDB SQL for a fixture: slots and parameters bound, and — for another
     dialect — translated through the verified allow-list (:mod:`sqlgami.translate`), raising
     ``Untranslatable`` for a construct whose translation is not proven."""
     from . import analysis as A
     from . import template
-    from .translate import Untranslatable, translate
+    from .translate import Untranslatable, column_types_of, translate
 
     for slot, value in (slots or {}).items():
         sql = sql.replace("{" + slot + "}", str(int(value)) if isinstance(value, (int, float)) and float(value).is_integer() else str(value))
@@ -471,15 +474,15 @@ def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str,
     # statement is translated as the tree it parsed to.
     statements = [st for st in sqlglot.parse(text, read=dialect) if st is not None]
     if len(statements) > 1 and dialect in A._SCRIPT_DIALECTS and A._is_script(statements):
-        script = A.bind_script(statements, dialect)
+        script = A.bind_script(statements, dialect, A._statement_defined_names(statements[-1]))
         if script.unbound:
             raise Untranslatable("script variable " + ", ".join(script.unbound) + " has no value the script gives it (no DEFAULT or SET)")
         tree = script.query
     elif len(statements) == 1:
         tree = statements[0]
     else:
-        return translate(text, dialect, tables, functions=functions).sql
-    return translate(tree, dialect, tables, functions=functions).sql
+        return translate(text, dialect, tables, functions=functions, column_types=column_types).sql
+    return translate(tree, dialect, tables, functions=functions, column_types=column_types).sql
 
 
 def _run_on(
@@ -495,6 +498,7 @@ def _run_on(
     tables: Mapping[str, str] | None = None,
     executable: str | None = None,
     functions: Mapping[str, Any] | None = None,
+    column_types: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run ``sql`` on a fixture connection and return the stored form of its result. The same
     gate as everywhere applies: a statement that is not a single read-only query over known
@@ -507,7 +511,7 @@ def _run_on(
     from .translate import Untranslatable
 
     try:
-        text = executable if executable is not None else _executable(sql, dialect, params, slots, tables, functions)
+        text = executable if executable is not None else _executable(sql, dialect, params, slots, tables, functions, column_types)
     except Untranslatable as exc:
         return {"ok": False, "error": str(exc), "untranslatable": exc.construct}
     except Exception as exc:
@@ -609,6 +613,12 @@ class Bundle:
     @property
     def untranslatable_views(self) -> dict[str, str]:
         return dict(self.manifest.get("untranslatable_views") or {})
+
+    @property
+    def column_types(self) -> dict[str, str]:
+        """Column name → declared type, from the schema the bundle was built for (the
+        translation's hint for DATE vs TIMESTAMP and NUMERIC vs FLOAT64 columns)."""
+        return dict(self.manifest.get("column_types") or {})
 
     @property
     def tables(self) -> dict[str, str]:

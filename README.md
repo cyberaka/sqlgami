@@ -490,8 +490,33 @@ func:JSON_EXTRACT_SCALAR`, never a verdict. Your `` `project.dataset.table` ``
 names map to the fixture tables through `tables:` in the compile config
 (every three-part name in your own DDL is mapped automatically), and the
 live catalogue resolves them the same way. Fixture connections run in UTC, as
-BigQuery does. Translations the proof forced: `COUNTIF` becomes
-`COALESCE(COUNT_IF(…), 0)` (DuckDB gives NULL for an all-NULL group).
+BigQuery does.
+
+Rewrites the proof forced (`translate._rewrite`, each a native case in
+`tests/test_bigquery_translation.py` and the 145-statement boundary audit in
+`tests/test_bigquery_boundary.py`): `COUNTIF` becomes `COALESCE(COUNT_IF(…), 0)`;
+`DATE_TRUNC`/`TIMESTAMP_TRUNC` become `TIME_BUCKET`, which keeps the argument's
+type (a DATE stays a DATE) and starts weeks on Sunday or the `WEEK(<DAY>)`
+named; `EXTRACT(WEEK)` is the Sunday-based week number; `LAST_DAY(d, WEEK)`
+likewise; `DATE_ADD`/`DATE_SUB` over a DATE are cast back to DATE; `UNNEST …
+WITH OFFSET` counts from 0; `LIKE` escapes with a backslash; a numeric literal
+with a point is FLOAT64 (so `ROUND(2.355, 2)` is 2.35 and `0.1 + 0.2` is
+0.30000000000000004 as in BigQuery), `ROUND(x, n)` rounds the exact binary
+value half away from zero, `NUMERIC` is DECIMAL(38, 9) and a NUMERIC quotient
+keeps scale 9, `CAST(FLOAT64 AS STRING)` prints as BigQuery does; `SUBSTR(s,
+0, n)` reads position 0 as 1; `CAST('1.5' AS INT64)` fails and `SAFE_CAST` of
+it is NULL; `x / 0`, `DIV`/`MOD` by zero and `arr[OFFSET(i)]` out of range
+raise as they do natively; `SELECT x AS g … GROUP BY g` groups by the alias.
+The schema's column types (carried in the bundle) tell a TIMESTAMP column from
+a DATE one and a NUMERIC from a FLOAT64. Not verified, so `not_run`:
+`APPROX_COUNT_DISTINCT` (the sketches differ), `TABLESAMPLE`, `RAND()` and
+other nondeterministic calls, `FORMAT_DATE` specifiers outside the proven set
+(`%e` is space-padded only in BigQuery), `DATE - DATE` (an INTERVAL in
+BigQuery), `ISOWEEK`, `DATETIME`, `TIMESTAMP_ADD/DIFF`, JSON functions. Known
+divergences no translation removes, listed in `docs/guarantees.md`: BigQuery
+rejects a statement DuckDB runs when its typing is stricter (an untyped NULL
+operand, `CONCAT` of a string and a number, mixed set operators) — the native
+dry run is the check for those — and `UPPER('ß')` differs under ICU.
 
 `sqlgami.contrib.bigquery` (`pip install "sqlgami[bigquery]"`) is an
 **offline** adapter for dry runs and native reference runs; it refuses any
@@ -588,8 +613,10 @@ one from bench suites and prints its error on questions held out of the fit.
   change a setting, take a lock. So a statement is sent only if every function
   it calls is on an allow-list of that engine's built-in functions that do
   nothing but compute (about 150 for SQLite, 900 for DuckDB, 1,550 for
-  Postgres; see `sqlgami/_functions.py`). The rule covers the query under
-  review and every alternative query alike.
+  Postgres, 340 for BigQuery from its function reference; see
+  `sqlgami/_functions.py`). The rule covers the query under review, every
+  alternative query, and the body of every view or table function the
+  statement reads through, alike.
   - A built-in that reaches outside the tables (`read_csv`, `pg_read_file`,
     `current_setting`, `nextval`, ...) is reported as `external_access` and the
     statement is not sent.
@@ -608,6 +635,18 @@ one from bench suites and prints its error on questions held out of the fit.
   `duckdb_*`; a read of `pg_shadow` or `pragma_database_list` is
   `external_access`. Vouch for what you need with
   `Scorer(..., allowed_tables=["information_schema.*"])`.
+- On BigQuery the gate also refuses `EXTERNAL_QUERY` and
+  `EXTERNAL_OBJECT_TRANSFORM` (federation), the `ML.`, `AI.` and `OBJ.`
+  namespaces, and `INFORMATION_SCHEMA` however it is written — bare,
+  dataset-qualified, or behind a region (`` `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT ``
+  discloses every query's text). A table function or UDF the catalogue does
+  not declare is `unlisted_function`, in every spelling (`ds.f(1)`,
+  `` `proj`.ds.f(1) ``, `` `proj.ds.f`(1) ``). Three constructs widen what a
+  statement reads beyond the tables it names and are refused unless the host
+  opts in: a wildcard table (`` `p.d.events_*` ``; allow with
+  `allowed_tables=["p.d.*"]`), `FOR SYSTEM_TIME AS OF` (time travel;
+  `allowed_functions=["system_time_as_of"]`) and `SESSION_USER()`
+  (`allowed_functions=["session_user"]`).
 - These checks rest on parsing the statement. They are a strong filter, not a
   sandbox: give sqlgami a database role that can only read what it should.
 - A database opened by path is opened read-only. On a SQLite connection you

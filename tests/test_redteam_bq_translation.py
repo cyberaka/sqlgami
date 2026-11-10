@@ -70,26 +70,17 @@ DISAGREE = [
     pytest.param(
         "date_trunc_week_sunday",
         "SELECT CAST(DATE_TRUNC(DATE '2024-01-10', WEEK) AS STRING) AS v", [["2024-01-07"]],
-        marks=pytest.mark.xfail(strict=True, reason="HIGH: part:WEEK — BigQuery DATE_TRUNC WEEK is "
-                                "Sunday-based (2024-01-07); DuckDB DATE_TRUNC('week') is Monday-based "
-                                "(2024-01-08). Silent wrong answer."),
         id="date_trunc_week_sunday",
     ),
     pytest.param(
         "date_trunc_week_monday",
         "SELECT CAST(DATE_TRUNC(DATE '2024-01-10', WEEK(MONDAY)) AS STRING) AS v", [["2024-01-08"]],
-        marks=pytest.mark.xfail(strict=True, reason="HIGH: part:WEEK — WEEK(MONDAY) transpiles to "
-                                "DATE_TRUNC(WEEK(MONDAY), ...), invalid DuckDB SQL (BinderException). A "
-                                "vouched construct that produces a crashing translation."),
         id="date_trunc_week_monday",
     ),
     pytest.param(
         "unnest_with_offset",
         "SELECT e, off FROM UNNEST(['x','y','z']) AS e WITH OFFSET AS off ORDER BY off",
         [["x", "0"], ["y", "1"], ["z", "2"]],
-        marks=pytest.mark.xfail(strict=True, reason="HIGH: clause:unnest — BigQuery WITH OFFSET is "
-                                "0-based (0,1,2); transpiled to DuckDB WITH ORDINALITY which is 1-based "
-                                "(1,2,3). Silent off-by-one on every array index."),
         id="unnest_with_offset",
     ),
 ]

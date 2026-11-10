@@ -139,32 +139,23 @@ def test_cast_failure_is_rejected_by_both_engines():
 
 
 # ---- DISAGREE: accepted/bound, yet the DuckDB result diverges from BigQuery (defects) ----------
-@pytest.mark.xfail(strict=True, reason="HIGH: BigQuery raises on 1/0; the DuckDB translation returns "
-                                       "inf instead of erroring -- silent wrong value.")
 def test_division_by_zero_diverges():
     # BigQuery errors; faithful behaviour is to error, not to yield a value.
     with pytest.raises(Exception):
         _duckdb_rows(_translate_query("SELECT 1 / 0 AS v"))
 
 
-@pytest.mark.xfail(strict=True, reason="MEDIUM-HIGH: BigQuery raises on OFFSET out of range; the DuckDB "
-                                       "translation returns NULL instead of erroring.")
 def test_array_offset_out_of_range_diverges():
     with pytest.raises(Exception):
         _duckdb_rows(_translate_query("SELECT [1,2][OFFSET(5)] AS v"))
 
 
-@pytest.mark.xfail(strict=True, reason="HIGH: a column shadows a same-named script variable; BigQuery "
-                                       "uses the column (1,2) but the binder substitutes the variable "
-                                       "value (99) into the SELECT -- silent wrong binding.")
 def test_variable_shadowed_by_column_binds_wrong():
     duck_sql = _translate_script(
         "DECLARE v INT64 DEFAULT 99; SELECT v FROM UNNEST([1,2]) AS v ORDER BY v")
     assert _duckdb_rows(duck_sql) == _native([["1"], ["2"]])
 
 
-@pytest.mark.xfail(strict=True, reason="MEDIUM: a DECLARE of a STRUCT is neither bound nor declined; the "
-                                       "binder leaves an unresolved reference (s.a) and emits broken SQL.")
 def test_declare_struct_neither_binds_nor_not_run():
     duck_sql = _translate_script("DECLARE s STRUCT<a INT64> DEFAULT STRUCT(1 AS a); SELECT s.a AS v")
     assert _duckdb_rows(duck_sql) == _native([["1"]])

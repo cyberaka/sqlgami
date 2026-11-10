@@ -188,7 +188,7 @@ def analyse(
         return analysis
     if len(statements) > 1 and dialect in _SCRIPT_DIALECTS and _is_script(statements):
         # A script: variable declarations and assignments, then the query that answers the question.
-        shadowed = _shadowing_columns(statements[-1], catalog) if catalog is not None else set()
+        shadowed = _shadowing_columns(statements[-1], catalog) if catalog is not None else _statement_defined_names(statements[-1])
         script = bind_script(statements, dialect, shadowed)
         analysis.script_statements = [type(st).__name__.upper() for st in statements[:-1]] + ["SELECT"]
         analysis.variables, analysis.variable_values, analysis.unbound_variables = script.variables, script.values, script.unbound
@@ -249,10 +249,34 @@ class BoundScript:
     unbound: list[str] = field(default_factory=list)
 
 
-def _shadowing_columns(query: exp.Expression, catalog: Any) -> set[str]:
-    """Column names of the tables the query reads: a variable with such a name is shadowed by the
-    column in the engine, so it must not be substituted."""
+def _statement_defined_names(query: exp.Expression) -> set[str]:
+    """Names the statement itself brings into scope — UNNEST element and offset names, column
+    lists of aliases and CTEs, the projections of its subqueries and CTEs — which take precedence
+    over a script variable of the same name, as a table's columns do."""
     names: set[str] = set()
+    for unnest in query.find_all(exp.Unnest):
+        alias = unnest.args.get("alias")
+        if isinstance(alias, exp.TableAlias):
+            if alias.this is not None and alias.name:
+                names.add(alias.name.lower())  # UNNEST(a) AS v: v is the element column
+            names |= {c.name.lower() for c in alias.columns}
+        offset = unnest.args.get("offset")
+        if offset is not None:
+            names.add((offset.name if isinstance(offset, exp.Expression) else "offset").lower())
+    for alias in query.find_all(exp.TableAlias):
+        names |= {c.name.lower() for c in alias.columns}
+    for sub in query.find_all((exp.Subquery, exp.CTE)):
+        inner = sub.this
+        if isinstance(inner, exp.Select):
+            names |= {n.lower() for n in inner.named_selects if n}
+    return names
+
+
+def _shadowing_columns(query: exp.Expression, catalog: Any) -> set[str]:
+    """Column names of the tables the query reads, and the names the statement itself defines: a
+    variable with such a name is shadowed by the column in the engine, so it must not be
+    substituted."""
+    names: set[str] = _statement_defined_names(query)
     for table in query.find_all(exp.Table):
         try:
             found = catalog.resolve(table.name, ".".join(p for p in (table.catalog, table.db) if p) or None, quoted=True) or catalog.resolve(table.name, ".".join(p for p in (table.catalog, table.db) if p) or None)
@@ -320,7 +344,7 @@ def bind_script_text(sql: str, dialect: str) -> tuple[str | exp.Expression, list
     statements = [st for st in sqlglot.parse(sql, read=dialect) if st is not None]
     if len(statements) <= 1 or not _is_script(statements):
         return sql, []
-    script = bind_script(statements, dialect)
+    script = bind_script(statements, dialect, _statement_defined_names(statements[-1]))
     return script.query, script.unbound
 
 
@@ -332,6 +356,9 @@ def _substitute_variables(tree: exp.Expression, values: dict[str, exp.Expression
         return tree
     for column in list(tree.find_all(exp.Column)):
         if column.table:
+            if not column.db and column.table.lower() in values and isinstance(values[column.table.lower()], exp.Struct):
+                # s.a where s is a STRUCT variable: the field of the struct value
+                column.replace(exp.Dot(this=exp.Paren(this=values[column.table.lower()].copy()), expression=exp.to_identifier(column.name)))
             continue
         value = values.get(column.name.lower())
         if value is None:

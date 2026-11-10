@@ -337,12 +337,12 @@ def _view_ddl(catalog: Catalog) -> list[str]:
                         part.set("quoted", False)  # a backticked or double-quoted name is the same table
                         part.set("this", part.name.lower())
             if catalog.dialect != "duckdb":
-                from .translate import Untranslatable, translate
+                from .translate import Untranslatable, column_types_of, translate
 
                 own = {q.strip("`").lower(): logical_name(q) for q in catalog.table_names() if q.count(".") >= 2}
                 functions = {k: {"parameters": [list(p) for p in f.parameters], "body": f.body, "language": f.language} for k, f in getattr(catalog, "scalar_functions", {}).items()}
                 try:
-                    query = translate(tree, catalog.dialect, own or None, functions=functions or None).sql
+                    query = translate(tree, catalog.dialect, own or None, functions=functions or None, column_types=column_types_of(catalog) or None).sql
                 except Untranslatable as exc:
                     UNTRANSLATABLE_VIEWS[qualified] = exc.construct
                     continue

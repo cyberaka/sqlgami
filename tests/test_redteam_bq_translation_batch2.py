@@ -84,41 +84,27 @@ DISAGREE = [
     pytest.param(
         "date_add_month_end", "q",
         "SELECT CAST(DATE_ADD(DATE '2024-01-31', INTERVAL 1 MONTH) AS STRING) AS v", [["2024-02-29"]],
-        marks=pytest.mark.xfail(strict=True, reason="MEDIUM: DATE_ADD on a DATE -- value is right "
-                                "(month-end clamp to 2024-02-29) but DuckDB widens DATE+INTERVAL to "
-                                "TIMESTAMP, so the string is '2024-02-29 00:00:00'. Type/row mismatch."),
         id="date_add_month_end",
     ),
     pytest.param(
         "date_add_leap_year", "q",
         "SELECT CAST(DATE_ADD(DATE '2024-02-29', INTERVAL 1 YEAR) AS STRING) AS v", [["2025-02-28"]],
-        marks=pytest.mark.xfail(strict=True, reason="MEDIUM: DATE_ADD on a DATE widens to TIMESTAMP in "
-                                "DuckDB ('2025-02-28 00:00:00' vs '2025-02-28')."),
         id="date_add_leap_year",
     ),
     pytest.param(
         "numeric_div", "q",
         "SELECT CAST(CAST(10 AS NUMERIC) / CAST(3 AS NUMERIC) AS STRING) AS v", [["3.333333333"]],
-        marks=pytest.mark.xfail(strict=True, reason="MEDIUM-HIGH: BigQuery NUMERIC/NUMERIC keeps fixed "
-                                "scale 9 (3.333333333); the DECIMAL translation yields a DOUBLE "
-                                "(3.3333333333333335). Precision not preserved."),
         id="numeric_div",
     ),
     pytest.param(
         "like_escaped_underscore", "q",
         "SELECT ('a_b' LIKE 'a\\\\_b') AS v", [["true"]],
-        marks=pytest.mark.xfail(strict=True, reason="HIGH: BigQuery LIKE treats backslash as an escape so "
-                                "'a\\_b' matches the literal 'a_b' (true); DuckDB LIKE does not escape with "
-                                "backslash by default, so it is false. Silent wrong filter."),
         id="like_escaped_underscore",
     ),
     pytest.param(
         "declare_set_month_end", "s",
         "DECLARE d DATE DEFAULT DATE '2024-01-31'; SET d = DATE_ADD(d, INTERVAL 1 MONTH); SELECT CAST(d AS STRING) AS v",
         [["2024-02-29"]],
-        marks=pytest.mark.xfail(strict=True, reason="MEDIUM: DECLARE/SET binds correctly (d = 2024-02-29) "
-                                "but inherits the DATE_ADD DATE->TIMESTAMP widening, so the string is "
-                                "'2024-02-29 00:00:00'."),
         id="declare_set_month_end",
     ),
 ]
