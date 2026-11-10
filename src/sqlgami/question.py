@@ -10,6 +10,7 @@ unless the structure of the query confirms the problem.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any, Iterable
 
 from sqlglot import exp
@@ -85,6 +86,8 @@ _TIME_PHRASE = re.compile(
     re.IGNORECASE,
 )
 _YEAR = re.compile(r"\b((?:19|20)\d{2})\b")
+# Every number in the question, hyphenated ones too ("180-day"), for telling repeated mentions.
+_ANY_NUMBER = re.compile(r"(?<![\w.,])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?![\w.]|,\d)")
 _QUESTION_NUMBER = re.compile(r"(?<![\w.,-])\$?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?![\w-]|\.\d)")
 _TEMPORAL_NAME = re.compile(r"(_at|_date|_time|_ts|_on|_day|_month|_year|date|timestamp|effective_|valid_|period)", re.IGNORECASE)
 _SCALES = (1, 10, 100, 1_000, 10_000, 1_000_000, 100_000_000)
@@ -838,6 +841,13 @@ def _bound_phrase(asked: _Asked, position: int, end: int) -> str | None:
     return found
 
 
+def _same_number(a: str, b: str) -> bool:
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
+
+
 def _comparison_words(asked: _Asked) -> list[Finding]:
     """'greater than 50000' written as >= 50000, and the like."""
     findings: list[Finding] = []
@@ -855,7 +865,10 @@ def _comparison_words(asked: _Asked) -> list[Finding]:
     operators = {exp.GT: "sa", exp.GTE: "ia", exp.LT: "sb", exp.LTE: "ib"}
     flipped = {"sa": "sb", "ia": "ib", "sb": "sa", "ib": "ia"}
     symbol = {"sa": ">", "ia": ">=", "sb": "<", "ib": "<="}
-    seen: set[str] = set()
+    # A number the question uses more than once ("the 180-day turnover rate ... at least 180 days")
+    # may name two different quantities, so a comparison on it is matched to the wording loosely.
+    counts = Counter(m.group(1).replace(",", "") for m in _ANY_NUMBER.finditer(asked.text))
+    comparisons: list[tuple[exp.Expression, exp.Literal, str]] = []
     for node in asked.tree.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE):
         left, right = strip(node.this), strip(node.expression)
         used = operators[type(node)]
@@ -864,7 +877,19 @@ def _comparison_words(asked: _Asked) -> list[Finding]:
             continue
         if literal is left:
             used = flipped[used]  # 50000 < x  is  x > 50000
+        comparisons.append((node, literal, used))
+    # The wording is honoured somewhere: another comparison on the same number uses the wanted operator.
+    honoured = {
+        (text, wanted)
+        for text, wanted in mentions
+        for _, literal, used in comparisons
+        if used == wanted and not literal.is_string and _same_number(literal.name, text)
+    }
+    seen: set[str] = set()
+    for node, literal, used in comparisons:
         for text, wanted in mentions:
+            if (text, wanted) in honoured:
+                continue
             is_date = "-" in text
             if is_date:
                 if not literal.is_string or not literal.name.startswith(text):
@@ -882,13 +907,20 @@ def _comparison_words(asked: _Asked) -> list[Finding]:
                 continue
             seen.add(text)
             same_side = used[1] == wanted[1]
+            repeated = counts.get(text, 0) > 1
             findings.append(
                 asked.finding(
                     "comparison_operator",
-                    Severity.MEDIUM if same_side else Severity.HIGH,
+                    Severity.LOW if repeated else Severity.MEDIUM if same_side else Severity.HIGH,
                     f"The question's wording for {text} calls for {symbol[wanted]}, but the SQL uses "
                     f"{symbol[used]}."
-                    + (" A row exactly on the boundary falls on the wrong side." if same_side else ""),
+                    + (" A row exactly on the boundary falls on the wrong side." if same_side else "")
+                    + (
+                        f" The question uses {text} more than once, so this comparison may be about a "
+                        "different quantity."
+                        if repeated
+                        else ""
+                    ),
                     asked.ctx.snippet(node),
                     value=text,
                     wanted=symbol[wanted],

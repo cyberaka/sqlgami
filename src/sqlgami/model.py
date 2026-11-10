@@ -84,6 +84,37 @@ def always_true(node: exp.Expression) -> bool:
     return False
 
 
+def _inside_nested_query(node: exp.Expression, root: exp.Expression) -> bool:
+    """Whether ``node`` sits in a SELECT nested somewhere below ``root``."""
+    parent = node.parent
+    while parent is not None and parent is not root:
+        if isinstance(parent, (exp.Select, exp.Subquery)):
+            return True
+        parent = parent.parent
+    return False
+
+
+def _value_key(value: exp.Expression) -> exp.Expression:
+    """What a comparison value amounts to. ``(SELECT c FROM t WHERE c = X)`` is X (or nothing),
+    so two such subqueries agree when their X does."""
+    value = strip(value)
+    inner = value.this if isinstance(value, exp.Subquery) else None
+    if isinstance(inner, exp.Select) and len(inner.expressions) == 1 and not inner.args.get("group"):
+        projected = strip(inner.expressions[0])
+        projected = projected.this if isinstance(projected, exp.Alias) else projected
+        if isinstance(projected, exp.Column):
+            for conjunct in flatten_and(inner.args.get("where").this if inner.args.get("where") else None):
+                if not isinstance(conjunct, exp.EQ):
+                    continue
+                left, right = strip(conjunct.this), strip(conjunct.expression)
+                for column, other in ((left, right), (right, left)):
+                    if isinstance(column, exp.Column) and column.name == projected.name and isinstance(
+                        other, (exp.Literal, exp.Placeholder, exp.Parameter)
+                    ):
+                        return other
+    return value
+
+
 def flatten_or(node: exp.Expression | None) -> list[exp.Expression]:
     if node is None:
         return []
@@ -327,8 +358,15 @@ class SelectModel:
         return frozenset(found)
 
     def _is_constant(self, node: exp.Expression) -> bool:
-        """True when ``node`` has one value for the whole SELECT (no local column in it)."""
+        """True when ``node`` has one value for the whole SELECT (no local column in it).
+
+        A scalar subquery counts when it is not correlated: its own columns belong to it, and
+        only a column written with one of this SELECT's aliases ties it to the current row."""
         for inner in node.find_all(exp.Column):
+            if _inside_nested_query(inner, node):
+                if inner.table and inner.table in self.sources:
+                    return False
+                continue
             if inner.table in self.sources or not inner.table:
                 return False
         return not any(isinstance(n, (exp.AggFunc, exp.Window)) for n in walk_own(node))
@@ -379,6 +417,7 @@ class SelectModel:
                     self._union(left_col, right_col)
                 elif left_col != right_col:
                     self.self_equal.update((left_col, right_col))
+                    self._union(left_col, right_col)  # one pinned, both pinned
             elif left_col and self._is_constant(right):
                 self._bind(left_col, right, conjunct)
             elif right_col and self._is_constant(left):
@@ -422,7 +461,8 @@ class SelectModel:
                 refs.extend(branch_refs)
                 values.extend([value] * len(branch_refs))
             if len(refs) >= 2:
-                same = all(v == values[0] for v in values)
+                keys = [_value_key(v) for v in values]
+                same = all(k == keys[0] for k in keys)
                 self.or_groups.append((refs, same, expr))
         elif isinstance(expr, exp.Is):
             ref = self._local_ref(strip(expr.this))
@@ -799,9 +839,14 @@ class SelectModel:
             info = self.key_info(alias)
             if not info.certain:
                 certain = False
+            # A key column pinned to one value for the whole SELECT (period_end_dt = <current
+            # period>, snap_dt = period_end_dt) need not be projected: the rest of the key is unique.
+            pinned = self.bound_columns(alias, set())
             for key in info.keys:
                 mapped = []
                 for column in key:
+                    if column in pinned:
+                        continue
                     name = self._projection_name_for_ref((alias, column))
                     if name is None:
                         break

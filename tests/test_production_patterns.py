@@ -384,6 +384,20 @@ def test_wording_of_bounds(scorer):
         assert not scorer.sample(sql, question).has("comparison_operator"), sql
 
 
+def test_a_number_the_question_uses_twice_is_only_a_note(scorer):
+    """'the 180-day turnover ... at least 180 days to attrit': <= 180 is about the first 180, not the second."""
+    question = "What is the 180-day turnover among orders placed at least 180 days ago? Return the count."
+    report = scorer.sample("SELECT COUNT(*) FROM orders WHERE total <= 180", question)
+    finding = next(f for f in report.findings if f.code == "comparison_operator")
+    assert finding.severity == Severity.LOW and "more than once" in finding.message
+    # The wording honoured by one comparison is not contradicted by another on the same number.
+    honoured = scorer.sample(
+        "SELECT COUNT(*) FROM orders WHERE total >= 50 AND quantity <= 50",
+        "How many orders have a total of at least 50?",
+    )
+    assert not honoured.has("comparison_operator")
+
+
 def test_partial_match_wording_and_totals(scorer):
     exact = scorer.sample("SELECT name FROM customers WHERE name = 'A'", "Which customers have a name that starts with A?")
     assert exact.has("pattern_match_missing")
@@ -578,3 +592,34 @@ def test_incomplete_column_list_still_fires(where):
 def test_in_list_of_values_is_not_an_access_chain():
     report = _hier("SELECT COUNT(*) FROM snap s WHERE s.lvl_3_id IN (1, 2, 3)")
     assert report.has("required_predicate")
+
+
+def test_lookup_subqueries_for_the_same_value_form_one_chain():
+    """Each branch compares a level with (SELECT node_id FROM dim WHERE node_id = {m}): that is {m}."""
+    ddl = HIER_DDL + "CREATE TABLE dim (node_id INTEGER, kind TEXT);"
+    branches = " OR ".join(
+        f"s.lvl_{n}_id = (SELECT node_id FROM dim WHERE kind = 'reporting' AND node_id = {{manager_id}})" for n in range(2, 8)
+    )
+    report = Scorer("duckdb", catalog=ddl, required_predicates=[_RULE]).explain(
+        f"SELECT COUNT(*) FROM snap s WHERE {branches}", "headcount under a manager"
+    )
+    assert not report.has("required_predicate"), report.summary()
+
+
+def test_scalar_subquery_is_a_constant_for_key_reasoning():
+    """period_end_dt bound to an uncorrelated scalar subquery drops out of the key, so a derived
+    table projecting the rest of the key is unique on it and no fan-out is suspected."""
+    ddl = (
+        "CREATE TABLE snap (assoc_id INTEGER, period_end_dt DATE, snap_dt DATE, amount INTEGER, PRIMARY KEY (assoc_id, period_end_dt, snap_dt));"
+        "CREATE TABLE periods (ppe_dt DATE PRIMARY KEY, is_current BOOLEAN);"
+        "CREATE TABLE people (assoc_id INTEGER PRIMARY KEY, name TEXT, salary INTEGER);"
+    )
+    sql = (
+        "WITH cur AS (SELECT assoc_id, amount FROM snap WHERE snap_dt = period_end_dt "
+        "AND period_end_dt = (SELECT ppe_dt FROM periods WHERE is_current)) "
+        "SELECT c.assoc_id, SUM(p.salary) FROM people p JOIN cur c ON c.assoc_id = p.assoc_id GROUP BY c.assoc_id"
+    )
+    report = Scorer("duckdb", catalog=ddl).explain(sql, "amount per person this period")
+    assert not [f for f in report.findings if f.code == "fan_out" and f.severity == Severity.HIGH], report.summary()
+    correlated = sql.replace("WHERE is_current", "WHERE is_current AND ppe_dt = snap.period_end_dt")
+    assert Scorer("duckdb", catalog=ddl).explain(correlated, "amount per person").has("fan_out")
