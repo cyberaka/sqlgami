@@ -46,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     p_comp.add_argument("--profiles", help="comma-separated fixture profiles")
     p_comp.add_argument("--from-seeds", action="store_true", help="subsample the suite's nasty seed databases instead of generating rows")
     p_comp.add_argument("--rules", help="YAML with a subsample: block of per-table predicates (with --from-seeds)")
+    p_comp.add_argument("--references", help="JSONL of host-registered references (id, question, sql, n_default) replacing golds of the same id")
+    p_comp.add_argument("--out", help="bundle folder (default bench/.runs/bundles/<suite>-<engine>)")
 
     p_lat = sub.add_parser("latency", help="p50/p90/p99 of score() per mode on the suite's gold statements")
     p_lat.add_argument("suite")
@@ -154,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
             bundle = compile_suite(
                 suite, args.engine, args.seed, args.profiles.split(",") if args.profiles else None,
                 from_seeds=args.from_seeds, rules_file=Path(args.rules) if args.rules else None,
+                references_file=Path(args.references) if args.references else None, out=Path(args.out) if args.out else None,
             )
             m = bundle.manifest
             print(f"bundle: {bundle.path}  references {m['references']} (rejected {m['rejected']})")

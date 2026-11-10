@@ -95,8 +95,8 @@ PINNED_RULES = {
     "critical_rows": {"customers": [{"id": 99, "name": "Zed", "tenant_id": 1}]},
 }
 PINNED_DIGESTS = {
-    "clean": "5bf48a4d77f798d1110aa073928ec051a70a664492f8223174e15b8f6875e150",
-    "nulls": "ed6bcd365faff9e1144bbd3675b839910773503ba80dcef4d024d917730e1fe3",
+    "clean": "11268673e296dd4f719e21122778fde079fee0c6fc47146d4c64a0e631844b6c",
+    "nulls": "5551a9d32baed3464c6b989a9d6a62d4a3c86d83900cdbe46bc1826e5e4fa0d2",
 }
 
 
@@ -106,3 +106,24 @@ def test_fixture_digest_is_pinned(profile):
     assert fixture.digest() == PINNED_DIGESTS[profile], (
         f"{profile} fixture changed: {fixture.digest()}; if the generator changed on purpose, update the pin"
     )
+
+
+def test_fixtures_depend_on_logical_schema_only_not_the_dialect_spelling():
+    """The same schema written for two dialects (SERIAL vs INTEGER, TIMESTAMPTZ vs TIMESTAMP WITH
+    TIME ZONE, mixed-case identifiers, a partition declared as a table) gives the same fixture."""
+    duck = """
+    CREATE TABLE "Shop"."Customers" (id INTEGER PRIMARY KEY, "Name" VARCHAR NOT NULL, created_at TIMESTAMPTZ);
+    CREATE TABLE "Shop"."Orders" (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES "Shop"."Customers"(id), total DECIMAL(10,2), status VARCHAR);
+    CREATE VIEW "Shop".paid_v AS SELECT id FROM "Shop"."Orders" WHERE status = 'paid';
+    """
+    pg = """
+    CREATE TABLE shop.customers (id SERIAL PRIMARY KEY, name TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE);
+    CREATE TABLE shop.orders (id SERIAL PRIMARY KEY, customer_id INT REFERENCES shop.customers(id), total NUMERIC(10,2), status TEXT) PARTITION BY RANGE (id);
+    CREATE TABLE shop.orders_p1 PARTITION OF shop.orders FOR VALUES FROM (1) TO (100);
+    CREATE VIEW shop.paid_v AS SELECT id FROM shop.orders WHERE status = 'paid';
+    """
+    rules = {"seed": 3, "profiles": ["clean"], "rows": {"shop.customers": 4, "shop.orders": 6}}
+    a = fixtures.build(Catalog.from_ddl(duck, "duckdb"), rules)[0]
+    b = fixtures.build(Catalog.from_ddl(pg, "postgres"), rules)[0]
+    assert a.digest() == b.digest(), (a.ddl, b.ddl)
+    assert set(a.tables) == {"shop.customers", "shop.orders"}

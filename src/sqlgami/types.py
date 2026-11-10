@@ -57,12 +57,16 @@ def family_of_datatype(data_type: exp.DataType | None) -> str:
     return _FAMILY_BY_TYPE.get(data_type.this, OTHER)
 
 
+_SERIALS = {"SERIAL": "INT", "SERIAL4": "INT", "BIGSERIAL": "BIGINT", "SERIAL8": "BIGINT", "SMALLSERIAL": "SMALLINT", "SERIAL2": "SMALLINT"}
+
+
 @lru_cache(maxsize=4096)
 def parse_type(declared: str, dialect: str) -> exp.DataType | None:
     """Parse a declared column type, tolerating the loose types SQLite allows."""
     text = (declared or "").strip()
     if not text:
         return None
+    text = _SERIALS.get(text.upper(), text)  # Postgres auto-increment pseudo-types are integers
     try:
         return exp.DataType.build(text, dialect=dialect)
     except Exception:

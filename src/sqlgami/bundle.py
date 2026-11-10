@@ -214,6 +214,7 @@ def compile_bundle(
         "sqlgami_version": _version,
         "created": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
         "dialect": dialect,
+        "schema_file": str(config.get("schema") or ""),  # which dialect's DDL the fixtures came from
         "schema_hash": schema_hash(catalog),
         "catalogue": catalogue.to_dict() if catalogue is not None else None,
         "fixtures": [
@@ -223,6 +224,7 @@ def compile_bundle(
                 "seed": f.seed,
                 "rows": f.row_count(),
                 "digest": f.digest(),
+                "views_digest": f.views_digest(),
                 "reference_ms": round(sorted(timings[f.name])[len(timings[f.name]) // 2], 2) if timings[f.name] else None,
                 "reference_max_ms": round(max(timings[f.name]), 2) if timings[f.name] else None,
             }
@@ -261,7 +263,20 @@ def _references(config: dict[str, Any], catalogue: Catalogue | None) -> list[Ref
     for row in config.get("references") or []:
         if not isinstance(row, dict) or not row.get("sql") or not row.get("question"):
             continue
-        found.append(Reference(str(row.get("key") or f"ref{len(found) + 1}"), str(row["question"]), str(row["sql"]), dict(row.get("params") or {})))
+        question = str(row["question"])
+        # A templated reference may write its slots into the question too ("last {n} pay
+        # periods"); its defaults make the question concrete for matching, the SQL stays templated.
+        defaults = dict(row.get("slots") or {})
+        if row.get("n_default") is not None:
+            defaults.setdefault("n", row["n_default"])
+        for slot, value in defaults.items():
+            question = question.replace("{" + slot + "}", str(value))
+        params = row.get("params") or {}
+        if isinstance(params, (list, tuple)):
+            params = {}  # names only: the values come from the question or the caller
+        reference = Reference(str(row.get("key") or row.get("id") or f"ref{len(found) + 1}"), question, str(row["sql"]), dict(params))
+        reference.slots = {k: v for k, v in defaults.items()}  # the declared defaults; the question's own bindings win below
+        found.append(reference)
     seen: set[str] = set()
     unique: list[Reference] = []
     for reference in found:
@@ -271,7 +286,7 @@ def _references(config: dict[str, Any], catalogue: Catalogue | None) -> list[Ref
         if catalogue is not None:
             matches = catalogue.match(reference.question)
             reference.terms = tuple(sorted({m.name.lower() for m in matches}))
-            reference.slots = slot_values(matches)
+            reference.slots = {**reference.slots, **slot_values(matches)}
         unique.append(reference)
     return unique
 
@@ -294,6 +309,35 @@ def slot_values(matches: Sequence[Any]) -> dict[str, Any]:
     for slot in clashed:
         found.pop(slot, None)
     return found
+
+
+def free_numbers(question: str, slots: dict[str, Any], params: dict[str, Any]) -> tuple:
+    """The numbers a question states that neither a term slot nor a parameter accounts for, as a
+    sorted tuple (with repeats): two questions compare under a reference only when these agree."""
+    import re
+
+    from .terms import normalise
+
+    text = normalise(question)
+    found: list[float] = []
+    for token in text.split():  # digits only: "one customer" is prose, "top 5" is a quantity
+        if re.fullmatch(r"\d+(?:\.\d+)?", token):
+            found.append(float(token))
+    accounted: list[float] = []
+    for value in list(slots.values()) + list(params.values()):
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for v in values:
+            try:
+                accounted.append(float(v))
+            except (TypeError, ValueError):
+                continue
+    for v in accounted:
+        if v in found:
+            found.remove(v)
+    years = [v for v in found if 1900 <= v <= 2100]  # dates in prose are not quantities
+    for v in years:
+        found.remove(v)
+    return tuple(sorted(found))
 
 
 def _parse_params(text: str) -> dict[str, Any]:

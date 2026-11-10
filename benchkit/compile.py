@@ -29,6 +29,7 @@ def compile_suite(
     out: Path | None = None,
     from_seeds: bool = False,
     rules_file: Path | None = None,
+    references_file: Path | None = None,
 ) -> Bundle:
     """``from_seeds`` builds one fixture per nasty seed by subsampling the suite's own databases
     with the ``subsample:`` predicates of ``rules_file`` (what the fixture study did), instead of
@@ -53,6 +54,25 @@ def compile_suite(
         for q in suite.questions
         if q.gold(engine)
     ]
+    if references_file is not None:
+        # Host-registered references (templated golds) replace the suite's gold of the same id.
+        import json
+
+        override = {}
+        for line in references_file.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                override[row.get("id") or row.get("key")] = row
+        kept = []
+        for ref in references:
+            row = override.pop(ref["key"], None)
+            if row is None:
+                kept.append(ref)
+                continue
+            question = suite.question(ref["key"])
+            params = dict(ref["params"])
+            kept.append({"key": ref["key"], "question": row["question"], "sql": row["sql"], "params": params, "n_default": row.get("n_default"), "slots": row.get("slots")})
+        references = kept + [{"key": k, **{kk: vv for kk, vv in v.items() if kk != "id"}} for k, v in override.items()]
     config: dict[str, Any] = {
         "dialect": engine,
         "snapshot_columns": config_block.get("snapshot_columns"),

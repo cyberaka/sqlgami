@@ -606,6 +606,8 @@ class Catalog:
                 continue
             kind = (statement.args.get("kind") or "").upper()
             if kind == "TABLE":
+                if statement.find(exp.PartitionedOfProperty) is not None:
+                    continue  # a partition of another table is storage, not a table of its own
                 table = _table_from_create(statement, dialect)
                 if table is not None:
                     catalog.add(table)

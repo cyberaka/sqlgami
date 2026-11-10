@@ -104,13 +104,24 @@ class Fixture:
         return self.texts[name]
 
     def digest(self) -> str:
-        """A content hash of the DDL and the tables' CSV text: the same fixture always hashes the
-        same, on any machine, whether built or read back from disk."""
+        """A content hash of the tables' DDL and CSV text: the same logical schema and rules give
+        the same digest on any machine, from any dialect's DDL file, whether built or read back.
+        The views' text is hashed separately (:meth:`views_digest`): two dialect files may spell
+        an equivalent view differently."""
         h = hashlib.sha256()
-        h.update(self.ddl.encode("utf-8"))
+        for statement in self.ddl.split(";\n"):
+            if statement.strip() and not statement.lstrip().upper().startswith("CREATE VIEW"):
+                h.update(statement.strip().encode("utf-8"))
         for name in sorted(self.tables):
             h.update(name.encode("utf-8"))
             h.update(self.text_of(name).encode("utf-8"))
+        return h.hexdigest()
+
+    def views_digest(self) -> str:
+        h = hashlib.sha256()
+        for statement in self.ddl.split(";\n"):
+            if statement.lstrip().upper().startswith("CREATE VIEW"):
+                h.update(statement.strip().encode("utf-8"))
         return h.hexdigest()
 
     def connect(self) -> Any:
@@ -156,7 +167,7 @@ class Fixture:
             (folder / f"{name}.csv").write_text(self.text_of(name), encoding="utf-8")
         (folder / "fixture.json").write_text(
             json.dumps({"name": self.name, "profile": self.profile, "seed": self.seed, "rows": self.row_count(), "digest": self.digest(),
-                        "tables": {n: len(r) for n, (_, r) in self.tables.items()}, "types": self.types}, indent=1),
+                        "views_digest": self.views_digest(), "tables": {n: len(r) for n, (_, r) in self.tables.items()}, "types": self.types}, indent=1),
             encoding="utf-8",
         )
 
@@ -204,7 +215,7 @@ def from_connection(
     where = {k.lower(): v for k, v in (where or {}).items()}
     for qualified in order:
         table = tables[qualified]
-        columns = [c.name for c in table.columns]
+        columns = [c.name.lower() for c in table.columns]  # fixtures are case-insensitive DuckDB: one spelling
         predicate = where.get(qualified) or where.get(table.name.lower())
         sql = f"SELECT {', '.join(columns)} FROM {qualified}"
         if predicate:
@@ -239,7 +250,7 @@ def build_one(catalog: Catalog, rules: FixtureRules, profile: str) -> Fixture:
     data: dict[str, tuple[list[str], list[tuple]]] = {}
     for qualified in order:
         table = tables[qualified]
-        columns = [c.name for c in table.columns]
+        columns = [c.name.lower() for c in table.columns]  # fixtures are case-insensitive DuckDB: one spelling
         rows = _rows_for(catalog, table, qualified, tables, data, rules, profile, rng)
         data[qualified] = (columns, rows)
     name = f"{profile}-s{rules.seed}"
@@ -278,13 +289,13 @@ def _view_ddl(catalog: Catalog) -> list[str]:
         if parsed is None:
             continue
         query, columns = parsed
-        if catalog.dialect != "duckdb":
-            try:
-                import sqlglot
+        try:
+            import sqlglot
 
-                query = sqlglot.transpile(query, read=catalog.dialect, write="duckdb")[0]
-            except Exception:
-                continue
+            # Rendered through the parser for every dialect, so the same view reads the same.
+            query = sqlglot.parse_one(query, read=catalog.dialect).sql(dialect="duckdb")
+        except Exception:
+            continue
         column_list = f" ({', '.join(columns)})" if columns else ""
         pending[qualified] = f"CREATE VIEW {qualified}{column_list} AS {query}"
     ordered: list[str] = []
@@ -345,7 +356,7 @@ def _rows_for(
     rng: random.Random,
 ) -> list[tuple]:
     columns = list(table.columns)
-    names = [c.name for c in columns]
+    names = [c.name.lower() for c in columns]
     is_parent = any(_parent_of(fk, tables, q) == qualified for q, t in tables.items() for fk in t.foreign_keys)
     count = rules.rows.get(qualified, rules.rows.get(table.name.lower(), DEFAULT_PARENT_ROWS if is_parent else DEFAULT_CHILD_ROWS))
     fk_of: dict[str, tuple[str, str]] = {}  # column -> (parent table, parent column)
@@ -354,8 +365,8 @@ def _rows_for(
         if parent is None or parent not in data:
             continue
         for col, ref in zip(fk.columns, fk.ref_columns):
-            fk_of[catalog.column_key(col)] = (parent, catalog.column_key(ref))
-    key_columns = {catalog.column_key(c) for c in table.primary_key}
+            fk_of[col.lower()] = (parent, ref.lower())
+    key_columns = {c.lower() for c in table.primary_key}
     snapshot_column = catalog.snapshot_columns.get(qualified) or catalog.snapshot_columns.get(table.name.lower())
     rows: list[list[Any]] = []
     seen_keys: set[tuple] = set()
@@ -374,7 +385,7 @@ def _rows_for(
         attempts += 1
         row: list[Any] = []
         for position, column in enumerate(columns):
-            key = catalog.column_key(column.name)
+            key = column.name.lower()  # one spelling whatever the dialect's case rules
             qualified_column = f"{qualified}.{key}"
             value: Any
             if key in fk_of and parent_pool.get(key):
@@ -391,7 +402,7 @@ def _rows_for(
                     value = None
             row.append(value)
         if key_columns:
-            key = tuple(row[names.index(c.name)] for c in columns if catalog.column_key(c.name) in key_columns)
+            key = tuple(row[names.index(c.name.lower())] for c in columns if c.name.lower() in key_columns)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -405,7 +416,7 @@ def _rows_for(
             index = [n.lower() for n in names].index(snapshot_column.lower())
             if isinstance(restated[index], dt.date):
                 restated[index] = restated[index] + dt.timedelta(days=14)
-                restated_key = tuple(restated[names.index(c.name)] for c in columns if catalog.column_key(c.name) in key_columns)
+                restated_key = tuple(restated[names.index(c.name.lower())] for c in columns if c.name.lower() in key_columns)
                 if not key_columns or restated_key not in seen_keys:
                     seen_keys.add(restated_key)
                     rows.append(restated)
@@ -424,8 +435,8 @@ def _rows_for(
         row = [critical.get(n, critical.get(n.lower())) for n in names]
         row = [_coerce(v, c, catalog) for v, c in zip(row, columns)]
         if key_columns:
-            key = tuple(row[names.index(c.name)] for c in columns if catalog.column_key(c.name) in key_columns)
-            rows = [r for r in rows if tuple(r[names.index(c.name)] for c in columns if catalog.column_key(c.name) in key_columns) != key]
+            key = tuple(row[names.index(c.name.lower())] for c in columns if c.name.lower() in key_columns)
+            rows = [r for r in rows if tuple(r[names.index(c.name.lower())] for c in columns if c.name.lower() in key_columns) != key]
         rows.append(row)
     return [tuple(r) for r in rows]
 
@@ -513,7 +524,7 @@ def _ddl(catalog: Catalog, tables: Sequence[Table], qualified: Sequence[str]) ->
             type_name = sqlglot_type_name(column.type, "duckdb")
             if type_name == "UNKNOWN":
                 type_name = "VARCHAR"
-            parts.append(f"{column.name} {type_name}")
+            parts.append(f"{column.name.lower()} {type_name}")
             declared.append(type_name)
         statements.append(f"CREATE TABLE {name} ({', '.join(parts)})")
         types[name] = declared

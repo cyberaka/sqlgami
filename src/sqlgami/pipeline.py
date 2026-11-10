@@ -666,6 +666,14 @@ def _fixture_stage(
         _stage(report, name, StageStatus.NOT_RUN, f"no reference for these values: the question does not bind {', '.join('{' + k + '}' for k in unbound)}")
         report.signals["fixtures"] = {"reference": reference.key, "matched_by": how, "verdict": "unverified", "reason": "unbound", "slots": slots, "params": live_params, "fixtures": []}
         return
+    # Numbers the questions state that no term binds ("top 3" when no top_n term exists) must be
+    # the same in both questions, or the comparison would silently use the reference's number.
+    free_here = B.free_numbers(question or "", slots, params or {})
+    free_there = B.free_numbers(reference.question, reference.slots, reference.params)
+    if free_here != free_there:
+        _stage(report, name, StageStatus.NOT_RUN, f"no reference for these values: the question's numbers {sorted(free_here)} differ from the reference's {sorted(free_there)} and no term binds them")
+        report.signals["fixtures"] = {"reference": reference.key, "matched_by": how, "verdict": "unverified", "reason": "free_numbers", "slots": slots, "params": live_params, "fixtures": []}
+        return
     live_slots = dict(reference.slots)
     live_slots.update({k: v for k, v in slots.items() if k in reference.slots or k in reference.slot_names_in_sql})
     same_values = live_params == reference.params and live_slots == reference.slots
