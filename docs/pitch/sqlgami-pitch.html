@@ -319,6 +319,7 @@ GROUP  BY 1</pre>
     <tr><td>Same, strict 50 ms budget</td><td class="n">0.955 AUROC</td><td>Some answer checks are cut for time and reported as skipped</td></tr>
     <tr><td>BigQuery held-out, first run</td><td class="n">0.912 AUROC</td><td>Before 40 BigQuery fixes</td></tr>
     <tr><td>BigQuery held-out, re-test (w5v)</td><td class="n">0.82 AUROC</td><td>First contact, after the 40 BigQuery fixes; a harder set (33/168 correct) — lower than the first run; 0.86 after fixes found on it</td></tr>
+    <tr><td>Table-valued function held-out</td><td class="n">0.868 AUROC</td><td>0.84 on TVF-calling queries; 0.60 without the answer check</td></tr>
     <tr><td>Correct LLM queries wrongly flagged</td><td class="n">1 of 63</td><td>Real BigQuery gold, static checks</td></tr>
     <tr><td>Median score of correct queries</td><td class="n">0.81</td><td>Static checks on BigQuery dev set, after false-alarm fixes</td></tr>
     <tr><td>Planted mistakes caught by rules alone</td><td class="n">8 of 15</td><td>The rest are value errors that need the answer check</td></tr>

@@ -91,7 +91,7 @@ glossary.yaml, `terms/` workbook, generate.py) and `holdout/hr_snapshot_w1 … w
 | w5 base (11 questions, scripts + plain equivalents, native-verified) | released as references only |
 | w5v (21 variants, 168 candidates) | released and scored ONCE (§7); now dev |
 | w6 base (7 TVF/view questions) | released as references; bundle `dfb5c050…` (no expansion: the model step hung) |
-| w6v (19 variants after q040v1-a/c excluded, 152 candidates) | released; run once at `438710c` but NOT MEASURED — labels invalid (H16); still an honest run once H16 is done, if nothing is tuned on it |
+| w6v (19 variants after q040v1-a/c excluded, 152 candidates) | released; scored ONCE at `438710c` + `dfb5c050…`, relabelled by the bench author on datasets holding the routines (§7); now dev |
 | w7, w7v | **held out, never opened, unscored** |
 
 The rule: a held-out set is scored once at a frozen bundle and a stated commit, under unlimited
@@ -192,12 +192,10 @@ Convention: a defect is a strict xfail that turns red when fixed; remove the mar
   (`multiple_statements`, 0.05); w5v q032 variants are such scripts. A bounded interpreter for
   `IF NOT EXISTS (...) THEN SET` fallbacks would cover the owner's idiom.
 - **H16 — native labels for TVF/view sets.** `benchkit` loads the bench seed datasets with
-  tables only; the w6 schema's TVFs, views and UDF are not created in the sandbox, so every w6v
-  gold and 143/152 candidates fail natively and no label is valid. Create the routine and view
-  DDL in each `bench_hr_snapshot_s<seed>_hr` dataset (`load_seed`, sandbox only, `bench_`
-  prefix, recorded in the ledger), then score w6v once at `438710c` + `dfb5c050…` without
-  touching the code first. The fixture verdicts of the unmeasured run are in
-  `bench/.runs/w6v-bq-b/`.
+  tables only, so `evaluate --engine bigquery` cannot label a TVF/view set itself; w6v was
+  labelled by the bench author on `bench_sherlock_hr_w5_s<seed>_hr[_ref|_mart]`, which hold the
+  routines. Make `load_seed` create the routine and view DDL in each seed dataset (sandbox only,
+  `bench_` prefix, ledger) so the labeller works unaided.
 - **H12 — docs/packaging**: `sqlgami init|doctor` accepting an INFORMATION_SCHEMA JSON/JSONL
   dump directly; wheel verified in a fresh venv at 0.1.0.
 
@@ -218,7 +216,7 @@ AUROC over all candidates; "correct ≤ 0.4" = false alarms; "wrong ≥ 0.8" = c
 | Dev false alarms | 224 candidates with real gold | 1/63 before batch 5/6 fixes; 0/88 on the 168 labelled after |
 | Ceiling experiment | `ceiling.py`, 168 labelled dev candidates, frozen w4 bundle | baseline median correct 0.811, AUROC 0.944; + uniqueness fact 0.812 / 0.948; LOW inform-only 0.819 / 0.938 |
 | w5v held-out (BigQuery) | first contact at `aa9b2ad`, then `438710c` after fixes found on this set; bundle `601bedb8…`, 168 candidates, unlimited and 50 ms, with and without the bundle | first contact AUROC 0.818 without / 0.800 with the bundle (0.814 at 50 ms), correct ≤ 0.4 5/33; after fixes 0.863 / 0.842 / 0.859, 2/33; wrong ≥ 0.8 0/135 (4/135 with the bundle, H13); §7.1 |
-| w6v held-out (TVF/view) | once at `438710c` + bundle `dfb5c050…`, 152 candidates | NOT MEASURED: native labels invalid (H16); fixtures 55 match / 7 mismatch / 70 none; 64/152 cut at 50 ms |
+| w6v held-out (TVF/view) | once at `438710c` + bundle `dfb5c050…`, 152 candidates; labels by the bench author's native relabel (11 seeds, `W6V_RESULT.md`) | 95 correct / 57 wrong; AUROC 0.708 without / 0.868 with the bundle; correct ≤ 0.4 3/95; wrong ≥ 0.8 0 / 1; TVF callers (88) 0.604 → 0.838; fixtures 55 match / 7 mismatch / 70 none; 64/152 cut at 50 ms |
 | Latency | `benchkit latency --deadline 50 --bundle` on 60–80-line scripts | w4 p50 36 / p99 88 ms (6/33 over 50); w4v2 p50 29 / p99 53; parse alone 17–26 ms |
 
 ### 7.1 w5v (recorded once; the honest BigQuery figure of this release)

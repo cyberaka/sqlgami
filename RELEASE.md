@@ -170,8 +170,9 @@ Known limitations of this release:
   The offline dry run (`sqlgami.contrib.bigquery`, sandbox only) is the check for that class.
 - **L5 — Unicode casing** (`UPPER('ß')`) follows ICU in BigQuery and not in DuckDB.
 - **L6 — TVF/UDF support** is tested on synthetic schemas and the fixture path end to end
-  (TVF over TVF, view over TVF, wrong and swapped arguments); the held-out TVF set (w6v) could
-  not be labelled natively in this release (§9), so there is no measured number for it.
+  (TVF over TVF, view over TVF, wrong and swapped arguments) and measured on the held-out TVF
+  set (§9: AUROC 0.868 with the bundle, 0.838 on TVF-calling candidates; the labels were made
+  after the tag on datasets holding the routines).
 - **L7 — calibration** does not ship; `calibrated` is false.
 - **L8 — the catalogue decides.** A question whose numbers no term binds, or whose wording no
   reference pattern matches, gets no fixture verdict; the workbook is the host's, and its gaps
@@ -223,15 +224,17 @@ static mode (no live engine), scored **once** per held-out set at the stated com
   bucketing, ARRAY_AGG projections, pivots) and six of its eleven base references could not
   compile (L2), so most candidates had no fixture to be judged on.
 - **Held-out w6v (TVF/view set, 19 variants after the author excluded q040v1-a/c, 152
-  candidates) at `438710c` + bundle `dfb5c050…`: NOT MEASURED.** The native labeller runs
-  every gold and candidate on the sandbox's bench seed datasets, which hold the tables only —
-  not the TVFs, views and the UDF the w6 schema declares — so all 19 variant golds and 143/152
-  candidates failed natively ("table-valued function not found") and no label is valid. The
-  fixture stage itself ran on the bundle (55 match, 7 mismatch, 70 no reference, 12 fixed
-  values, 3 runaway; TVF callers 126/152), but without labels those verdicts cannot be scored.
-  The bench's seed datasets need the routine and view DDL created in the sandbox before w6v can
-  be scored once (H16). Latency with the bundle at 50 ms: p50 21 / p90 33 / p99 40 ms,
-  64/152 cut by the deadline (TVF expansion makes the statements heavier).
+  candidates) at `438710c` + bundle `dfb5c050…`, scored once, labelled afterwards** (post-tag
+  doc update: the scores are the one-shot run's; the bench author relabelled them natively on
+  datasets that hold the TVFs, views and UDF — 11 seeds, multiset compare against the variant
+  gold, 0 gold errors; `W6V_RESULT.md` in the bench archive): 95 correct / 57 wrong. Without
+  the bundle: AUROC **0.708**; correct ≤ 0.4: 3/95; wrong ≤ 0.4: 25/57; wrong ≥ 0.8: 0/57. With
+  the bundle: AUROC **0.868**; correct ≤ 0.4: 3/95; wrong ≤ 0.4: 31/57; wrong ≥ 0.8: 1/57.
+  TVF-calling candidates (88): 0.604 without the bundle → 0.838 with it. Fixture stage: 55
+  match, 7 mismatch, 70 no reference, 12 fixed values, 3 runaway; latency with the bundle at
+  50 ms p50 21 / p90 33 / p99 40 ms, 64/152 cut by the deadline (TVF expansion makes the
+  statements heavier). The tag's text said "NOT MEASURED" because the maintainers' seed
+  datasets held no routines (H16); the labels above come from the bench author's datasets.
 - **Latency** on 60–80-line BigQuery scripts with the bundle: p50 29–36 ms, p99 53–88 ms;
   parse alone 17–26 ms.
 
