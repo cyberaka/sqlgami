@@ -75,16 +75,16 @@ BYPASS_ALIAS_SHADOW = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="a table aliased AS a system-table name adds that name to the global defined-names set, so a real read of the system table in the same statement is skipped and sent")
 @pytest.mark.parametrize("label,sql,dialect", BYPASS_ALIAS_SHADOW, ids=[c[0] for c in BYPASS_ALIAS_SHADOW])
 def test_alias_shadowing_does_not_smuggle_a_catalog_read(label, sql, dialect):
     assert not _sent(sql, dialect)
 
 
 def test_alias_shadow_really_discloses_sqlite_master():
-    """Runtime proof on a throwaway temp DB: the aliased form reads the real sqlite_master."""
+    """Why it matters, on a throwaway temp DB: the aliased form reads the real sqlite_master. The
+    gate now refuses both forms, so through sqlgami it never runs."""
     sql = "SELECT m.name, m.sql FROM t AS sqlite_master, sqlite_master m WHERE m.type = 'table'"
-    assert _sent(sql, "sqlite"), "precondition: the gate sends it today"
+    assert not _sent(sql, "sqlite")
     assert not _sent("SELECT name, sql FROM sqlite_master", "sqlite"), "the direct form is blocked"
     tmp = tempfile.mkdtemp()
     try:
@@ -92,8 +92,6 @@ def test_alias_shadow_really_discloses_sqlite_master():
         conn.executescript("CREATE TABLE t(x); INSERT INTO t VALUES (1); CREATE TABLE secret_users(name, pw);")
         names = [r[0] for r in conn.execute(sql).fetchall()]
         conn.close()
-        if "secret_users" in names:
-            pytest.xfail("the aliased form is sent and discloses the real sqlite_master (lists secret_users)")
-        assert "secret_users" not in names
+        assert "secret_users" in names  # the engine would disclose it; the gate is what stands in the way
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -241,14 +241,16 @@ def review_tables(tree: exp.Expression, dialect: str | None, allowed: Iterable[s
     if schemas is None and not prefixes:
         return []
     host = {name.lower() for name in allowed}
-    defined = _defined_names(tree)
+    # Only a CTE can stand in for a table name. An alias never does: in
+    # ``FROM t AS sqlite_master, sqlite_master m`` the second name is the real catalogue.
+    ctes = {cte.alias.lower() for cte in tree.find_all(exp.CTE) if cte.alias}
     refused: set[str] = set()
     for node in tree.find_all(exp.Table):
         if not isinstance(node.this, exp.Identifier):
             continue
         name = node.name.lower()
         schema = (node.db or "").lower()
-        if not schema and name in defined:
+        if not schema and name in ctes:
             continue
         full = f"{schema}.{name}" if schema else name
         if full in host or name in host or (schema and f"{schema}.*" in host):
