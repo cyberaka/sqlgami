@@ -1,0 +1,63 @@
+{
+  "description": "Batch 6: scored every BigQuery gold (expect high) and every planted bug (expect low) in static mode with question text + params, and redid the 224-candidate false-alarm rate with REAL gold labels. Dev gold from holdout w4/w4v/w4v2/w5 (released/dev; held-out w5v/w6/w6v/w7 were NOT fetched).",
+  "part1_false_alarm_rate_real_gold": {
+    "candidates": 224,
+    "correct_by_real_gold": 63,
+    "note": "stricter than the batch-5 native-consensus proxy (126); correctness = candidate native == gold native on all of clean-1/nasty-42/nasty-44",
+    "correct_scored_le_0_4": 1,
+    "rate_le_0_4": "1.6%",
+    "correct_with_high": 1,
+    "rate_high": "1.6%",
+    "case": "hr_snapshot-q027 (gemma-3-27b), required_predicate HIGH on the IN-subquery hierarchy scope (batch-5 finding), now scored 0.087 with question text",
+    "correct_score_distribution": {"min": 0.087, "median": 0.540, "max": 0.588}
+  },
+  "part2_gold_scores": {
+    "mode": "static",
+    "n_scored": 26,
+    "native_only_excluded": 13,
+    "native_only_note": "w5 control-flow scripts (DECLARE + IF/SET/END IF) are bigquery_(script_)native_only; sqlgami correctly declines to bind them (kind=multiple), scoring ~0.05 -- not a false alarm, consistent with batch-3 'binder does not pretend'.",
+    "median": 0.536,
+    "min": 0.103,
+    "max": 0.588,
+    "ceiling_note": "NO gold reaches 'confident' (max 0.588). Correct answers are capped in the 0.50-0.59 band by ubiquitous partition_filter (LOW) and recurring scalar_subquery_rows / top_n / limit_without_order (MEDIUM).",
+    "golds_le_0_4_with_high": [
+      {"id": "hr_snapshot-q025", "score": 0.118, "finding": "term_rank"},
+      {"id": "hr_snapshot-q025a", "score": 0.118, "finding": "term_rank"},
+      {"id": "hr_snapshot-q025b", "score": 0.118, "finding": "term_rank"},
+      {"id": "hr_snapshot-q025c", "score": 0.118, "finding": "term_rank"},
+      {"id": "hr_snapshot-q031", "score": 0.103, "finding": "required_predicate"}
+    ]
+  },
+  "part2_bug_catch_rate": {
+    "mode": "static",
+    "bugs": 15,
+    "caught_le_0_4": 8,
+    "catch_rate": "53.3%",
+    "note": "static mode has no execution, so value bugs that produce valid SQL with wrong numbers cannot be caught statically -- they need the fixtures/translation stage. Structural/predicate bugs are caught.",
+    "misses_by_class": {
+      "wrong_column": "5/7 missed (value bugs, need execution)",
+      "missing_required_predicate": "1/1 missed (b038 -- a glossary hire_dt-in-window predicate, not the hierarchy check; a semantic/term bug)",
+      "array_agg_wrong_order": "1/1 missed (ordering inside ARRAY_AGG; value-level, needs execution)"
+    }
+  },
+  "findings": [
+    {
+      "id": "required_predicate_unnest_pivot_scope",
+      "severity": "HIGH",
+      "finding_code": "required_predicate",
+      "gold": "hr_snapshot-q031 (score 0.103)",
+      "symptom": "the or_chain hierarchy matcher does not recognize an UNNEST-pivot scope (explode the 12 level columns into one node_id via UNNEST([STRUCT(...)]) and filter node_id = manager); a correct gold is flagged HIGH. Together with the IN-subquery form (batch 5, q027) the matcher misses multiple idiomatic scopings, including the owner's own gold.",
+      "minimal_construct": "SELECT COUNT(DISTINCT eps.assoc_id) FROM emp_period_snapshot eps, UNNEST([STRUCT(eps.lvl_2_id AS node_id), ... all 12 ...]) x WHERE eps.status_cd='A' AND x.node_id = 12003",
+      "test": "tests/test_redteam_bq_false_alarms_gold.py"
+    },
+    {
+      "id": "term_rank_limit_in_scalar_subquery",
+      "severity": "HIGH",
+      "finding_code": "term_rank",
+      "gold": "hr_snapshot-q025 (+a/b/c) (score 0.118)",
+      "symptom": "term_rank reports 'the query uses a plain row limit' and fires HIGH on a correct top-N that uses QUALIFY DENSE_RANK() OVER (ORDER BY active_n DESC) <= 3 -- solely because of an unrelated LIMIT 1 inside a current-period scalar subquery (period_end_dt = (SELECT ppe_dt ... is_current_flag LIMIT 1)). Removing that incidental LIMIT 1 clears the HIGH.",
+      "minimal_construct": "a top-N with QUALIFY DENSE_RANK() <= 3 whose scope includes period_end_dt = (SELECT ppe_dt ... LIMIT 1); the DENSE_RANK top-N is correct, the LIMIT 1 is incidental",
+      "test": "tests/test_redteam_bq_false_alarms_gold.py"
+    }
+  ]
+}
