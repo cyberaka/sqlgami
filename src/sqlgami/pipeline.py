@@ -797,7 +797,16 @@ def _fixture_stage(
     elif matched:
         _stage(report, name, StageStatus.PASSED, f"matches the reference on {matched} fixture(s)", clock.lap())
     else:
-        _stage(report, name, StageStatus.SKIPPED, "no fixture could be run in time", clock.lap())
+        statuses = {f["status"] for f in outcome["fixtures"]}
+        if statuses and statuses <= {"no_evidence"}:
+            detail = "the reference returns no rows on any fixture under these values, so nothing could be compared"
+        elif statuses and statuses <= {"no_evidence", "not_run"} and "not_run" in statuses:
+            detail = "no fixture could be run in time"
+        elif statuses:
+            detail = "no fixture gave a verdict (" + ", ".join(sorted(statuses)) + ")"
+        else:
+            detail = "the reference has no stored results"
+        _stage(report, name, StageStatus.SKIPPED, detail, clock.lap())
 
 
 def _differing_rows(stored: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
