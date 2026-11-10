@@ -157,6 +157,12 @@ def test_pattern_matching_with_slots(tmp_path):
             "Which are the largest 5 customers by paid order value?",
         )
         assert wrong.signals["fixtures"]["verdict"] == "mismatch"
+        # a question that does not say its N is not compared under the reference's N
+        silent = scorer.explain(
+            "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.name ORDER BY spend DESC LIMIT 3",
+            "The top paid customers by order value",
+        )
+        assert silent.stage("fixtures").status == StageStatus.NOT_RUN  # another pattern (no top_n term), or an unbound slot: never the reference's N
         # a reference fixed at one value cannot serve another: not run, never guessed
         report = scorer.explain("SELECT id FROM orders WHERE status = 'paid' ORDER BY total DESC LIMIT 4", "The top 4 paid orders")
         assert report.stage("fixtures").status == StageStatus.NOT_RUN and "no reference for these values" in (report.stage("fixtures").detail or "")

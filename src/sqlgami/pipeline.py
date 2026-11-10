@@ -659,6 +659,13 @@ def _fixture_stage(
     live_params = dict(reference.params)
     if params:
         live_params.update({k: v for k, v in params.items() if k in reference.params or not reference.params})
+    # Every slot the reference binds must be bound by the question too; a question that does not
+    # say its N is not compared under the reference's N.
+    unbound = sorted(k for k in reference.slots if k not in slots)
+    if unbound:
+        _stage(report, name, StageStatus.NOT_RUN, f"no reference for these values: the question does not bind {', '.join('{' + k + '}' for k in unbound)}")
+        report.signals["fixtures"] = {"reference": reference.key, "matched_by": how, "verdict": "unverified", "reason": "unbound", "slots": slots, "params": live_params, "fixtures": []}
+        return
     live_slots = dict(reference.slots)
     live_slots.update({k: v for k, v in slots.items() if k in reference.slots or k in reference.slot_names_in_sql})
     same_values = live_params == reference.params and live_slots == reference.slots
