@@ -84,9 +84,14 @@ def test_reference_by_key_and_parameters_and_no_reference(bundle_dir):
     with Scorer("duckdb", catalog=SHOP_DDL, bundle=bundle_dir) as scorer:
         by_key = scorer.explain("SELECT COUNT(*) FROM orders WHERE status = 'paid'", "paid orders, worded differently", reference="ex2")
         assert by_key.signals["fixtures"]["verdict"] == "match" and by_key.signals["fixtures"]["matched_by"] == "key"
-        # the candidate runs under the reference's parameter values, whatever the caller passed
-        with_params = scorer.explain("SELECT SUM(total) FROM orders WHERE customer_id = {customer}", "Spend of one customer", params={"customer": 999})
-        assert with_params.signals["fixtures"]["verdict"] == "match" and with_params.signals["fixtures"]["params"] == {"customer": 1}
+        # the reference's own values use the stored fingerprints; other values re-run the reference live
+        same = scorer.explain("SELECT SUM(total) FROM orders WHERE customer_id = {customer}", "Spend of one customer", params={"customer": 1})
+        assert same.signals["fixtures"]["verdict"] == "match" and same.signals["fixtures"]["reference_rerun"] is False
+        other = scorer.explain("SELECT SUM(total) FROM orders WHERE customer_id = {customer}", "Spend of one customer", params={"customer": 2})
+        assert other.signals["fixtures"]["verdict"] == "match" and other.signals["fixtures"]["reference_rerun"] is True
+        assert other.signals["fixtures"]["params"] == {"customer": 2}
+        wrong = scorer.explain("SELECT SUM(total) FROM orders WHERE customer_id = {customer} AND status = 'paid'", "Spend of one customer", params={"customer": 2})
+        assert wrong.signals["fixtures"]["verdict"] == "mismatch"
         none = scorer.explain("SELECT COUNT(*) FROM orders", "a question nobody registered")
         assert none.stage("fixtures").status == StageStatus.NOT_RUN and "no reference" in (none.stage("fixtures").detail or "")
         assert none.verdict.value != "likely_right"
@@ -112,3 +117,46 @@ def test_fixtures_respect_the_deadline(bundle_dir):
         report = scorer.explain(RIGHT, QUESTION)
         assert (time.perf_counter() - started) * 1000 < 50 + 250
         assert report.signals["fixtures"]["matched"] == 4
+
+
+def test_pattern_matching_with_slots(tmp_path):
+    """Hosts register a reference per question PATTERN: the same terms with other numbers and
+    parameters must find it, and the reference, written over {n}, is re-run for those values."""
+    (tmp_path / "schema.sql").write_text(SHOP_DDL)
+    terms = tmp_path / "terms"
+    terms.mkdir()
+    (terms / "Terms.csv").write_text(
+        "term,phrases,kind,table,sql,nulls,description\n"
+        "paid,paid,filter,orders,status = 'paid',,\n"
+        "top_n,top {n};largest {n},,,,,documentation: the n largest\n"
+        "spend,spend;order value,,,,,documentation\n"
+    )
+    top3_sql = "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.name ORDER BY spend DESC LIMIT {n}"
+    fixed_sql = "SELECT id FROM orders WHERE status = 'paid' ORDER BY total DESC LIMIT 2"
+    (terms / "Examples.csv").write_text(
+        "id,question,params,correct_sql,expected_result,dataset\n"
+        f'top3,"The top 3 customers by paid spend",,"{top3_sql}",,\n'
+        f'fixed,"The top 2 paid orders",,"{fixed_sql}",,\n'
+    )
+    (tmp_path / "sqlgami.yaml").write_text("dialect: duckdb\nschema: schema.sql\nterms: terms\nfixtures: {seed: 2, profiles: [clean, ties], values: {orders.status: [paid, open]}}\n")
+    compile_bundle(tmp_path / "sqlgami.yaml", tmp_path / "bundle")
+    bundle = Bundle.load(tmp_path / "bundle")
+    top3 = bundle.reference_for(None, "top3")[0]
+    assert top3.terms == ("paid", "spend", "top_n") and top3.slots == {"n": 3} and top3.slot_names_in_sql == {"n"}
+    with Scorer("duckdb", catalog=SHOP_DDL, bundle=tmp_path / "bundle") as scorer:
+        # a paraphrase with another n: matched by pattern, reference re-run with n = 5
+        five = scorer.explain(
+            "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.name ORDER BY spend DESC LIMIT 5",
+            "Which are the largest 5 customers by paid order value?",
+        )
+        signal = five.signals["fixtures"]
+        assert signal["matched_by"] == "pattern" and signal["slots"] == {"n": 5} and signal["reference_rerun"] is True
+        assert signal["verdict"] == "match", signal
+        wrong = scorer.explain(
+            "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name ORDER BY spend DESC LIMIT 5",
+            "Which are the largest 5 customers by paid order value?",
+        )
+        assert wrong.signals["fixtures"]["verdict"] == "mismatch"
+        # a reference fixed at one value cannot serve another: not run, never guessed
+        report = scorer.explain("SELECT id FROM orders WHERE status = 'paid' ORDER BY total DESC LIMIT 4", "The top 4 paid orders")
+        assert report.stage("fixtures").status == StageStatus.NOT_RUN and "no reference for these values" in (report.stage("fixtures").detail or "")

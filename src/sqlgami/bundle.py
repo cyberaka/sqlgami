@@ -64,21 +64,32 @@ class Reference:
     question: str
     sql: str
     params: dict[str, Any] = field(default_factory=dict)
-    terms: tuple[str, ...] = ()  # names of the catalogue terms the question matched, for matching
+    terms: tuple[str, ...] = ()  # names of the catalogue terms the question matched: the question's PATTERN
+    slots: dict[str, Any] = field(default_factory=dict)  # numbers the question bound into those terms ({n: 26})
     results: dict[str, dict[str, Any]] = field(default_factory=dict)  # fixture name -> stored result
 
     @property
     def question_key(self) -> str:
         return normalise(self.question).strip()
 
+    @property
+    def slot_names_in_sql(self) -> set[str]:
+        """Slots the reference SQL is written over (``{n}``), so it can be re-run for other values."""
+        import re
+
+        return set(re.findall(r"\{(n|m)\}", self.sql))
+
     def to_dict(self) -> dict[str, Any]:
-        return {"key": self.key, "question": self.question, "sql": self.sql, "params": self.params, "terms": list(self.terms), "results": self.results}
+        return {
+            "key": self.key, "question": self.question, "sql": self.sql, "params": self.params,
+            "terms": list(self.terms), "slots": self.slots, "results": self.results,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Reference":
         return cls(
             str(data["key"]), str(data["question"]), str(data["sql"]), dict(data.get("params") or {}),
-            tuple(data.get("terms") or ()), dict(data.get("results") or {}),
+            tuple(data.get("terms") or ()), dict(data.get("slots") or {}), dict(data.get("results") or {}),
         )
 
 
@@ -181,7 +192,7 @@ def compile_bundle(
             problems: list[str] = []
             for fixture in fixtures:
                 started = time.perf_counter()
-                outcome = _run_on(connections[fixture.name], reference.sql, dialect, reference.params)
+                outcome = _run_on(connections[fixture.name], reference.sql, dialect, reference.params, slots=reference.slots)
                 timings[fixture.name].append((time.perf_counter() - started) * 1000)
                 if outcome.get("error"):
                     problems.append(f"{fixture.name}: {outcome['error']}")
@@ -255,9 +266,31 @@ def _references(config: dict[str, Any], catalogue: Catalogue | None) -> list[Ref
             raise ConfigurationError(f"two references share the key {reference.key!r}")
         seen.add(reference.key)
         if catalogue is not None:
-            reference.terms = tuple(sorted({m.name.lower() for m in catalogue.match(reference.question)}))
+            matches = catalogue.match(reference.question)
+            reference.terms = tuple(sorted({m.name.lower() for m in matches}))
+            reference.slots = slot_values(matches)
         unique.append(reference)
     return unique
+
+
+def slot_values(matches: Sequence[Any]) -> dict[str, Any]:
+    """The numbers a question binds into its terms' ``{n}``/``{m}`` slots: ``{"n": 26}``. A slot
+    bound to two different numbers in one question is ambiguous and dropped."""
+    from .terms import bound_number
+
+    found: dict[str, Any] = {}
+    clashed: set[str] = set()
+    for match in matches:
+        for slot, text in (match.bindings or {}).items():
+            value = bound_number(text)
+            if value is None:
+                continue
+            if slot in found and found[slot] != value:
+                clashed.add(slot)
+            found[slot] = value
+    for slot in clashed:
+        found.pop(slot, None)
+    return found
 
 
 def _parse_params(text: str) -> dict[str, Any]:
@@ -295,9 +328,11 @@ def _scalar(text: str) -> Any:
         return text
 
 
-def _executable(sql: str, dialect: str, params: dict[str, Any]) -> str:
+def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str, Any] | None = None) -> str:
     from . import template
 
+    for slot, value in (slots or {}).items():
+        sql = sql.replace("{" + slot + "}", str(int(value)) if isinstance(value, (int, float)) and float(value).is_integer() else str(value))
     prepared = template.prepare(sql, dialect, params or None)
     text = prepared.executable_sql or sql
     if dialect != "duckdb":
@@ -305,12 +340,12 @@ def _executable(sql: str, dialect: str, params: dict[str, Any]) -> str:
     return text
 
 
-def _run_on(conn: Any, sql: str, dialect: str, params: dict[str, Any], timeout_s: float | None = None) -> dict[str, Any]:
+def _run_on(conn: Any, sql: str, dialect: str, params: dict[str, Any], timeout_s: float | None = None, slots: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run ``sql`` on a fixture connection and return the stored form of its result."""
     from .engines.duckdb import DuckDBAdapter
 
     try:
-        text = _executable(sql, dialect, params)
+        text = _executable(sql, dialect, params, slots)
     except Exception as exc:
         return {"ok": False, "error": f"could not prepare: {exc}"}
     adapter = DuckDBAdapter(conn)
@@ -345,7 +380,7 @@ class Bundle:
         for r in references:
             if r.terms:
                 by_terms.setdefault(r.terms, []).append(r)
-        self._by_terms = {k: v[0] for k, v in by_terms.items() if len(v) == 1}
+        self._by_terms = by_terms  # a pattern (term set) -> its references; usable only when exactly one
 
     @classmethod
     def load(cls, path: str | Path) -> "Bundle":
@@ -403,8 +438,8 @@ class Bundle:
 
     def reference_for(self, question: str | None, key: str | None = None, terms: Sequence[str] = ()) -> tuple[Reference | None, str]:
         """The reference for a question: by explicit key, by the exact question text, or by the
-        exact set of matched catalogue terms when that set belongs to one reference only.
-        Returns ``(reference, how)``."""
+        question's PATTERN — the exact set of catalogue terms it matched — when that pattern
+        belongs to one reference only. Returns ``(reference, how)``; ``how`` says why not."""
         if key:
             found = self._by_key.get(key)
             return (found, "key") if found else (None, f"no reference with key {key!r}")
@@ -413,9 +448,12 @@ class Bundle:
             if found is not None:
                 return found, "question"
         if terms:
-            found = self._by_terms.get(tuple(sorted(t.lower() for t in terms)))
-            if found is not None:
-                return found, "terms"
+            candidates = self._by_terms.get(tuple(sorted(t.lower() for t in terms))) or []
+            if len(candidates) == 1:
+                return candidates[0], "pattern"
+            if len(candidates) > 1:
+                keys = ", ".join(r.key for r in candidates[:4])
+                return None, f"the question's pattern matches {len(candidates)} references ({keys}); register a distinguishing term or name the reference"
         return None, "no reference matches this question"
 
     def close(self) -> None:

@@ -630,20 +630,40 @@ def _fixture_stage(
     if any(f.severity == Severity.ERROR for f in report.findings):
         _stage(report, name, StageStatus.NOT_RUN, "the statement cannot run")
         return
+    from . import bundle as B
+
     matched_terms: list[str] = []
+    slots: dict[str, Any] = {}
     if terms is not None and question:
         try:
-            matched_terms = sorted({m.name.lower() for m in terms.match(question)})
+            matches = terms.match(question)
+            matched_terms = sorted({m.name.lower() for m in matches})
+            slots = B.slot_values(matches)
         except Exception:
-            matched_terms = []
+            matched_terms, slots = [], {}
     reference, how = bundle.reference_for(question, reference_key, matched_terms)
     if reference is None:
         _stage(report, name, StageStatus.NOT_RUN, how)
         return
-    from . import bundle as B
+    # The candidate's own values: the question's slots ({n}) and the template parameters it was
+    # given. When they equal the reference's, the stored fingerprints serve; otherwise the
+    # reference must be a template over those slots and is re-run live beside the candidate.
+    live_params = dict(reference.params)
+    if params:
+        live_params.update({k: v for k, v in params.items() if k in reference.params or not reference.params})
+    live_slots = dict(reference.slots)
+    live_slots.update({k: v for k, v in slots.items() if k in reference.slots or k in reference.slot_names_in_sql})
+    same_values = live_params == reference.params and live_slots == reference.slots
+    if not same_values:
+        differing_slots = {k for k, v in live_slots.items() if reference.slots.get(k) != v}
+        missing = differing_slots - reference.slot_names_in_sql
+        if missing:
+            _stage(report, name, StageStatus.NOT_RUN, f"no reference for these values: the reference is fixed at {', '.join(f'{k}={reference.slots.get(k)}' for k in sorted(missing))}")
+            report.signals["fixtures"] = {"reference": reference.key, "matched_by": how, "verdict": "unverified", "reason": "values", "slots": live_slots, "params": live_params, "fixtures": []}
+            return
 
     clock = _Clock()
-    outcome: dict[str, Any] = {"reference": reference.key, "matched_by": how, "params": reference.params, "fixtures": []}
+    outcome: dict[str, Any] = {"reference": reference.key, "matched_by": how, "params": live_params, "slots": live_slots, "reference_rerun": not same_values, "fixtures": []}
     matched = 0
     mismatch: Finding | None = None
     for entry in bundle.fixture_order():
@@ -651,12 +671,9 @@ def _fixture_stage(
         stored = reference.results.get(fixture_name)
         if not stored or not stored.get("ok"):
             continue
-        if not stored.get("row_count"):
-            # An empty reference result proves nothing: any query returning nothing would match.
-            outcome["fixtures"].append({"fixture": fixture_name, "status": "no_evidence", "reason": "the reference returns no rows on this fixture"})
-            continue
         left = deadline.remaining_ms()
-        needed = (entry.get("reference_max_ms") or 5.0) * 2 + 2.0
+        per_run = (entry.get("reference_max_ms") or 5.0)
+        needed = per_run * (4 if not same_values else 2) + 2.0
         if left is not None and left < needed:
             deadline.cut(name)
             outcome["fixtures"].append({"fixture": fixture_name, "status": "not_run", "reason": DEADLINE})
@@ -667,8 +684,22 @@ def _fixture_stage(
         except Exception as exc:
             outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": str(exc)[:160]})
             continue
-        # The candidate runs under the reference's own parameter values, so the two compare.
-        result = B._run_on(conn, sql, dialect, dict(reference.params), timeout_s=timeout_s)
+        if not same_values:
+            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots)
+            if not stored.get("ok"):
+                outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": f"the reference fails under these values: {str(stored.get('error'))[:120]}"})
+                continue
+            left = deadline.remaining_ms()
+            timeout_s = min(options.timeout_s, left / 1000) if left is not None else options.timeout_s
+            if left is not None and left <= 0:
+                deadline.cut(name)
+                outcome["fixtures"].append({"fixture": fixture_name, "status": "not_run", "reason": DEADLINE})
+                continue
+        if not stored.get("row_count"):
+            # An empty reference result proves nothing: any query returning nothing would match.
+            outcome["fixtures"].append({"fixture": fixture_name, "status": "no_evidence", "reason": "the reference returns no rows on this fixture"})
+            continue
+        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots)
         if not result.get("ok"):
             error = str(result.get("error") or "")
             status = "timeout" if "stopped" in error or "deadline" in error else "error"
@@ -695,7 +726,7 @@ def _fixture_stage(
             f"On the fixture {fixture_name} the query returns {result['row_count']} row(s) and the reference "
             f"{stored.get('row_count')}; the results differ"
             + (f" (for example {differing['example']})" if differing.get("example") else "")
-            + ". The reference answers the same question under the same parameter values.",
+            + ". The reference answers the same question pattern under the same slot and parameter values.",
             name,
             suggestion="Compare the query with the reference listed under signals.fixtures.",
             evidence={"fixture": fixture_name, "reference": reference.key, "differing": differing},
