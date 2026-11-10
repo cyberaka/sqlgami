@@ -269,3 +269,62 @@ def date_arithmetic(ctx: CheckContext) -> Iterable[Finding]:
                     suggestion="Use the engine's date function or an INTERVAL.",
                 )
                 break
+
+
+@check("unbounded_recursion", description="A recursive CTE grows with UNION ALL and nothing bounds its depth.")
+def unbounded_recursion(ctx: CheckContext) -> Iterable[Finding]:
+    """``WITH RECURSIVE x AS (... UNION ALL ... FROM ... JOIN x ...)`` with no depth bound.
+
+    With UNION ALL every round keeps all its rows, so the recursion only ends when a round
+    finds nothing new. A hierarchy with a cycle, or a table that holds a key many times (a
+    snapshot with one row per person and period), feeds every round from the last and the
+    statement never finishes. UNION (without ALL) drops repeated rows and stops on its own.
+    """
+    tree = ctx.analysis.tree
+    if tree is None:
+        return
+    for with_ in tree.find_all(exp.With):
+        if not with_.args.get("recursive"):
+            continue
+        for cte in with_.expressions:
+            body = cte.this
+            if not isinstance(body, exp.Union) or body.args.get("distinct") is not False:
+                continue
+            name = cte.alias
+            recursive = body.expression
+            if not isinstance(recursive, exp.Select) or not _reads(recursive, name):
+                continue
+            if _has_depth_bound(recursive):
+                continue
+            yield ctx.finding(
+                "unbounded_recursion",
+                Severity.LOW,
+                (
+                    f"The recursive CTE {name} grows with UNION ALL and nothing bounds its depth. "
+                    "If the data repeats a key along the way (a cycle in the hierarchy, or several "
+                    "rows per key as in a snapshot), every round feeds the next and the statement "
+                    "never finishes."
+                ),
+                cte,
+                suggestion=(
+                    "Use UNION instead of UNION ALL so repeated rows end the recursion, or carry a "
+                    "depth counter and stop at a fixed level."
+                ),
+                cte=name,
+            )
+
+
+def _reads(select: exp.Select, name: str) -> bool:
+    return any(t.name.lower() == name.lower() and not t.db for t in select.find_all(exp.Table))
+
+
+def _has_depth_bound(select: exp.Select) -> bool:
+    """A comparison with a number in the recursive member's conditions reads as a depth bound."""
+    conditions = [select.args.get("where")] + [j.args.get("on") for j in select.args.get("joins") or []]
+    for condition in conditions:
+        if condition is None:
+            continue
+        for node in condition.find_all(exp.LT, exp.LTE, exp.GT, exp.GTE):
+            if any(isinstance(unparen(side), exp.Literal) and unparen(side).is_number for side in (node.this, node.expression)):
+                return True
+    return False

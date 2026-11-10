@@ -129,6 +129,7 @@ Static checks, each reported as a finding with a severity:
 | `date_arithmetic` | a bare number added to a date where the engine does not define that |
 | `json_path` | a JSON path no row has (found in `sample` mode) |
 | `window_order_ties` | `ROW_NUMBER()` or a running total ordered by columns that can tie |
+| `unbounded_recursion` | a recursive CTE grown with `UNION ALL` and no depth bound, which never finishes on data that repeats a key |
 
 When you pass the question, sqlgami also compares it with the SQL. These checks
 are word-and-structure matching with no language model involved:
@@ -409,7 +410,17 @@ one from bench suites and prints its error on questions held out of the fit.
   already inside a transaction, sqlgami works under a savepoint and leaves your
   transaction as it found it; the statement gate still applies, but the
   read-only setting is then yours to make.
-- Queries run under a time limit and return a bounded number of rows.
+- Every statement runs under a time limit (`Options.timeout_s`, 15 seconds for
+  the query under review, less for probes) and returns a bounded number of
+  rows, and one report has a budget for all of its statements together
+  (`Options.budget_s`, 120 seconds). The bound is enforced, not hoped for:
+  SQLite stops through its progress handler and Postgres through
+  `statement_timeout`; DuckDB runs each statement on a worker thread, is asked
+  to stop with `interrupt()` repeatedly for a grace period, and if it still runs
+  (DuckDB has been seen to ignore the request inside a recursive CTE) the
+  statement is abandoned and a fresh cursor serves the next one. A statement
+  that was cut short is a `timeout` outcome and never counts as verified; a
+  report that ran out of budget carries a `budget_spent` note.
 - Nothing is sent to a database, a network service or an LLM unless you pass a
   connection or function for it.
 

@@ -24,7 +24,7 @@ from .catalog import Catalog, Table
 from .checks import CheckContext, Probe, run_static_checks
 from .checks.base import PROBE_HAS_NULL, PROBE_QUERY, PROBE_TIMESTAMP_FORMAT, PROBE_UNIQUE, PROBE_VALUE
 from .checks.predicates import _ISO_DATE_RE, judge_value, value_finding
-from .engines.base import INVALID, TIMEOUT, Adapter
+from .engines.base import INVALID, TIMEOUT, Adapter, DryRunResult, ExecutionResult
 from .errors import AdapterError, SqlgamiError, UnsafeQueryError
 from .report import (
     CostEstimate,
@@ -80,6 +80,9 @@ class Options:
     # calls anything outside the engine's built-in allow-list and this list is not sent to
     # the database.
     allowed_functions: tuple[str, ...] = ()
+    # Wall-clock bound on everything one report sends to the database, all stages together.
+    # Statements that would overrun it are cut short or not sent; the report says so.
+    budget_s: float = 120.0
 
 
 class _Clock:
@@ -91,6 +94,58 @@ class _Clock:
         elapsed = (now - self.started) * 1000
         self.started = now
         return elapsed
+
+
+BUDGET_SPENT = "the time budget for this report is spent"
+
+
+class _Bounded:
+    """An adapter under one wall-clock budget for the whole report.
+
+    Every statement sqlgami sends (dry run, sample, probes, alternatives, anchors) gets at most
+    the time left in the budget; once it is spent, statements are not sent at all and the
+    callers see a timeout. The engine adapters enforce their own per-statement bound, so the two
+    together keep a ``score()`` call from outliving ``Options.budget_s`` by more than one grace
+    period.
+    """
+
+    def __init__(self, adapter: Adapter, budget_s: float) -> None:
+        self._adapter = adapter
+        self._deadline = time.monotonic() + budget_s
+        self.spent = False  # set once a statement was refused or cut short for lack of time
+
+    def remaining(self) -> float:
+        return self._deadline - time.monotonic()
+
+    def _clamp(self, timeout_s: float) -> float | None:
+        left = self.remaining()
+        if left <= 0.05:
+            self.spent = True
+            return None
+        if left < timeout_s:
+            self.spent = True
+            return left
+        return timeout_s
+
+    def dry_run(self, sql: str) -> DryRunResult:
+        if self._clamp(10.0) is None:
+            return DryRunResult(ok=False, error=BUDGET_SPENT, error_kind=TIMEOUT)
+        return self._adapter.dry_run(sql)
+
+    def execute(self, sql: str, *, max_rows: int, timeout_s: float) -> ExecutionResult:
+        limit = self._clamp(timeout_s)
+        if limit is None:
+            return ExecutionResult(ok=False, error=BUDGET_SPENT, error_kind=TIMEOUT)
+        return self._adapter.execute(sql, max_rows=max_rows, timeout_s=limit)
+
+    def query(self, expression: exp.Expression, *, max_rows: int = 1000, timeout_s: float = 10.0) -> list[tuple]:
+        limit = self._clamp(timeout_s)
+        if limit is None:
+            raise AdapterError(BUDGET_SPENT)
+        return self._adapter.query(expression, max_rows=max_rows, timeout_s=limit)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter, name)
 
 
 def run(
@@ -161,6 +216,8 @@ def _run(
     generator: Any = None,
 ) -> None:
     clock = _Clock()
+    bounded: _Bounded | None = _Bounded(adapter, options.budget_s) if adapter is not None else None
+    adapter = bounded  # type: ignore[assignment]  # every stage below talks to the database through the budget
 
     # ------------------------------------------------------------- parse
     prepared = template.prepare(sql, dialect, params)
@@ -392,6 +449,17 @@ def _run(
         params,
     )
     _question_stage(report, ctx, adapter, question, glossary, mode, options)
+    if bounded is not None and bounded.spent:
+        report.findings.append(
+            Finding(
+                "budget_spent",
+                Severity.LOW,
+                f"Checking stopped at the time budget of {options.budget_s:g}s: some statements were "
+                "cut short or not sent, so the result is verified less than it could be.",
+                "sample",
+                evidence={"budget_s": options.budget_s},
+            )
+        )
 
 
 def _consistency_stage(

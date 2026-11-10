@@ -122,6 +122,10 @@ class DuckDBAdapter(Adapter):
     engine = "duckdb"
     dialect = "duckdb"
 
+    # After the timeout, how long the engine gets to honour the interrupt (asked repeatedly)
+    # before the cursor is abandoned and the caller gets its answer anyway.
+    GRACE_S = 3.0
+
     def __init__(self, db: Any) -> None:
         duckdb = _import_duckdb()
         self._duckdb = duckdb
@@ -129,19 +133,22 @@ class DuckDBAdapter(Adapter):
         if isinstance(db, (str, bytes)) or hasattr(db, "__fspath__"):
             path = str(db if not hasattr(db, "__fspath__") else db.__fspath__())
             try:
-                self.conn = duckdb.connect(path, read_only=path != ":memory:")
+                self._source = duckdb.connect(path, read_only=path != ":memory:")
             except duckdb.Error as exc:
                 raise ConnectionFailed(f"could not open DuckDB database {path!r}: {exc}") from exc
             self._owned = True
         elif hasattr(db, "cursor") and hasattr(db, "execute"):
-            # A separate cursor shares the database but not the caller's result state.
-            try:
-                self.conn = db.cursor()
-            except duckdb.Error as exc:
-                raise ConnectionFailed(f"could not use the DuckDB connection: {exc}") from exc
+            self._source = db
         else:
             raise ConnectionFailed("expected a DuckDB connection or a path to a database file")
+        # Work on a cursor of the source: it shares the database but not the caller's result
+        # state, and it can be dropped for a fresh one if the engine ever ignores an interrupt.
+        try:
+            self.conn = self._source.cursor()
+        except duckdb.Error as exc:
+            raise ConnectionFailed(f"could not use the DuckDB connection: {exc}") from exc
         self._lock = threading.RLock()
+        self._abandoned: list[Any] = []
 
     def loader(self) -> _Loader:
         return _Loader(self)
@@ -156,41 +163,82 @@ class DuckDBAdapter(Adapter):
                 raise AdapterError(f"DuckDB metadata query failed: {exc}") from exc
 
     def _guarded(self, sql: str, max_rows: int | None, timeout_s: float) -> tuple[list[str], list[tuple], bool]:
-        timed_out = threading.Event()
+        """Run ``sql`` under a wall-clock bound the caller can rely on.
 
-        def interrupt() -> None:
-            timed_out.set()
-            try:
-                self.conn.interrupt()
-            except Exception:
-                pass
-
-        timer = threading.Timer(timeout_s, interrupt)
-        timer.daemon = True
+        The statement runs on a worker thread. Past ``timeout_s`` the engine is asked to stop,
+        again every quarter second for ``GRACE_S`` in case a request is lost (DuckDB drops an
+        interrupt that lands between statements, and has been seen to ignore one inside a
+        recursive CTE). If it still has not stopped, the cursor is abandoned: the caller gets a
+        timeout now, a fresh cursor serves the next statement, and the old one is interrupted in
+        the background until it gives up.
+        """
         with self._lock:
-            timer.start()
-            try:
-                if max_rows is None:
-                    cursor = self.conn.execute(sql)
-                    columns = [d[0] for d in cursor.description or []]
-                    return columns, rows_as_tuples(cursor.fetchall()), False
-                relation = self.conn.sql(sql)
-                columns = list(relation.columns)
-                # DuckDB needs the pytz package to hand time-zone-aware values to Python.
-                # Reading those columns as text avoids depending on it.
-                projection = ", ".join(
-                    f"CAST(#{i} AS VARCHAR)" if "TIME ZONE" in str(t).upper() else f"#{i}"
-                    for i, t in enumerate(relation.types, 1)
-                )
-                rows = relation.project(projection).limit(max_rows + 1).fetchall()
-                truncated = len(rows) > max_rows
-                return columns, rows_as_tuples(rows[:max_rows]), truncated
-            except self._duckdb.Error as exc:
-                if timed_out.is_set():
-                    raise _Timeout(str(exc)) from exc
-                raise
-            finally:
-                timer.cancel()
+            conn = self.conn
+            done = threading.Event()
+            box: dict[str, Any] = {}
+
+            def work() -> None:
+                try:
+                    box["result"] = self._run(conn, sql, max_rows)
+                except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread
+                    box["error"] = exc
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=work, name="sqlgami-duckdb", daemon=True)
+            worker.start()
+            if done.wait(timeout_s):
+                return self._unbox(box, None)
+            deadline = time.monotonic() + self.GRACE_S
+            while not done.is_set() and time.monotonic() < deadline:
+                _interrupt(conn)
+                done.wait(0.25)
+            if done.is_set():
+                return self._unbox(box, f"stopped after {timeout_s:g}s")
+            self._abandon(conn, done)
+            raise _Timeout(
+                f"not stopped after {timeout_s:g}s; the statement was abandoned and the engine keeps being asked to drop it"
+            )
+
+    @staticmethod
+    def _run(conn: Any, sql: str, max_rows: int | None) -> tuple[list[str], list[tuple], bool]:
+        if max_rows is None:
+            cursor = conn.execute(sql)
+            columns = [d[0] for d in cursor.description or []]
+            return columns, rows_as_tuples(cursor.fetchall()), False
+        relation = conn.sql(sql)
+        columns = list(relation.columns)
+        # DuckDB needs the pytz package to hand time-zone-aware values to Python.
+        # Reading those columns as text avoids depending on it.
+        projection = ", ".join(
+            f"CAST(#{i} AS VARCHAR)" if "TIME ZONE" in str(t).upper() else f"#{i}"
+            for i, t in enumerate(relation.types, 1)
+        )
+        rows = relation.project(projection).limit(max_rows + 1).fetchall()
+        truncated = len(rows) > max_rows
+        return columns, rows_as_tuples(rows[:max_rows]), truncated
+
+    def _unbox(self, box: dict[str, Any], timed_out: str | None) -> tuple[list[str], list[tuple], bool]:
+        if "error" in box:
+            exc = box["error"]
+            if timed_out and isinstance(exc, self._duckdb.Error):
+                raise _Timeout(timed_out) from exc
+            raise exc
+        return box["result"]
+
+    def _abandon(self, conn: Any, done: threading.Event) -> None:
+        """Give up on a cursor that ignores interrupts; keep asking it to stop in the background."""
+        self._abandoned.append(conn)
+
+        def nag() -> None:
+            while not done.wait(1.0):
+                _interrupt(conn)
+
+        threading.Thread(target=nag, name="sqlgami-duckdb-abandoned", daemon=True).start()
+        try:
+            self.conn = self._source.cursor()
+        except Exception as exc:  # the database itself is gone; later statements will say so
+            raise AdapterError(f"could not reopen the DuckDB connection: {exc}") from exc
 
     def _error_kind(self, exc: Exception) -> str:
         if isinstance(exc, _Timeout):
@@ -219,7 +267,7 @@ class DuckDBAdapter(Adapter):
         except (self._duckdb.Error, _Timeout) as exc:
             return ExecutionResult(
                 ok=False,
-                error=f"stopped after {timeout_s:g}s" if isinstance(exc, _Timeout) else _first_lines(str(exc)),
+                error=str(exc) if isinstance(exc, _Timeout) else _first_lines(str(exc)),
                 error_kind=self._error_kind(exc),
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
@@ -257,6 +305,20 @@ class DuckDBAdapter(Adapter):
             self.conn.close()  # closes our own cursor; a borrowed connection stays open
         except Exception:
             pass
+        # An abandoned cursor may still be running; closing the database under it is not safe,
+        # so a connection we opened ourselves is left to the process in that (rare) case.
+        if self._owned and not self._abandoned:
+            try:
+                self._source.close()
+            except Exception:
+                pass
+
+
+def _interrupt(conn: Any) -> None:
+    try:
+        conn.interrupt()
+    except Exception:
+        pass
 
 
 def _first_lines(text: str, limit: int = 400) -> str:

@@ -138,7 +138,13 @@ def _literal(value: Any) -> str:
 
 
 def _marker(name: str, dialect: str) -> str:
-    return f"@{name}" if dialect == "bigquery" else f":{name}"
+    """A query parameter the dialect's parser accepts anywhere a value can stand (``SELECT {p} AS x``
+    as well as ``WHERE c = {p}``)."""
+    if dialect == "bigquery":
+        return f"@{name}"
+    if dialect == "duckdb":
+        return f"${name}"  # DuckDB's parser rejects :name as a projection
+    return f":{name}"
 
 
 def _comment_body(text: str) -> str:

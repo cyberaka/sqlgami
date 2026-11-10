@@ -38,40 +38,100 @@ TIMEOUT_S = 60.0  # a statement that runs longer than this is reported as a time
 TIMED_OUT = "timed out"
 
 
+GRACE_S = 3.0  # after the timeout, how long DuckDB gets to honour the interrupt before the statement is abandoned
+
+
+class Abandoned(Exception):
+    """The engine ignored the interrupt; the connection is unusable and must be dropped."""
+
+
 def run_sql(conn: Any, sql: str, max_rows: int = 100_000, timeout_s: float = TIMEOUT_S) -> Outcome:
-    """Execute a statement on a read-only bench connection, within a time limit."""
+    """Execute a statement on a read-only bench connection, within a time limit.
+
+    SQLite stops through its progress handler and Postgres through statement_timeout, both
+    reliable. DuckDB is asked to stop with interrupt(), which it has been seen to lose, so the
+    statement runs on a worker thread and is asked again every quarter second for GRACE_S;
+    if it still runs, :class:`Abandoned` is raised and the caller must drop the connection.
+    """
+    module = type(conn).__module__ or ""
+    if "duckdb" in module:
+        return _run_duckdb(conn, sql, max_rows, timeout_s)
     stop = _deadline(conn, timeout_s)
     try:
-        cursor = conn.execute(sql)
-        columns = [d[0] for d in cursor.description or []]
-        rows = [tuple(r) for r in cursor.fetchmany(max_rows)]
-        if hasattr(cursor, "close") and cursor is not conn:
-            cursor.close()
-        return Outcome(True, rows, columns)
+        return _fetch(conn, sql, max_rows)
     except Exception as exc:  # any engine error is a result here, not a crash
-        text = " ".join(str(exc).split())
-        if stop.expired or "interrupt" in text.lower() or "statement timeout" in text.lower() or "canceling statement" in text.lower():
-            return Outcome(False, error=f"{TIMED_OUT} after {timeout_s:g}s")
-        return Outcome(False, error=text[:300])
+        return _failure(exc, stop.expired, timeout_s)
     finally:
         stop.cancel()
+
+
+def _fetch(conn: Any, sql: str, max_rows: int) -> Outcome:
+    cursor = conn.execute(sql)
+    columns = [d[0] for d in cursor.description or []]
+    rows = [tuple(r) for r in cursor.fetchmany(max_rows)]
+    if hasattr(cursor, "close") and cursor is not conn:
+        cursor.close()
+    return Outcome(True, rows, columns)
+
+
+def _failure(exc: Exception, expired: bool, timeout_s: float) -> Outcome:
+    text = " ".join(str(exc).split())
+    if expired or "interrupt" in text.lower() or "statement timeout" in text.lower() or "canceling statement" in text.lower():
+        return Outcome(False, error=f"{TIMED_OUT} after {timeout_s:g}s")
+    return Outcome(False, error=text[:300])
+
+
+def _run_duckdb(conn: Any, sql: str, max_rows: int, timeout_s: float) -> Outcome:
+    done = threading.Event()
+    box: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            box["outcome"] = _fetch(conn, sql, max_rows)
+        except BaseException as exc:  # noqa: BLE001 - reported on the calling thread
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="benchkit-duckdb", daemon=True).start()
+    expired = not done.wait(timeout_s)
+    if expired:
+        deadline = time.monotonic() + GRACE_S
+        while not done.is_set() and time.monotonic() < deadline:
+            _interrupt(conn)
+            done.wait(0.25)
+        if not done.is_set():
+
+            def nag() -> None:
+                while not done.wait(1.0):
+                    _interrupt(conn)
+
+            threading.Thread(target=nag, name="benchkit-duckdb-abandoned", daemon=True).start()
+            raise Abandoned(f"{TIMED_OUT} after {timeout_s:g}s and the engine did not stop")
+    if "error" in box:
+        return _failure(box["error"], expired, timeout_s)
+    return box["outcome"]
+
+
+def _interrupt(conn: Any) -> None:
+    try:
+        conn.interrupt()
+    except Exception:
+        pass
 
 
 class _Deadline:
     def __init__(self) -> None:
         self.expired = False
-        self._timer: threading.Timer | None = None
         self._restore: Any = None
 
     def cancel(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
         if self._restore is not None:
             self._restore()
 
 
 def _deadline(conn: Any, timeout_s: float) -> _Deadline:
-    """Arrange for ``conn`` to give up after ``timeout_s`` seconds, whatever engine it is."""
+    """Arrange for ``conn`` to give up after ``timeout_s`` seconds (SQLite, Postgres)."""
     stop = _Deadline()
     module = type(conn).__module__ or ""
     if module.startswith("sqlite3"):
@@ -85,18 +145,6 @@ def _deadline(conn: Any, timeout_s: float) -> _Deadline:
 
         conn.set_progress_handler(handler, 10_000)
         stop._restore = lambda: conn.set_progress_handler(None, 0)
-    elif "duckdb" in module:
-
-        def interrupt() -> None:
-            stop.expired = True
-            try:
-                conn.interrupt()
-            except Exception:
-                pass
-
-        stop._timer = threading.Timer(timeout_s, interrupt)
-        stop._timer.daemon = True
-        stop._timer.start()
     elif module.startswith("psycopg"):
         try:
             conn.execute(f"SET statement_timeout = {int(timeout_s * 1000)}")

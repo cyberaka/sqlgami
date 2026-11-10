@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import build
-from .compare import TIMED_OUT, Outcome, run_sql, same_outcome, same_rows
+from .compare import TIMED_OUT, Abandoned, Outcome, run_sql, same_outcome, same_rows
 from .suite import Question, Seed, Suite, Variant
 
 BUG_CLASSES = {
@@ -105,7 +105,13 @@ class Runner:
     def run(self, engine: str, seed: Seed, sql: str) -> Outcome:
         key = (engine, seed.label, sql)
         if key not in self._runs:
-            self._runs[key] = run_sql(self.conn(engine, seed), sql)
+            try:
+                self._runs[key] = run_sql(self.conn(engine, seed), sql)
+            except Abandoned as exc:
+                # The engine would not stop; that connection is left to its orphaned statement
+                # and the next statement on this seed gets a fresh one.
+                self._conns.pop((engine, seed.label), None)
+                self._runs[key] = Outcome(False, error=str(exc))
         return self._runs[key]
 
     def gold(self, question: Question, engine: str, seed: Seed) -> Outcome | None:
