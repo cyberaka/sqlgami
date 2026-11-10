@@ -169,3 +169,108 @@ SELECT eps.region, COUNT(*) AS headcount
   FROM `acme-people-prod.hr.current_snapshot_v` eps
  WHERE eps.status_cd = 'A'
  GROUP BY eps.region;
+
+-- ---------------------------------------------------------------------------
+-- w6 additions: 4 TVFs + 4 views + 1 scalar UDF, across two datasets.
+-- Covers: TVF-calls-TVF, view-over-TVF (with a fixed arg), a view in a
+-- sibling hr_mart dataset reading hr tables, and a basis-points helper UDF.
+-- Bugs in w6 land INSIDE the TVF/view call rather than in the surrounding
+-- SQL.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE FUNCTION `acme-people-prod.hr.org_roster`(manager_id INT64, as_of DATE)
+AS (
+  SELECT eps.*
+    FROM `acme-people-prod.hr.emp_period_snapshot` eps
+   WHERE eps.period_end_dt = as_of
+     AND eps.snap_dt = eps.period_end_dt
+     AND (manager_id IN (eps.lvl_2_id, eps.lvl_3_id, eps.lvl_4_id, eps.lvl_5_id, eps.lvl_6_id, eps.lvl_7_id)
+          OR manager_id IN (eps.lvl_2_id_fn, eps.lvl_3_id_fn, eps.lvl_4_id_fn, eps.lvl_5_id_fn, eps.lvl_6_id_fn, eps.lvl_7_id_fn))
+);
+
+CREATE OR REPLACE TABLE FUNCTION `acme-people-prod.hr.period_window`(n INT64)
+AS (
+  SELECT period_seq, period_start_dt, ppe_dt AS period_end_dt
+    FROM `acme-people-prod.hr.pay_period_dim`
+   WHERE freq_cd = 'B' AND period_seq BETWEEN -(n - 1) AND 0
+);
+
+CREATE OR REPLACE TABLE FUNCTION `acme-people-prod.hr.leavers`(manager_id INT64, n_periods INT64)
+AS (
+  SELECT eps.assoc_id, eps.period_end_dt, eps.invol_exit_ind,
+         IF(eps.invol_exit_ind = 1, 'involuntary', 'voluntary') AS leave_kind
+    FROM `acme-people-prod.hr.emp_period_snapshot` eps
+    JOIN `acme-people-prod.hr.pay_period_dim` pp
+      ON pp.ppe_dt = eps.period_end_dt AND pp.freq_cd = 'B'
+   WHERE eps.turn_filt_ind = 1
+     AND eps.snap_dt = eps.period_end_dt
+     AND pp.period_seq BETWEEN -(n_periods - 1) AND 0
+     AND (manager_id IN (eps.lvl_2_id, eps.lvl_3_id, eps.lvl_4_id, eps.lvl_5_id, eps.lvl_6_id, eps.lvl_7_id)
+          OR manager_id IN (eps.lvl_2_id_fn, eps.lvl_3_id_fn, eps.lvl_4_id_fn, eps.lvl_5_id_fn, eps.lvl_6_id_fn, eps.lvl_7_id_fn))
+);
+
+CREATE OR REPLACE VIEW `acme-people-prod.hr.chain_level_coverage_v`
+AS
+  SELECT eps.assoc_id, eps.period_end_dt, x.chain, x.lvl, x.node_id
+    FROM `acme-people-prod.hr.emp_period_snapshot` eps,
+         UNNEST([
+           STRUCT('reporting'  AS chain, 2 AS lvl, eps.lvl_2_id    AS node_id),
+           STRUCT('reporting',       3, eps.lvl_3_id),
+           STRUCT('reporting',       4, eps.lvl_4_id),
+           STRUCT('reporting',       5, eps.lvl_5_id),
+           STRUCT('reporting',       6, eps.lvl_6_id),
+           STRUCT('reporting',       7, eps.lvl_7_id),
+           STRUCT('functional', 2, eps.lvl_2_id_fn),
+           STRUCT('functional', 3, eps.lvl_3_id_fn),
+           STRUCT('functional', 4, eps.lvl_4_id_fn),
+           STRUCT('functional', 5, eps.lvl_5_id_fn),
+           STRUCT('functional', 6, eps.lvl_6_id_fn),
+           STRUCT('functional', 7, eps.lvl_7_id_fn)
+         ]) AS x
+   WHERE eps.snap_dt = eps.period_end_dt;
+
+CREATE OR REPLACE VIEW `acme-people-prod.hr.active_headcount_by_period_by_lvl_3_v`
+AS
+  SELECT eps.lvl_3_id, eps.period_end_dt,
+         COUNT(DISTINCT IF(eps.status_cd = 'A', eps.assoc_id, NULL)) AS active_n
+    FROM `acme-people-prod.hr.emp_period_snapshot` eps
+    JOIN `acme-people-prod.hr.pay_period_dim` pp
+      ON pp.ppe_dt = eps.period_end_dt AND pp.freq_cd = 'B'
+   WHERE eps.snap_dt = eps.period_end_dt
+     AND eps.lvl_3_id IS NOT NULL
+     AND pp.period_seq BETWEEN -25 AND 0
+   GROUP BY eps.lvl_3_id, eps.period_end_dt;
+
+CREATE OR REPLACE VIEW `acme-people-prod.hr.active_by_lvl_3_current_v`
+AS
+  SELECT v.lvl_3_id, v.active_n
+    FROM `acme-people-prod.hr.active_headcount_by_period_by_lvl_3_v` v
+    JOIN `acme-people-prod.hr.pay_period_dim` pp
+      ON pp.ppe_dt = v.period_end_dt AND pp.freq_cd = 'B'
+   WHERE pp.is_current_flag = TRUE;
+
+CREATE OR REPLACE TABLE FUNCTION `acme-people-prod.hr.active_headcount_trend`(manager_id INT64, n INT64)
+AS (
+  SELECT pw.period_seq, pw.period_end_dt,
+         (SELECT COUNT(DISTINCT eps.assoc_id)
+            FROM `acme-people-prod.hr.org_roster`(manager_id, pw.period_end_dt) eps
+           WHERE eps.status_cd = 'A') AS active_n
+    FROM `acme-people-prod.hr.period_window`(n) pw
+);
+
+CREATE OR REPLACE VIEW `acme-people-prod.hr.current_pay_period_v`
+AS
+  SELECT period_seq, period_start_dt, period_end_dt
+    FROM `acme-people-prod.hr.period_window`(1);
+
+CREATE OR REPLACE FUNCTION `acme-people-prod.hr.bp`(x FLOAT64)
+AS (CAST(FLOOR(x * 10000) AS INT64));
+
+CREATE OR REPLACE VIEW `acme-people-prod.hr_mart.active_headcount_by_period_v`
+AS
+  SELECT eps.period_end_dt, COUNT(*) AS headcount
+    FROM `acme-people-prod.hr.emp_period_snapshot` eps
+   WHERE eps.snap_dt = eps.period_end_dt
+     AND eps.status_cd = 'A'
+   GROUP BY eps.period_end_dt;
+

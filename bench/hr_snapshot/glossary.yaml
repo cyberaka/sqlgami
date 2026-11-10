@@ -75,6 +75,17 @@ definitions:
       at that period's close and MUST NOT be used as the authoritative value, even when
       today's data happens to agree with hr.employee_dim.
 
+  event_month_bucketing:
+    meaning: >
+      When counts are reported per calendar month (e.g. monthly new hires, monthly voluntary
+      turnover), the month a new hire falls in is the month of hr.employee_dim.hire_dt, and
+      the month a voluntary leaver falls in is the month of hr.employee_dim.term_dt. The
+      pay-period month of the snapshot row that carries new_hire_ind = 1 or
+      turn_filt_ind = 1 is NOT the bucketing key — a new_hire_ind flag persists across the
+      three ~weekly restated snapshots the period emits, and a turnover row's period_end_dt
+      is the pay period that first carries the departure, not the departure date itself.
+      Each associate is counted exactly once in their event month.
+
   ninety_day_new_hire_turnover:
     meaning: >
       Among new hires in a given window, the portion whose term_dt is within 90 calendar days
