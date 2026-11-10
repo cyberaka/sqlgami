@@ -376,7 +376,7 @@ report.timing         # ms per stage</pre>
   <div class="cols">
     <div class="c1"><h3>Guaranteed</h3><ul><li>Deterministic, with no AI at scoring time</li><li>Unsafe SQL is never run</li><li>Unsupported SQL says "can't check", never a guess</li></ul></div>
     <div class="c2"><h3>Depends on preparation</h3><ul><li>The answer check needs a reference for that question pattern</li><li>Undefined terms reduce confidence</li><li>Mock data is only as good as its rules</li></ul></div>
-    <div class="c3"><h3>Still maturing</h3><ul><li>70+ line scripts may get rules only within 50 ms</li><li>Table-function support in final testing</li><li>Score calibration on our data</li></ul></div>
+    <div class="c3"><h3>Still maturing</h3><ul><li>70+ line scripts may get rules only within 50 ms</li><li>Rare false confidence: a few wrong answers still score above 0.8</li><li>Score calibration on our data</li></ul></div>
   </div>
 </section>
 
@@ -384,7 +384,7 @@ report.timing         # ms per stage</pre>
 <section class="slide" aria-label="Roadmap">
   <h2>Risks and next steps</h2>
   <div class="cols">
-    <div class="c1"><h3>Next</h3><ul><li>Table-valued function support and its held-out test</li><li>Two-step scoring with caching for long scripts</li><li>Score calibration on real-world data</li></ul></div>
+    <div class="c1"><h3>Next</h3><ul><li>Fix the rare false-confidence cases (H13)</li><li>Two-step scoring with caching for long scripts</li><li>Score calibration on real-world data</li></ul></div>
     <div class="c2"><h3>Risks</h3><ul><li>Coverage depends on how many question patterns get references</li><li>Unusual phrasing may not match a defined term</li><li>Our tests are synthetic; real-world use is the real test</li></ul></div>
     <div class="c3"><h3>Mitigations</h3><ul><li>Start with the top 10–20 patterns; expand from usage logs</li><li>Offline phrase suggestions, reviewed by the team</li><li>Run in shadow mode until the numbers hold on your data</li></ul></div>
   </div>
