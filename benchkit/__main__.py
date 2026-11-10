@@ -48,6 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     p_comp.add_argument("--rules", help="YAML with a subsample: block of per-table predicates (with --from-seeds)")
     p_comp.add_argument("--references", help="JSONL of host-registered references (id, question, sql, n_default) replacing golds of the same id")
     p_comp.add_argument("--out", help="bundle folder (default bench/.runs/bundles/<suite>-<engine>)")
+    p_bq = sub.add_parser("bq-native", help="offline: load a suite's seeds into the BigQuery sandbox, run every BigQuery gold and bug natively, compare with the DuckDB golds and the verified translation")
+    p_bq.add_argument("suite")
+    p_bq.add_argument("--seeds", default="47", help="comma-separated seed numbers (default 47)")
+    p_bq.add_argument("--no-bugs", action="store_true")
+    p_bq.add_argument("--no-load", action="store_true", help="the datasets are already loaded")
+    p_bq.add_argument("--out", help="report JSON (default bench/.runs/bqnative/<suite>.json)")
     p_comp.add_argument("--expand", help="offline expansion with a model: hf:<model> or claude:<model> (phrases to review, variants into the bundle)")
     p_comp.add_argument("--per-term", type=int, default=6, help="wordings to ask for per term (with --expand)")
     p_comp.add_argument("--per-example", type=int, default=4, help="paraphrases to ask for per reference (with --expand)")
@@ -155,6 +161,23 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{digest}  {name}")
             return 0
         suite = load_suite(args.suite)
+        if args.command == "bq-native":
+            from sqlgami.contrib.bigquery import BigQuerySandbox
+
+            from .bqnative import compare_suite, write_report
+
+            wanted = {int(x) for x in args.seeds.split(",") if x.strip()}
+            seeds = [s for s in suite.seeds if s.seed in wanted]
+            sandbox = BigQuerySandbox()
+            report = compare_suite(sandbox, suite, seeds, include_bugs=not args.no_bugs, load=not args.no_load)
+            out = Path(args.out) if args.out else Path("bench/.runs/bqnative") / f"{suite.path.name}.json"
+            write_report(report, out)
+            print(json.dumps(report.summary(), indent=1))
+            for c in report.comparisons:
+                if not c.native_ok or c.vs_duckdb_gold is False or c.vs_translation is False:
+                    print(f"  {c.id:28} {c.kind:11} {c.seed:9} native_ok={c.native_ok} vs_duckdb_gold={c.vs_duckdb_gold} vs_translation={c.vs_translation} {(c.native_error or c.vs_duckdb_gold_why or c.vs_translation_why or c.translation_error or '')[:120]}")
+            print(f"report: {out}")
+            return 0
         if args.command == "compile":
             from .compile import compile_suite
 
