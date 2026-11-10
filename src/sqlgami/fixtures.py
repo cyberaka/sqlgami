@@ -172,6 +172,44 @@ class Fixture:
         return fixture
 
 
+# ------------------------------------------------------------------ from a database (opt-in)
+
+
+def from_connection(
+    conn: Any,
+    catalog: Catalog,
+    name: str,
+    *,
+    where: dict[str, str] | None = None,
+    limit: int | None = None,
+    profile: str = "subsample",
+    seed: int = 0,
+) -> Fixture:
+    """A fixture copied from a live DuckDB connection: every catalogue table, optionally cut
+    down by a ``where`` predicate per table and a row ``limit``. An explicit choice: rows of
+    real data end up in the bundle, so use it on data that may be stored there."""
+    tables = _tables(catalog)
+    order = _topological(tables)
+    data: dict[str, tuple[list[str], list[tuple]]] = {}
+    where = {k.lower(): v for k, v in (where or {}).items()}
+    for qualified in order:
+        table = tables[qualified]
+        columns = [c.name for c in table.columns]
+        predicate = where.get(qualified) or where.get(table.name.lower())
+        sql = f"SELECT {', '.join(columns)} FROM {qualified}"
+        if predicate:
+            sql += f" WHERE {predicate}"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        try:
+            rows = [tuple(r) for r in conn.execute(sql).fetchall()]
+        except Exception as exc:
+            raise ConfigurationError(f"could not read {qualified} for the fixture: {exc}") from exc
+        data[qualified] = (columns, rows)
+    ddl, types = _ddl(catalog, [tables[q] for q in order], [q for q in order])
+    return Fixture(name, profile, seed, data, ddl, types)
+
+
 # ------------------------------------------------------------------ building
 
 
@@ -207,6 +245,55 @@ def _tables(catalog: Catalog) -> dict[str, Table]:
         if table is not None and not table.is_view:
             found[qualified.lower()] = table
     return found
+
+
+def _views(catalog: Catalog) -> dict[str, Table]:
+    found: dict[str, Table] = {}
+    for qualified in catalog.table_names():
+        schema, _, name = qualified.rpartition(".")
+        table = catalog.resolve(name, schema or None, quoted=True) or catalog.resolve(name, schema or None)
+        if table is not None and table.is_view and table.definition:
+            found[qualified.lower()] = table
+    return found
+
+
+def _view_ddl(catalog: Catalog) -> list[str]:
+    """CREATE VIEW statements in an order DuckDB accepts (a view before the views that read it)."""
+    from .catalog import view_query_from_sql
+
+    views = _views(catalog)
+    pending: dict[str, str] = {}
+    for qualified, table in views.items():
+        parsed = view_query_from_sql(table.definition or "", catalog.dialect)
+        if parsed is None:
+            continue
+        query, columns = parsed
+        if catalog.dialect != "duckdb":
+            try:
+                import sqlglot
+
+                query = sqlglot.transpile(query, read=catalog.dialect, write="duckdb")[0]
+            except Exception:
+                continue
+        column_list = f" ({', '.join(columns)})" if columns else ""
+        pending[qualified] = f"CREATE VIEW {qualified}{column_list} AS {query}"
+    ordered: list[str] = []
+    done: set[str] = set()
+    for _ in range(len(pending) + 1):
+        progressed = False
+        for qualified, statement in pending.items():
+            if qualified in done:
+                continue
+            text = statement.lower()
+            needs = [other for other in pending if other != qualified and other not in done and (other in text or other.rpartition(".")[2] in text)]
+            if not needs:
+                ordered.append(statement)
+                done.add(qualified)
+                progressed = True
+        if not progressed:
+            break
+    ordered.extend(statement for qualified, statement in pending.items() if qualified not in done)
+    return ordered
 
 
 def _parent_of(fk: Any, tables: dict[str, Table], qualified: str) -> str | None:
@@ -420,6 +507,7 @@ def _ddl(catalog: Catalog, tables: Sequence[Table], qualified: Sequence[str]) ->
             declared.append(type_name)
         statements.append(f"CREATE TABLE {name} ({', '.join(parts)})")
         types[name] = declared
+    statements.extend(_view_ddl(catalog))  # the schema's views, so a query that reads them runs too
     return ";\n".join(statements) + ";\n", types
 
 

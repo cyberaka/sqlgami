@@ -378,6 +378,47 @@ by sheet, row and column; a catalogue with problems is refused. Reading
 `.xlsx` needs `pip install sqlgami[excel]`; CSV needs nothing. The HR example
 lives in `examples/terms/`.
 
+### Reference fixtures: the compiled bundle
+
+The strongest deterministic signal is a run against a reference. Offline,
+`sqlgami compile config.yaml -o bundle/` (also `sqlgami train`) builds small
+adversarial fixture datasets from your schema and declared rules (keys and
+foreign keys from the catalogue, value domains, NULL rates, duplicates and
+restatements, ties, empty groups, edge dates, the parameter values your
+questions use, and rows you write down verbatim), runs every reference query —
+the `Examples` sheet of the term catalogue plus any `references:` in the config
+— on every fixture, and writes a plain, versioned folder: `manifest.json`,
+`schema.sql`, `terms/`, `fixtures/<name>/*.csv`, `references.json`,
+`rejected.jsonl` (references whose query failed on a fixture; nothing enters
+the bundle unverified). No model is called.
+
+```yaml
+dialect: duckdb
+schema: schema/duckdb.sql
+terms: metadata/terms/
+fixtures:
+  seed: 1
+  profiles: [clean, nulls, duplicates, ties, sparse, edges]
+  rows: {hr.emp_period_snapshot: 400}
+  values: {hr.emp_period_snapshot.status_cd: [A, L, T]}
+  params: {manager_id: [12003]}
+  param_columns: {manager_id: [hr.emp_period_snapshot.lvl_3_id]}
+```
+
+Live, `Scorer("duckdb", db=conn, bundle="bundle/")` loads only the bundle (its
+schema hash must match the catalogue; the fixtures go into in-memory DuckDB
+once, at construction). For a question with a reference — chosen by
+`score(..., reference="key")`, else by the exact question text, else by the
+exact set of matched catalogue terms when that set belongs to one reference —
+the candidate runs on the fixtures while the deadline allows, under the
+reference's own parameter values, and its result fingerprint is compared with
+the stored one: a match on the fixtures run is `likely_right`-grade support; a
+mismatch is `fixture_mismatch` (HIGH, `likely_wrong`) with the differing rows
+as evidence, and the remaining fixtures are not run. A reference that returns
+no rows on a fixture proves nothing there and is skipped. Fixtures can also be
+cut from a real database (`sqlgami.fixtures.from_connection`); that is an
+explicit choice, since those rows then live in the bundle.
+
 ### Policies
 
 Some filters are rules of your organisation, not properties of the SQL. Tell

@@ -16,7 +16,7 @@ from typing import Any
 from sqlgami import Options, Scorer
 
 from . import build
-from .suite import RUNS_DIR, Question, Suite
+from .suite import RUNS_DIR, Question, Suite, SuiteError
 from .validate import Runner
 
 
@@ -195,6 +195,7 @@ def evaluate(
     role: str = "confirm",
     substitute: bool = False,
     terms: bool = True,
+    bundle: str | None = None,
 ) -> tuple[list[Item], dict[str, Any]]:
     """Score every labelled statement for one engine. Returns the items and their metrics.
 
@@ -214,6 +215,13 @@ def evaluate(
     # The suite's term catalogue is passed exactly as a host would pass its own; ``terms=False``
     # scores without it, so both numbers can be reported.
     catalogue = suite.terms_source(engine) if terms else None
+    bundle_path = None
+    if bundle:
+        from .compile import bundle_dir
+
+        bundle_path = bundle_dir(suite, engine) if bundle == "auto" else Path(bundle)
+        if not (bundle_path / "manifest.json").exists():
+            raise SuiteError(f"no bundle at {bundle_path}; run: python -m benchkit compile {suite.path} --engine {engine}")
 
     def scorer_for(question: Question) -> Scorer:
         scoped = question.tenant is not None
@@ -227,6 +235,7 @@ def evaluate(
                 glossary=glossary,
                 options=Options(consistency_role=role, consistency_max_alternatives=24, deadline_ms=None),  # batch: no deadline
                 terms=str(catalogue) if catalogue is not None else None,
+                bundle=str(bundle_path) if bundle_path is not None else None,
                 **config,
             )
         return scorers[scoped]

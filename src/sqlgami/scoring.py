@@ -51,6 +51,8 @@ BONUS_SPLIT_VOTE = 0.2
 # Anchor queries (reconciliation) that the result satisfies, none violated: one, several, or
 # several that two independent sources agreed on.
 BONUS_RECONCILED = (0.4, 0.6, 0.9)
+# The candidate's result equals the reference's on one / several of the bundle's fixtures.
+BONUS_FIXTURES = (1.2, 1.6)
 # With source weights (their known share of right answers) the agreement bonus is scaled by the
 # agreeing sources' average weight, and sources known to be wrong more often than not can
 # together add at most this much: a wrong query agreeing with a wrong alternative is common.
@@ -118,9 +120,12 @@ def _sigmoid(x: float) -> float:
 
 
 def evidence_depth(report: Report) -> str:
-    """How far the checks actually got: ``static``, ``dry`` or ``sample``."""
+    """How far the checks actually got: ``static``, ``dry`` or ``sample``. A run on the bundle's
+    fixtures against a reference is a run: it counts as ``sample`` depth."""
     executed = report.stage("sample")
     if executed is not None and executed.status == StageStatus.PASSED:
+        return "sample"
+    if (report.signals.get("fixtures") or {}).get("verdict") in ("match", "mismatch"):
         return "sample"
     dry = report.stage("dry_run")
     if dry is not None and dry.status == StageStatus.PASSED:
@@ -144,7 +149,18 @@ def _clean_bonus(report: Report, depth: str, analysed: bool) -> float:
         bonus += BONUS_ROWS_RETURNED
     bonus += _consistency_bonus(report)
     bonus += _reconciliation_bonus(report)
+    bonus += _fixture_bonus(report)
     return bonus
+
+
+def _fixture_bonus(report: Report) -> float:
+    """The candidate matched the reference on the bundle's fixtures: the strongest
+    deterministic support there is, worth what two reliable independent sources earn."""
+    signal = report.signals.get("fixtures") or {}
+    if signal.get("verdict") != "match":
+        return 0.0
+    matched = int(signal.get("matched") or 0)
+    return BONUS_FIXTURES[1] if matched >= 2 else BONUS_FIXTURES[0] if matched == 1 else 0.0
 
 
 def _reconciliation_bonus(report: Report) -> float:
@@ -166,7 +182,10 @@ def _reliable_agreement(report: Report) -> bool:
         if (signal.get("agreeing_sources") or 0) > rival:
             return True
     anchors = report.signals.get("reconciliation") or {}
-    return bool(anchors.get("agreed_satisfied")) and not anchors.get("violated")
+    if anchors.get("agreed_satisfied") and not anchors.get("violated"):
+        return True
+    # The host's own verified reference agrees with the result on the bundle's fixtures.
+    return (report.signals.get("fixtures") or {}).get("verdict") == "match"
 
 
 def _consistency_bonus(report: Report) -> float:
@@ -278,13 +297,19 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
         high = min(high, cap)
         low = min(low, high)
 
+    fixtures = report.signals.get("fixtures") or {}
+    ran_on_host = (sample := report.stage("sample")) is not None and sample.status == StageStatus.PASSED
     parts = [
         {
             "static": "static checks only: the query was not planned or run against a database",
             "dry": "static checks and the engine's planner: the query was not run",
-            "sample": "static checks, the engine's planner and one read-only run",
+            "sample": "static checks, the engine's planner and one read-only run" if ran_on_host else "static checks and runs on the bundle's fixture datasets",
         }[depth]
     ]
+    if fixtures.get("verdict") == "match":
+        parts.append(f"the result equals the reference's on {fixtures.get('matched')} fixture dataset(s)")
+    elif fixtures.get("verdict") == "mismatch":
+        parts.append("the result differs from the reference's on a fixture dataset")
     if not analysed:
         parts.append("static checks did not run")
     sample = report.stage("sample")

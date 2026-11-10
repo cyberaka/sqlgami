@@ -41,11 +41,36 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         help="exit with status 1 when confidence is below this value (or no number is given)",
     )
+    score.add_argument("--bundle", help="a compiled bundle folder (see: sqlgami compile)")
+    score.add_argument("--terms", help="a term catalogue: a folder of CSV sheets or an .xlsx workbook")
+
+    compile_ = sub.add_parser("compile", help="build the bundle live scoring loads: fixtures and reference fingerprints (offline; also: train)")
+    compile_.add_argument("config", help="a YAML config: dialect, schema, terms, fixtures, references")
+    compile_.add_argument("-o", "--out", required=True, help="the bundle folder to write")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "train":
+        argv[0] = "compile"
     args = _parser().parse_args(argv)
+    if args.command == "compile":
+        from .bundle import compile_bundle
+
+        try:
+            bundle = compile_bundle(args.config, args.out)
+        except SqlgamiError as exc:
+            print(f"sqlgami: {exc}", file=sys.stderr)
+            return 2
+        manifest = bundle.manifest
+        print(f"bundle written to {bundle.path}")
+        print(f"  schema {manifest['schema_hash'][:12]}…, {len(manifest['fixtures'])} fixture(s), {manifest['references']} reference(s), {manifest['rejected']} rejected")
+        for entry in manifest["fixtures"]:
+            print(f"  {entry['name']:16} {entry['rows']:6} rows   reference query p50 {entry['reference_ms'] or 0:.1f} ms, max {entry['reference_max_ms'] or 0:.1f} ms")
+        if manifest["rejected"]:
+            print(f"  see {bundle.path / 'rejected.jsonl'}")
+        return 0
     try:
         if args.sql is not None:
             sql = args.sql
@@ -58,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
             args.engine,
             db=args.db,
             catalog=catalog,
+            bundle=args.bundle,
+            terms=args.terms,
             mode=args.mode,
             cost_ceiling=args.cost_ceiling,
             tenant_column=args.tenant_column,

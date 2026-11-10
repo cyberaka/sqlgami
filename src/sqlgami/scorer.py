@@ -66,6 +66,12 @@ class Scorer:
         stage, measured on a labelled set of your own. Agreement from a source right less than
         half the time earns little; two sources right most of the time that agree with each
         other against the query make a HIGH finding. Names match by substring.
+    bundle:
+        A compiled bundle folder (``sqlgami compile``): fixtures and reference fingerprints
+        the candidate is checked against before any host database is touched. The bundle's
+        schema hash must match the catalogue; its term catalogue is used unless ``terms`` is
+        given. ``score(..., reference="key")`` names the reference explicitly; otherwise the
+        exact question text, then the exact set of matched terms, selects it.
     terms:
         The term catalogue: a folder of CSV sheets (``Terms.csv``, ``KPIs.csv``, ...), an
         ``.xlsx`` workbook with those sheets, or YAML/dict/list rows — how the host's business
@@ -110,6 +116,7 @@ class Scorer:
         source_weights: dict[str, float] | None = None,
         prober: Any = None,
         terms: Any = None,
+        bundle: Any = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -155,6 +162,18 @@ class Scorer:
         # glossary written as YAML with a ``terms:`` section carries one too.
         from .terms import catalogue_from_yaml_glossary, load_terms
 
+        self.bundle = None
+        if bundle is not None:
+            from .bundle import Bundle, schema_hash
+
+            self.bundle = bundle if isinstance(bundle, Bundle) else Bundle.load(bundle)
+            if self.bundle.dialect != self.dialect:
+                raise ConfigurationError(f"the bundle was compiled for {self.bundle.dialect}, this scorer is {self.dialect}")
+            if self.catalog is not None and self.bundle.schema_hash and schema_hash(self.catalog) != self.bundle.schema_hash:
+                raise ConfigurationError("the bundle was compiled against a different schema; recompile it (sqlgami compile)")
+            if terms is None and self.bundle.terms_path() is not None:
+                terms = self.bundle.terms_path()
+            self.bundle.warm()  # the fixtures are loaded once, here, not inside the first deadline
         self.terms = load_terms(terms) if terms is not None else None
         if self.terms is None and isinstance(glossary, str) and "terms:" in glossary:
             self.terms = catalogue_from_yaml_glossary(glossary)
@@ -219,6 +238,7 @@ class Scorer:
         params: dict[str, Any] | None = None,
         alternatives: Sequence[str] | None = None,
         probes: Sequence[Any] | None = None,
+        reference: str | None = None,
     ) -> Report:
         """Check ``sql`` and return a :class:`Report`.
 
@@ -260,15 +280,17 @@ class Scorer:
             probes=probes,
             prober=self.prober,
             terms=self.terms,
+            bundle=self.bundle,
+            reference=reference,
         )
 
-    def explain(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None) -> Report:
+    def explain(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None, reference: str | None = None) -> Report:
         """Static checks only. Never contacts the database for the query itself."""
-        return self.score(sql, question, mode="static", params=params)
+        return self.score(sql, question, mode="static", params=params, reference=reference)
 
-    def dry_run(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None) -> Report:
+    def dry_run(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None, reference: str | None = None) -> Report:
         """Static checks plus the engine's own planner. Does not run the query."""
-        return self.score(sql, question, mode="dry", params=params)
+        return self.score(sql, question, mode="dry", params=params, reference=reference)
 
     def sample(
         self,
@@ -278,6 +300,7 @@ class Scorer:
         params: dict[str, Any] | None = None,
         alternatives: Sequence[str] | None = None,
         probes: Sequence[Any] | None = None,
+        reference: str | None = None,
     ) -> Report:
         """Also runs the query read-only, if its estimated cost is under the ceiling.
 
@@ -285,12 +308,14 @@ class Scorer:
         same question.
         """
         return self.score(
-            sql, question, mode="sample", cost_ceiling=cost_ceiling, params=params, alternatives=alternatives, probes=probes
+            sql, question, mode="sample", cost_ceiling=cost_ceiling, params=params, alternatives=alternatives, probes=probes, reference=reference
         )
 
     # ----------------------------------------------------------- lifecycle
 
     def close(self) -> None:
+        if getattr(self, "bundle", None) is not None:
+            self.bundle.close()
         if self.adapter is not None and self._owns_adapter:
             self.adapter.close()
 

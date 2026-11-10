@@ -39,6 +39,14 @@ def main(argv: list[str] | None = None) -> int:
     p_sync.add_argument("source")
     p_sync.add_argument("dest")
 
+    p_comp = sub.add_parser("compile", help="compile the suite into a bundle: fixtures plus the golds as references")
+    p_comp.add_argument("suite")
+    p_comp.add_argument("--engine", default="duckdb")
+    p_comp.add_argument("--seed", type=int, default=1)
+    p_comp.add_argument("--profiles", help="comma-separated fixture profiles")
+    p_comp.add_argument("--from-seeds", action="store_true", help="subsample the suite's nasty seed databases instead of generating rows")
+    p_comp.add_argument("--rules", help="YAML with a subsample: block of per-table predicates (with --from-seeds)")
+
     p_lat = sub.add_parser("latency", help="p50/p90/p99 of score() per mode on the suite's gold statements")
     p_lat.add_argument("suite")
     p_lat.add_argument("--engine", default="duckdb")
@@ -101,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     p_cal.add_argument("--out", required=True, help="where to write the calibration JSON")
 
     p_eval.add_argument("--no-terms", action="store_true", help="score without the suite's term catalogue (terms/ folder), to report both numbers")
+    p_eval.add_argument("--bundle", nargs="?", const="auto", help="score with a compiled bundle (default: the suite's own, from benchkit compile)")
     p_eval.add_argument("--role", choices=["confirm", "judge"], default="confirm", help="how far the alternatives are trusted")
     p_eval.add_argument("--max-samples", type=int, help="with --consistency: use only samples 0..N-1 of each verifier")
     p_eval.add_argument("--score-only", action="append", help="score only candidates from these generators (repeatable)")
@@ -139,6 +148,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{digest}  {name}")
             return 0
         suite = load_suite(args.suite)
+        if args.command == "compile":
+            from .compile import compile_suite
+
+            bundle = compile_suite(
+                suite, args.engine, args.seed, args.profiles.split(",") if args.profiles else None,
+                from_seeds=args.from_seeds, rules_file=Path(args.rules) if args.rules else None,
+            )
+            m = bundle.manifest
+            print(f"bundle: {bundle.path}  references {m['references']} (rejected {m['rejected']})")
+            for entry in m["fixtures"]:
+                print(f"  {entry['name']:16} {entry['rows']:6} rows   gold p50 {entry['reference_ms'] or 0:.1f} ms  max {entry['reference_max_ms'] or 0:.1f} ms")
+            return 0
         if args.command == "latency":
             from .latency import format_result, measure, write_result
 
@@ -207,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
                     role=args.role,
                     substitute=args.substitute,
                     terms=not args.no_terms,
+                    bundle=args.bundle,
                 )
                 path = write_run(suite, engine, mode, items, result, run_id)
                 print(f"== {suite.name} / {engine} / {mode}")

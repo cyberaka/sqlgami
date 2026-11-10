@@ -249,10 +249,12 @@ def run(
     probes: Sequence[Any] | None = None,
     prober: Any = None,
     terms: Any = None,
+    bundle: Any = None,
+    reference: str | None = None,
 ) -> Report:
     options = options or Options()
     report = Report(engine=engine, mode=mode, sql=sql, question=question)
-    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober, terms)
+    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober, terms, bundle, reference)
     report.findings = _dedupe(report.findings)
     scored = score_report(report, calibrator)
     report.confidence = scored.confidence
@@ -303,6 +305,8 @@ def _run(
     probes: Sequence[Any] | None = None,
     prober: Any = None,
     terms: Any = None,
+    bundle: Any = None,
+    reference: str | None = None,
 ) -> None:
     clock = _Clock()
     deadline = _Deadline(options.deadline_ms)
@@ -311,7 +315,7 @@ def _run(
     bounded: _Bounded | None = _Bounded(adapter, options.budget_s, deadline) if adapter is not None else None
     adapter = bounded  # type: ignore[assignment]  # every stage below talks to the database through the budget
     try:
-        _stages(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober, terms, clock, deadline, bounded)
+        _stages(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober, terms, clock, deadline, bounded, bundle, reference)
     finally:
         report.timing = deadline.ledger(report)
 
@@ -335,6 +339,8 @@ def _stages(
     clock: _Clock,
     deadline: _Deadline,
     bounded: _Bounded | None,
+    bundle: Any = None,
+    reference: str | None = None,
 ) -> None:
 
     # ------------------------------------------------------------- parse
@@ -355,12 +361,12 @@ def _stages(
             Finding("parse_error", Severity.ERROR, f"The statement does not parse: {analysis.parse_error}", "parse")
         )
         _stage(report, "parse", StageStatus.FAILED, analysis.parse_error, elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "reconciliation", "question"), "the statement does not parse")
+        _not_run(report, ("statement", "schema", "static", "fixtures", "dry_run", "sample", "consistency", "reconciliation", "question"), "the statement does not parse")
         return
     if analysis.kind == A.EMPTY:
         report.findings.append(Finding("empty_statement", Severity.ERROR, "There is no statement to check.", "parse"))
         _stage(report, "parse", StageStatus.FAILED, "empty input", elapsed)
-        _not_run(report, ("statement", "schema", "static", "dry_run", "sample", "consistency", "reconciliation", "question"), "empty input")
+        _not_run(report, ("statement", "schema", "static", "fixtures", "dry_run", "sample", "consistency", "reconciliation", "question"), "empty input")
         return
     _stage(report, "parse", StageStatus.PASSED, None, elapsed)
 
@@ -403,7 +409,7 @@ def _stages(
     if problem is not None:
         report.findings.append(problem)
         _stage(report, "statement", StageStatus.FAILED, problem.message, clock.lap())
-        _not_run(report, ("schema", "static", "dry_run", "sample", "consistency", "reconciliation", "question"), "the statement is not a plain read-only query")
+        _not_run(report, ("schema", "static", "fixtures", "dry_run", "sample", "consistency", "reconciliation", "question"), "the statement is not a plain read-only query")
         return
     _stage(report, "statement", StageStatus.PASSED, None, clock.lap())
     report.findings.extend(prepared.findings)
@@ -505,6 +511,11 @@ def _stages(
     else:
         _stage(report, "static", StageStatus.NOT_RUN, "needs a resolved schema")
 
+    # ---------------------------------------------------------- fixtures
+    # The strongest deterministic signal: the candidate on the bundle's fixtures against the
+    # reference fingerprints. Runs before any host database is touched, while the deadline allows.
+    _fixture_stage(report, prepared, sql, dialect, question, params, options, bundle, reference, deadline, terms)
+
     blocked: str | None = None
     if analysis.unknown_tables and catalog is not None:
         # The catalogue is the allow-list of what a query may read: a table outside it is not
@@ -594,6 +605,134 @@ def _stages(
                 evidence={"budget_s": options.budget_s},
             )
         )
+
+
+BONUS_FIXTURES = (1.2, 1.6)  # the candidate matches the reference on one fixture / on two or more
+
+
+def _fixture_stage(
+    report: Report,
+    prepared: Any,
+    sql: str,
+    dialect: str,
+    question: str | None,
+    params: dict[str, Any] | None,
+    options: Options,
+    bundle: Any,
+    reference_key: str | None,
+    deadline: _Deadline,
+    terms: Any,
+) -> None:
+    name = "fixtures"
+    if bundle is None:
+        _stage(report, name, StageStatus.NOT_RUN, "no bundle was supplied")
+        return
+    if any(f.severity == Severity.ERROR for f in report.findings):
+        _stage(report, name, StageStatus.NOT_RUN, "the statement cannot run")
+        return
+    matched_terms: list[str] = []
+    if terms is not None and question:
+        try:
+            matched_terms = sorted({m.name.lower() for m in terms.match(question)})
+        except Exception:
+            matched_terms = []
+    reference, how = bundle.reference_for(question, reference_key, matched_terms)
+    if reference is None:
+        _stage(report, name, StageStatus.NOT_RUN, how)
+        return
+    from . import bundle as B
+
+    clock = _Clock()
+    outcome: dict[str, Any] = {"reference": reference.key, "matched_by": how, "params": reference.params, "fixtures": []}
+    matched = 0
+    mismatch: Finding | None = None
+    for entry in bundle.fixture_order():
+        fixture_name = entry["name"]
+        stored = reference.results.get(fixture_name)
+        if not stored or not stored.get("ok"):
+            continue
+        if not stored.get("row_count"):
+            # An empty reference result proves nothing: any query returning nothing would match.
+            outcome["fixtures"].append({"fixture": fixture_name, "status": "no_evidence", "reason": "the reference returns no rows on this fixture"})
+            continue
+        left = deadline.remaining_ms()
+        needed = (entry.get("reference_max_ms") or 5.0) * 2 + 2.0
+        if left is not None and left < needed:
+            deadline.cut(name)
+            outcome["fixtures"].append({"fixture": fixture_name, "status": "not_run", "reason": DEADLINE})
+            continue
+        timeout_s = min(options.timeout_s, left / 1000) if left is not None else options.timeout_s
+        try:
+            conn = bundle.connection(fixture_name)
+        except Exception as exc:
+            outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": str(exc)[:160]})
+            continue
+        # The candidate runs under the reference's own parameter values, so the two compare.
+        result = B._run_on(conn, sql, dialect, dict(reference.params), timeout_s=timeout_s)
+        if not result.get("ok"):
+            error = str(result.get("error") or "")
+            status = "timeout" if "stopped" in error or "deadline" in error else "error"
+            outcome["fixtures"].append({"fixture": fixture_name, "status": status, "reason": error[:200]})
+            if status == "error" and dialect == "duckdb" and mismatch is None:
+                mismatch = Finding(
+                    "fixture_error",
+                    Severity.HIGH,
+                    f"On the fixture {fixture_name} the query fails ({error[:160]}), where the reference query runs.",
+                    name,
+                    evidence={"fixture": fixture_name, "reference": reference.key},
+                )
+            continue
+        same = result["strict"] == stored["strict"] or result["loose"] == stored["loose"]
+        if same:
+            matched += 1
+            outcome["fixtures"].append({"fixture": fixture_name, "status": "match", "rows": result["row_count"]})
+            continue
+        differing = _differing_rows(stored, result)
+        outcome["fixtures"].append({"fixture": fixture_name, "status": "mismatch", "rows": result["row_count"], "reference_rows": stored.get("row_count"), "differing": differing})
+        mismatch = Finding(
+            "fixture_mismatch",
+            Severity.HIGH,
+            f"On the fixture {fixture_name} the query returns {result['row_count']} row(s) and the reference "
+            f"{stored.get('row_count')}; the results differ"
+            + (f" (for example {differing['example']})" if differing.get("example") else "")
+            + ". The reference answers the same question under the same parameter values.",
+            name,
+            suggestion="Compare the query with the reference listed under signals.fixtures.",
+            evidence={"fixture": fixture_name, "reference": reference.key, "differing": differing},
+        )
+        break  # a mismatch is a verdict; the remaining fixtures need not run
+    outcome["matched"] = matched
+    outcome["verdict"] = "mismatch" if mismatch is not None else ("match" if matched else "unverified")
+    report.signals["fixtures"] = outcome
+    if mismatch is not None:
+        report.findings.append(mismatch)
+        _stage(report, name, StageStatus.PASSED, f"differs from the reference on {mismatch.evidence.get('fixture')}", clock.lap())
+    elif matched:
+        _stage(report, name, StageStatus.PASSED, f"matches the reference on {matched} fixture(s)", clock.lap())
+    else:
+        _stage(report, name, StageStatus.SKIPPED, "no fixture could be run in time", clock.lap())
+
+
+def _differing_rows(stored: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """A bounded, readable account of how two results differ."""
+    from .consistency import _norm
+
+    left = {tuple(_norm(v) for v in row) for row in (stored.get("rows") or [])}
+    right = {tuple(_norm(v) for v in row) for row in (result.get("rows") or [])}
+    only_reference = sorted(left - right, key=repr)[:5]
+    only_candidate = sorted(right - left, key=repr)[:5]
+    example = None
+    if only_candidate:
+        example = f"the query returns {list(only_candidate[0])} which the reference does not"
+    elif only_reference:
+        example = f"the reference returns {list(only_reference[0])} which the query does not"
+    return {
+        "columns": result.get("columns"),
+        "reference_columns": stored.get("columns"),
+        "only_in_reference": [list(r) for r in only_reference],
+        "only_in_candidate": [list(r) for r in only_candidate],
+        "example": example,
+    }
 
 
 def _consistency_stage(
