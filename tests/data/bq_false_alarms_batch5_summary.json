@@ -1,0 +1,38 @@
+{
+  "description": "Batch 5: false alarms on CORRECT BigQuery, static/term stage. Scorer('bigquery', catalog=bench/hr_snapshot/schema/bigquery.sql, mode='static', terms=bench/hr_snapshot/terms). A correct query scored <= 0.4 or flagged HIGH/ERROR is a false alarm.",
+  "false_alarm_rate_on_dev_candidates": {
+    "candidates": 224,
+    "correct_by_native_consensus": 126,
+    "correctness_label": "native-result consensus per question across clean-1/nasty-42/nasty-44 (dev gold is not in the repo); a candidate matching the plurality native result on all 3 seeds is correct",
+    "correct_scored_le_0_4": 1,
+    "rate_le_0_4": "0.8%",
+    "correct_with_high_finding": 1,
+    "rate_high": "0.8%",
+    "by_finding_code_le_0_4": {"required_predicate": 1, "partition_filter": 1},
+    "high_finding_codes_on_correct": {"required_predicate": 1},
+    "score_distribution_on_correct": {"min": 0.204, "median": 0.588, "max": 0.588}
+  },
+  "findings": [
+    {
+      "id": "required_predicate_in_subquery_scope",
+      "severity": "HIGH",
+      "finding_code": "required_predicate",
+      "symptom": "the hierarchy_access required-predicate (match=or_chain over lvl_2_id..lvl_7_id and _fn) is NOT recognized when each level is scoped with an equivalent IN-subquery, only with a literal equality; a correct, fully-scoped query is flagged HIGH and the score collapses 0.52 -> 0.09.",
+      "literal_form_score": 0.519,
+      "in_subquery_form_score": 0.090,
+      "real_candidate": "hr_snapshot-q027 (hf:google/gemma-3-27b-it), correct by native, scored 0.204 with required_predicate HIGH + partition_filter",
+      "minimal_construct": "WHERE e.lvl_2_id IN (SELECT node_id FROM hierarchy_dim WHERE node_id = 12003 AND hierarchy_kind='reporting') OR e.lvl_3_id IN (...) OR ... (all 12 levels) -- flagged HIGH; the same chain with e.lvl_2_id = 12003 is accepted",
+      "test": "tests/test_redteam_bq_false_alarms.py",
+      "fix_direction": "the or_chain matcher should accept a level matched by IN (subquery) / IN (list) that resolves to the manager node, not only a literal equality"
+    }
+  ],
+  "idioms_with_no_high_false_alarm": [
+    "QUALIFY dedup", "CROSS JOIN UNNEST", "LEFT JOIN UNNEST ON TRUE", "ARRAY_AGG(STRUCT(...))",
+    "ARRAY subquery", "SELECT * EXCEPT(...)", "SELECT * REPLACE(...)", "COUNTIF", "COUNT(DISTINCT IF(...))",
+    "SAFE_DIVIDE", "scalar-subquery date bound", "DECLARE/SET script", "view read (current_snapshot_v)",
+    "backticked dashed project names"
+  ],
+  "secondary_observation": {
+    "note": "Correct queries against emp_period_snapshot sit in an 'uncertain' band (~0.50-0.59), never confident, driven by recurring partition_filter (LOW/MEDIUM) and scalar_subquery_rows (MEDIUM, e.g. period_end_dt = (SELECT ppe_dt WHERE is_current_flag=TRUE), which is unique but the schema does not declare it so). These do not cross the <= 0.4 / HIGH false-alarm bar but depress confidence on correct idiomatic queries."
+  }
+}
