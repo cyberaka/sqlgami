@@ -330,6 +330,11 @@ class Catalogue:
 
     # ---------------------------------------------------------------- matching
 
+    def numeric_parameters(self) -> tuple[str, ...]:
+        """Parameters rows of a numeric type: their placeholders bind a number in a phrase, as
+        ``{n}`` does, so a KPI may have several numeric slots (``{n_months_back}``, ``{top_n}``)."""
+        return tuple(p.name for p in self.parameters if (p.type or "").strip().lower().split("(")[0] in _NUMERIC_PARAMETER_TYPES)
+
     def match(self, question: str) -> list[Match]:
         """Terms and KPIs whose phrases occur in the question. Exact, after normalising case,
         hyphens, underscores and simple plurals; ``{n}`` binds a number. Longer phrases win
@@ -381,6 +386,7 @@ class Catalogue:
     def _compiled(self) -> list[tuple[re.Pattern[str], str, str, str]]:
         if self._patterns is None:
             entries: list[tuple[re.Pattern[str], str, str, str, int]] = []
+            numeric = self.numeric_parameters()
             for term in self.terms:
                 phrases = list(term.phrases)
                 if term.kind == "source" and term.sql.strip():
@@ -390,10 +396,10 @@ class Catalogue:
                     if re.fullmatch(r"\w+", column) and column not in {normalise(p).strip() for p in phrases}:
                         phrases.append(column)
                 for phrase in phrases:
-                    entries.append((_phrase_pattern(phrase, term.qualifiers), term.name, phrase, term.kind if term.enforceable else "", len(phrase)))
+                    entries.append((_phrase_pattern(phrase, term.qualifiers, numeric), term.name, phrase, term.kind if term.enforceable else "", len(phrase)))
             for kpi in self.kpis:
                 for phrase in kpi.phrases:
-                    entries.append((_phrase_pattern(phrase), kpi.name, phrase, "kpi" if kpi.enforceable else "", len(phrase)))
+                    entries.append((_phrase_pattern(phrase, (), numeric), kpi.name, phrase, "kpi" if kpi.enforceable else "", len(phrase)))
             entries.sort(key=lambda e: -e[4])  # longest phrases first
             self._patterns = [(p, n, ph, k) for p, n, ph, k, _ in entries]
         return self._patterns
@@ -428,7 +434,8 @@ def normalise(text: str) -> str:
     text = text.lower()
     text = re.sub(r"\b(non|un)-(?=\w)", r"\1", text)
     text = text.replace("-", " ")
-    text = re.sub(r"[^\w\s{}%]", " ", text)
+    text = re.sub(r"(?<=\d)\.(?=\d)", "\x00", text)  # a decimal point stays ("2.5" is one number)
+    text = re.sub(r"[^\w\s{}%\x00]", " ", text).replace("\x00", ".")
     return " " + re.sub(r"\s+", " ", text).strip() + " "
 
 
@@ -438,18 +445,23 @@ _NUMBER_WORDS = {
 }
 
 
-def _phrase_pattern(phrase: str, qualifiers: Sequence[str] = ()) -> re.Pattern[str]:
+_NUMERIC_PARAMETER_TYPES = {"integer", "int", "number", "numeric", "decimal", "float", "percent", "pp", "days", "count"}
+
+
+def _phrase_pattern(phrase: str, qualifiers: Sequence[str] = (), numeric: Sequence[str] = ()) -> re.Pattern[str]:
     """A phrase becomes a regular expression over the normalised question: words may take a
-    plural s, ``{n}``/``{m}`` take a number (digits or a number word), other placeholders take a
-    word. ``qualifiers`` are words the term declares a question may put between the phrase's
-    words without changing its meaning ("trailing {n} biweekly pay periods")."""
+    plural s, ``{n}``/``{m}`` and every placeholder named in ``numeric`` (a Parameters row of a
+    numeric type: ``{n_months_back}``, ``{tolerance_pp}``) take a number — digits, a decimal, or
+    a number word — other placeholders take a value. ``qualifiers`` are words the term declares
+    a question may put between the phrase's words without changing its meaning ("trailing {n}
+    biweekly pay periods")."""
     parts: list[str] = []
     for token in normalise(phrase).split():
         marker = re.fullmatch(r"\{(\w+)\}", token)
         if marker:
             name = marker.group(1)
-            if name in ("n", "m"):
-                parts.append(rf"(?P<{name}>\d+|{'|'.join(_NUMBER_WORDS)})")
+            if name in ("n", "m") or name in numeric:
+                parts.append(rf"(?P<{name}>\d+(?:\.\d+)?|{'|'.join(_NUMBER_WORDS)})")
             else:
                 # a parameter slot takes a value, not a word: a number, an identifier with digits
                 # or underscores, or a quoted/placeholder form — never plain prose
@@ -466,14 +478,20 @@ def _phrase_pattern(phrase: str, qualifiers: Sequence[str] = ()) -> re.Pattern[s
     return re.compile(r"(?<=\s)" + gap.join(parts) + r"(?=\s)")
 
 
-def bound_number(value: str) -> int | None:
+def bound_number(value: str) -> int | float | None:
+    """The number a slot's text stands for: an integer, a decimal ("2.5"), or a number word."""
     value = value.strip().lower()
     if value in _NUMBER_WORDS:
         return int(_NUMBER_WORDS[value])
     try:
         return int(value)
     except ValueError:
+        pass
+    try:
+        number = float(value)
+    except ValueError:
         return None
+    return int(number) if number.is_integer() else number
 
 
 def _looks_like_path(value: Any) -> bool:

@@ -445,3 +445,76 @@ def test_limit_rank_term_accepts_a_limit_or_a_row_number_and_binds_number_words(
 def test_rank_term_sql_is_validated():
     problems = Catalogue.from_sheets({"terms": TERMS + "top_n,top {n},rank,,ORDER BY x DESC,,\n"}).validate()
     assert any("rank is written as" in str(p) and "sql" in str(p) for p in problems), problems
+
+
+# ------------------------------------------------------------------ named numeric slots
+
+
+def test_named_numeric_slots_bind_like_n_including_decimals_and_number_words():
+    """A KPI may have several numeric parameters: a Parameters row of a numeric type makes its
+    placeholder bind a number in a phrase as {n} does — digits, a decimal, or a number word."""
+    terms = """term,phrases,kind,table,sql,nulls,description
+last_months,last {n_months_back} calendar months;past {n_months_back} months,window,hr_pay_period_dim,period_seq BETWEEN -({n_months_back}-1) AND 0,,
+within_tolerance,within {tolerance_pp} pp;within {tolerance_pp} percentage points,filter,hr_emp_period_snapshot,ABS(delta_pp) <= {tolerance_pp},,
+top_by_cap,top {top_n} segments capped at {cap_n},rank,,DENSE_RANK() <= {top_n},,
+by_region,in region {region},filter,hr_emp_period_snapshot,region_cd = '{region}',,
+"""
+    params = "name,type,example_values\nn_months_back,integer,24\ntolerance_pp,number,2.5\ntop_n,integer,5\ncap_n,integer,50\nregion,input,\n"
+    book = Catalogue.from_sheets({"terms": terms, "kpis": "kpi,phrases,formula,format,reference_sql,description\n", "parameters": params})
+    assert not book.validate("duckdb")
+    assert set(book.numeric_parameters()) == {"n_months_back", "tolerance_pp", "top_n", "cap_n"}
+    matches = {m.name: m.bindings for m in book.match("New hires over the last 24 calendar months within 2.5 pp of plan, top five segments capped at 50, in region us_east")}
+    assert matches["last_months"] == {"n_months_back": "24"}
+    assert matches["within_tolerance"] == {"tolerance_pp": "2.5"}
+    assert matches["top_by_cap"] == {"top_n": "five", "cap_n": "50"}
+    assert matches["by_region"] == {"region": "us_east"}
+    from sqlgami.bundle import slot_values
+    from sqlgami.terms import bound_number
+
+    assert bound_number("2.5") == 2.5 and bound_number("24") == 24 and bound_number("five") == 5 and bound_number("3.0") == 3
+    assert slot_values(book.match("within 2.5 pp over the past twelve months")) == {"tolerance_pp": 2.5, "n_months_back": 12}
+    # the decimal is one number to the free-number guard too
+    from sqlgami.bundle import free_number_phrases
+
+    assert free_number_phrases("within 2.5 pp over the past 12 months", {"tolerance_pp": 2.5, "n_months_back": 12}, {}) == []
+    assert [v for v, _ in free_number_phrases("within 2.5 pp over the past 12 months", {}, {})] == [2.5, 12.0]
+    # a non-numeric parameter still takes a value, never prose
+    assert "by_region" not in {m.name for m in book.match("in region the north")}
+
+
+# ------------------------------------------------------- false alarms seen in the owner's demo
+
+
+def _q022_sql() -> str:
+    return (
+        "WITH periods AS (SELECT period_seq, ppe_dt AS period_end_dt FROM hr_pay_period_dim WHERE freq_cd = 'B' AND period_seq BETWEEN -(8-1) AND 0) "
+        "SELECT p.period_seq, p.period_end_dt, COUNT(DISTINCT CASE WHEN s.status_cd = 'A' THEN s.assoc_id END) AS active_n "
+        "FROM periods p LEFT JOIN hr_emp_period_snapshot s ON s.snap_dt = p.period_end_dt AND s.period_end_dt = p.period_end_dt AND (" + CHAIN + ") "
+        "GROUP BY p.period_seq, p.period_end_dt ORDER BY p.period_seq"
+    )
+
+
+def test_a_number_bound_by_a_window_term_is_not_a_top_n():
+    """"last 8 pay periods" is the catalogue's window; the correct trend query has no LIMIT 8 and
+    must not be told it needs one."""
+    report = scorer().score(_q022_sql(), "Show the active headcount trend for my organisation over the last 8 pay periods, oldest first.", params={"manager_id": 12003})
+    assert "top_n" not in {f.code for f in report.findings}, [f.message for f in report.findings]
+    # a genuine top-8 with no window term still fires
+    report = scorer().score("SELECT assoc_id, hire_dt FROM hr_employee_dim ORDER BY hire_dt", "Show the 8 most recently hired associates.")
+    assert "top_n" in {f.code for f in report.findings}
+
+
+def test_an_output_list_after_a_colon_is_read_as_the_list():
+    """"…: period_seq, period_end_dt, active_n, oldest first." lists three columns, not one."""
+    question = "Show the active headcount trend for my organisation over the last 8 pay periods: period_seq, period_end_dt, active_n, oldest first."
+    report = scorer().score(_q022_sql(), question, params={"manager_id": 12003})
+    codes = {f.code for f in report.findings}
+    assert "output_columns" not in codes and "top_n" not in codes, [f.message for f in report.findings]
+    from sqlgami.question import _listed_outputs
+
+    assert _listed_outputs(question) == 3
+    assert _listed_outputs("Return period_seq and active_n, sorted by period_seq.") == 2
+    # a two-column query against the three-column list is still told
+    two = _q022_sql().replace("p.period_seq, p.period_end_dt, COUNT", "p.period_seq, COUNT")
+    report = scorer().score(two, question, params={"manager_id": 12003})
+    assert "output_columns" in {f.code for f in report.findings}

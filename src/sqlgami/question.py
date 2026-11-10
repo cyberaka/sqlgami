@@ -1028,7 +1028,7 @@ _RETURN_LIST = re.compile(r"(?:^|[.;?)]\s+)(?:return|returns|output|show)\s+(?:o
 _LIST_OF = re.compile(r"^\s*(?:list|show|give)\s+(?:the\s+)?([\w`,\s]+?)\s+(?:of|for)\s+(?:every|each|all)\b", re.IGNORECASE)
 _WITH_THEIR = re.compile(r"^\s*(?:list|show|give|return)\b[^.;?]*?\bwith\s+(?:their|its)\s+([^.;?]+)", re.IGNORECASE)
 _LIST_SPLIT = re.compile(r"\s*,\s*(?:and\s+)?|\s+and\s+")
-_LIST_STOP = re.compile(r"\b(sorted|sort|ordered|order by|where|for|per|grouped|break|with ties|as integer|rounded)\b", re.IGNORECASE)
+_LIST_STOP = re.compile(r"\b(sorted|sort|ordered|order by|where|for|per|grouped|break|with ties|as integer|rounded|oldest first|newest first|latest first|earliest first|most recent first|alphabetically|ascending|descending)\b", re.IGNORECASE)
 
 
 def _sorting(asked: _Asked) -> list[Finding]:
@@ -1058,6 +1058,9 @@ def _listed_outputs(text: str, column_names: set[str] | None = None) -> int | No
     if match is None:
         return None
     listed = match.group(1)
+    if ":" in listed:
+        # "Show the trend over the last 8 periods: period_seq, period_end_dt, active_n, oldest first."
+        listed = listed.rsplit(":", 1)[1]
     stop = _LIST_STOP.search(listed)
     if stop:
         listed = listed[: stop.start()]

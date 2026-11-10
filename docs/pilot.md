@@ -62,7 +62,10 @@ reported as undefined, never interpreted.
 `KPIs.csv` names measures (`headcount = COUNT(DISTINCT {assoc_id})`, `requires: active`).
 `Examples.csv` holds questions with a correct query each — these become the references the
 fixture stage compares candidates against. Write them as you would ask them, with `{n}` and
-`{manager_id}` where the values vary.
+`{manager_id}` where the values vary. A measure with several numbers — "the last
+{n_months_back} months within {tolerance_pp} pp" — declares each as a `Parameters.csv` row of a
+numeric type (`integer`, `number`); its placeholder then binds a number (digits, a decimal, or a
+number word) in a wording exactly as `{n}` does.
 
 ### The table map
 

@@ -341,7 +341,11 @@ data terms is reported as `undefined_term` and caps confidence at 0.75:
 sqlgami never guesses what a word means.
 
 `Terms.csv` (one row per term; `phrases` separated by `;`, `{n}` a number from
-the question, `{manager_id}` a template parameter; an optional `qualifiers`
+the question — and so is any placeholder whose `Parameters.csv` row has a
+numeric type (`{n_months_back}`, `{tolerance_pp}`: digits, a decimal such as
+2.5, or a number word), so a measure may have several numeric slots that bind
+to the reference parameters of the same names; `{manager_id}` a template
+parameter of another type takes a value, never prose; an optional `qualifiers`
 column lists single words a question may put inside a wording without
 changing it — `biweekly;authoritative` lets "trailing 8 biweekly pay periods"
 match "trailing {n} pay periods"; nothing is inferred without it):

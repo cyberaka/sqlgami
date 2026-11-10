@@ -1090,6 +1090,18 @@ def _question_stage(
         term_findings, signal = check_terms(ctx, question, terms, ctx.dialect, params)
         report.signals["terms"] = signal
         findings.extend(term_findings)
+        # "last 8 pay periods" is a window the catalogue defines, not a top-8: a number a matched
+        # term binds (any kind but rank) is that term's, and the term check judges it.
+        from .terms import bound_number
+
+        bound = set()
+        for match in terms.match(question):
+            if match.kind != "rank":
+                for text in (match.bindings or {}).values():
+                    number = bound_number(text)
+                    if number is not None:
+                        bound.add(float(number))
+        findings = [f for f in findings if not (f.code == "top_n" and float(f.evidence.get("asked") or -1) in bound)]
     report.findings.extend(findings)
     _stage(report, "question", StageStatus.PASSED, f"{len(findings)} finding(s)", clock.lap())
 
