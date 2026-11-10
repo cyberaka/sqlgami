@@ -15,7 +15,8 @@ SOURCE
   2. RELEASE.md                  (supported constructs, report fields, known limits, open defects)
   3. docs/guarantees.md          (what is and is not guaranteed)
   4. docs/pilot.md               (term workbook, references, fixture rules, compile)
-  5. HANDOVER.md, docs/REDTEAM_HANDOVER.md (architecture, tests, open work; read when debugging)
+  5. HANDOVER.md, docs/REDTEAM_HANDOVER.md (architecture, tests, open work; read when debugging;
+     the red-team file was written against an earlier commit — HANDOVER.md §5 has the current status)
   6. docs/pitch/sqlgami-pitch.html (overview of the approach)
 
 NON-NEGOTIABLE RULES
@@ -38,8 +39,8 @@ NON-NEGOTIABLE RULES
    operator. Do not guess.
 
 WHAT TO DO (shadow mode; nothing is blocked)
-1. Install the release in a fresh virtualenv with the [bigquery] and [excel] extras, and run
-   the test suite to confirm it is green.
+1. Install the release in a fresh virtualenv with the [pilot] extra (add [excel] only if the
+   workbook is .xlsx), and run the test suite to confirm it is green.
 2. Export DDL for tables, views and table-valued functions from INFORMATION_SCHEMA
    (TABLES + ROUTINES), using the query in the runbook. Run `sqlgami doctor` on it plus a
    sample of real queries, and list the constructs outside the allow-list.

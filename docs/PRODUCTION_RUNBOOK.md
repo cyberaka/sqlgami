@@ -87,7 +87,9 @@ parameters, and later the outcome (accepted / edited / rejected; found wrong?).
 (h) **Score in shadow mode.** One `Scorer("bigquery", catalog=<schema.sql text>,
 bundle="pilot/bundle")` per process; `report = scorer.score(sql, question, params=…)`. Log
 `score`, `verdict`, high finding codes, `signals.fixtures.verdict`, `timing.cut_by_deadline`,
-`timing.total_ms`, `signals.fixtures.bundle`. Change nothing in the application.
+`timing.total_ms`, `signals.fixtures.bundle`. Score each statement twice: at the default
+50 ms deadline, and again with `Options(deadline_ms=None)` (every fixture runs), so the
+deadline's cost can be seen. Change nothing in the application.
 
 (i) **Label.** Have a reviewer label a sample (right / wrong), stratified by score band.
 
