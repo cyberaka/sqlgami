@@ -630,3 +630,31 @@ def test_scalar_subquery_is_a_constant_for_key_reasoning():
     assert not [f for f in report.findings if f.code == "fan_out" and f.severity == Severity.HIGH], report.summary()
     correlated = sql.replace("WHERE is_current", "WHERE is_current AND ppe_dt = snap.period_end_dt")
     assert Scorer("duckdb", catalog=ddl).explain(correlated, "amount per person").has("fan_out")
+
+
+def test_or_chain_against_a_column_pinned_to_the_parameter():
+    """JOIN hierarchy_dim h ON lvl_2_id = h.node_id OR ... WHERE h.node_id = {manager_id}: every
+    branch compares with a column pinned to the parameter one clause later; that is the chain."""
+    ddl = HIER_DDL + "CREATE TABLE hierarchy_dim (node_id INTEGER, hierarchy_kind TEXT);"
+    chain = " OR ".join(f"s.lvl_{n}_id = h.node_id" for n in range(2, 8)) + " OR " + " OR ".join(f"s.lvl_{n}_id_fn = h.node_id" for n in range(2, 8))
+    both_chains = {"name": "hierarchy_access", "tables": ["snap"], "match": "or_chain",
+                   "columns": [f"lvl_{n}_id" for n in range(2, 8)] + [f"lvl_{n}_id_fn" for n in range(2, 8)]}
+    sc = Scorer("duckdb", catalog=ddl, required_predicates=[both_chains])
+    full = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s JOIN hierarchy_dim h ON {chain} WHERE h.node_id = {{manager_id}}", "headcount under a manager", params={"manager_id": 7})
+    assert not full.has("required_predicate"), full.summary()
+    partial = " OR ".join(f"s.lvl_{n}_id = h.node_id" for n in range(2, 8))
+    short = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s JOIN hierarchy_dim h ON {partial} WHERE h.node_id = {{manager_id}}", "headcount under a manager", params={"manager_id": 7})
+    finding = next(f for f in short.findings if f.code == "required_predicate")
+    assert finding.severity == Severity.HIGH and "leaves out" in finding.message
+    unpinned = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s JOIN hierarchy_dim h ON {chain}", "headcount under a manager")
+    assert unpinned.has("required_predicate")  # h.node_id is not pinned to anything: no access filter
+
+
+def test_distinct_entity_keys_from_a_snapshot_are_not_a_grain_problem():
+    ddl = "CREATE TABLE snap (assoc_id INTEGER, snap_dt DATE, period_end_dt DATE, status_cd TEXT, lvl_2_id INTEGER, PRIMARY KEY (assoc_id, period_end_dt, snap_dt));"
+    sc = Scorer("duckdb", catalog=ddl, snapshot_columns={"snap": "snap_dt"})
+    keys = sc.explain("WITH org AS (SELECT DISTINCT assoc_id FROM snap WHERE lvl_2_id = 7) SELECT COUNT(*) FROM org", "headcount")
+    assert not keys.has("snapshot_grain"), keys.summary()
+    with_status = sc.explain("WITH org AS (SELECT DISTINCT assoc_id, status_cd FROM snap WHERE lvl_2_id = 7) SELECT COUNT(*) FROM org", "headcount")
+    assert with_status.has("snapshot_grain")  # status varies across snapshots: one person, several rows
+    assert sc.explain("SELECT COUNT(*) FROM snap WHERE lvl_2_id = 7", "headcount").has("snapshot_grain")

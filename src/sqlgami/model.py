@@ -299,6 +299,7 @@ class SelectModel:
         self._mult: dict[tuple[str, bool], Multiplication] = {}
         self._key_info: dict[str, KeyInfo] = {}
         self._own: tuple[exp.Expression, ...] | None = None
+        self._or_pending: list[exp.Expression] = []
         self._build_sources()
         self._build_predicates()
 
@@ -401,6 +402,11 @@ class SelectModel:
             if len(conjunct.aliases) >= 2:
                 self.links.append(conjunct.aliases)
             self._record(conjunct)
+        # OR chains are read once every binding is known: a branch that compares with a column
+        # pinned to a constant elsewhere (ON lvl_2_id = h.node_id ... WHERE h.node_id = 7) is a
+        # branch against that constant.
+        for expr in self._or_pending:
+            self._record_or(expr)
         # A derived table or table function that mentions a sibling is tied to it (LATERAL, UNNEST).
         for alias, source in self.sources.items():
             if source.kind == "table":
@@ -452,26 +458,9 @@ class SelectModel:
                 elif self.filters(ref, conjunct):
                     self.restricted.add(ref)
             elif ref is None:
-                # 7 IN (lvl_2_id, lvl_3_id, ...): one value against several columns, an OR chain
-                # by another name.
-                choices = self._column_choices(expr)
-                if choices is not None and len(choices[0]) >= 2:
-                    self.or_groups.append((choices[0], True, expr))
+                self._or_pending.append(expr)  # 7 IN (lvl_2_id, lvl_3_id, ...): an OR chain by another name
         elif isinstance(expr, exp.Or):
-            refs: list[ColRef] = []
-            values: list[exp.Expression] = []
-            for branch in flatten_or(expr):
-                part = self._column_choices(branch)
-                if part is None:
-                    refs = []
-                    break
-                branch_refs, value = part
-                refs.extend(branch_refs)
-                values.extend([value] * len(branch_refs))
-            if len(refs) >= 2:
-                keys = [_value_key(v) for v in values]
-                same = all(k == keys[0] for k in keys)
-                self.or_groups.append((refs, same, expr))
+            self._or_pending.append(expr)
         elif isinstance(expr, exp.Is):
             ref = self._local_ref(strip(expr.this))
             if ref and isinstance(expr.expression, exp.Boolean):
@@ -485,21 +474,63 @@ class SelectModel:
             if ref:
                 self._bind(ref, exp.false(), conjunct)
 
+    def _record_or(self, expr: exp.Expression) -> None:
+        if isinstance(expr, exp.In):
+            choices = self._column_choices(expr)
+            if choices is not None and len(choices[0]) >= 2:
+                self.or_groups.append((choices[0], True, expr))
+            return
+        refs: list[ColRef] = []
+        values: list[exp.Expression] = []
+        for branch in flatten_or(expr):
+            part = self._column_choices(branch)
+            if part is None:
+                refs = []
+                break
+            branch_refs, value = part
+            refs.extend(branch_refs)
+            values.extend([value] * len(branch_refs))
+        if len(refs) >= 2:
+            keys = [_value_key(v) for v in values]
+            same = all(k == keys[0] for k in keys)
+            self.or_groups.append((refs, same, expr))
+
+    def _constant_or_pinned(self, node: exp.Expression) -> exp.Expression | None:
+        """``node`` when it is a constant for the whole SELECT; the constant a local column is
+        pinned to (``h.node_id`` with ``h.node_id = 7`` elsewhere); else None."""
+        if self._is_constant(node):
+            return node
+        ref = self._local_ref(node)
+        if ref is not None:
+            pinned = self.bound.get(ref)
+            if pinned is None:
+                for member in self.class_members(ref):
+                    pinned = self.bound.get(member)
+                    if pinned is not None:
+                        break
+            if pinned is not None:
+                return pinned
+        return None
+
     def _column_choices(self, branch: exp.Expression) -> tuple[list[ColRef], exp.Expression] | None:
         """``col = v`` gives ``([col], v)``; ``v IN (c1, c2, ...)`` gives ``([c1, c2, ...], v)``; else None.
 
-        ``v`` must be a constant for the whole SELECT (a literal, a parameter, an outer column)."""
+        ``v`` must be a constant for the whole SELECT (a literal, a parameter, an outer column),
+        or a column pinned to one."""
         branch = strip(branch)
         if isinstance(branch, exp.EQ):
             left, right = strip(branch.this), strip(branch.expression)
-            ref = self._local_ref(left) or self._local_ref(right)
-            value = right if self._local_ref(left) else left
-            if ref is None or not self._is_constant(value):
-                return None
-            return [ref], value
+            left_ref, right_ref = self._local_ref(left), self._local_ref(right)
+            for ref, other in ((left_ref, right), (right_ref, left)):
+                if ref is None:
+                    continue
+                value = self._constant_or_pinned(other)
+                if value is not None:
+                    return [ref], value
+            return None
         if isinstance(branch, exp.In) and not branch.args.get("query") and branch.expressions:
-            value = strip(branch.this)
-            if not self._is_constant(value):
+            value = self._constant_or_pinned(strip(branch.this))
+            if value is None:
                 return None
             refs = [self._local_ref(strip(e)) for e in branch.expressions]
             if not refs or any(r is None for r in refs):

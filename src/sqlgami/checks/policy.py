@@ -818,6 +818,8 @@ def snapshot_grain(ctx: CheckContext) -> Iterable[Finding]:
 
     for miss in _Tracer(ctx, columns_for, GRAIN).run():
         source = miss.model.sources[miss.alias]
+        if _distinct_entity_keys(ctx, miss):
+            continue  # SELECT DISTINCT assoc_id FROM snapshot: one row per thing whatever the snapshots
         sure = declared.get(miss.table.qualified_name, False)
         yield ctx.finding(
             "snapshot_grain",
@@ -835,6 +837,25 @@ def snapshot_grain(ctx: CheckContext) -> Iterable[Finding]:
             alias=miss.alias,
             column=miss.column.name,
         )
+
+
+def _distinct_entity_keys(ctx: CheckContext, miss: Miss) -> bool:
+    """The SELECT is DISTINCT over nothing but key columns of the snapshot table other than the
+    snapshot date itself: the per-snapshot repeats collapse, nothing is counted per snapshot."""
+    select = miss.model.select
+    if select.args.get("distinct") is None or miss.model.own_aggregates():
+        return False
+    snapshot = ctx.catalog.column_key(miss.column.name)
+    keys = [set(k) - {snapshot} for k in ctx.catalog.unique_key_sets(miss.table)]
+    if not keys:
+        return False
+    projected: set[str] = set()
+    for projection in select.expressions:
+        node = strip(unalias(projection))
+        if not isinstance(node, exp.Column) or node.table != miss.alias:
+            return False
+        projected.add(ctx.catalog.column_key(node.name))
+    return any(projected and projected <= key for key in keys)
 
 
 # ------------------------------------------------------- partition filters
