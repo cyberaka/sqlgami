@@ -438,8 +438,10 @@ once, at construction). For a question with a reference — chosen by
 `score(..., reference="key")`, else by the exact question text, else by the
 question's *pattern* — the set of catalogue terms it matches, closed over what
 the catalogue declares (a KPI's `requires`, the shorter phrases a matched
-phrase contains) — when that pattern belongs to exactly one reference; two
-references with one pattern are reported as ambiguous and neither is used —
+phrase contains), plus the identifiers it names outside those phrases
+(`period_seq`, `lvl_3_id`: exact tokens, so a question naming other columns
+is another question) — when that pattern belongs to exactly one reference;
+two references with one pattern are reported as ambiguous and neither is used —
 the candidate runs on the fixtures while the deadline allows, under the
 question's own slot and parameter values, and its result fingerprint is
 compared with the stored one: a match on the fixtures run is
