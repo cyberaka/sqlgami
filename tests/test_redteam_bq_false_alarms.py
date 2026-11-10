@@ -67,9 +67,6 @@ def test_required_predicate_recognizes_literal_scope(scorer):
     assert "required_predicate" not in _high(scorer.score(sql, None, mode="static"))
 
 
-@pytest.mark.xfail(strict=True, reason="HIGH false alarm: an equivalent IN-subquery hierarchy scope is not "
-                                       "recognized by the or_chain required-predicate matcher, so a correct "
-                                       "query is flagged HIGH and scored ~0.09.")
 def test_required_predicate_accepts_equivalent_in_subquery_scope(scorer):
     sql = f"SELECT COUNT(DISTINCT e.assoc_id) AS n FROM {_FACT} WHERE e.status_cd = 'A' AND {_scope_in_subquery()}"
     report = scorer.score(sql, None, mode="static")

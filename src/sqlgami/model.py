@@ -530,12 +530,22 @@ class SelectModel:
             return None
         if isinstance(branch, exp.In) and not branch.args.get("query") and branch.expressions:
             value = self._constant_or_pinned(strip(branch.this))
-            if value is None:
-                return None
-            refs = [self._local_ref(strip(e)) for e in branch.expressions]
-            if not refs or any(r is None for r in refs):
-                return None
-            return [r for r in refs if r is not None], value
+            refs = [self._local_ref(strip(e)) for e in branch.expressions] if value is not None else []
+            if value is not None and refs and all(r is not None for r in refs):
+                return [r for r in refs if r is not None], value
+        if isinstance(branch, exp.In) and branch.args.get("query"):
+            # col IN (SELECT node_id FROM hierarchy_dim WHERE node_id = 12003 AND ...): a lookup
+            # that can only yield 12003 is a branch on col = 12003, as "col = (SELECT ...)" is.
+            ref = self._local_ref(strip(branch.this))
+            query = branch.args["query"]
+            subquery = query if isinstance(query, exp.Subquery) else exp.Subquery(this=query)
+            if ref is not None and _value_key(subquery) is not strip(subquery):
+                return [ref], subquery
+        if isinstance(branch, exp.In) and len(branch.expressions) == 1 and not branch.args.get("query"):
+            ref = self._local_ref(strip(branch.this))  # col IN (12003): one value
+            value = self._constant_or_pinned(strip(branch.expressions[0])) if ref is not None else None
+            if ref is not None and value is not None:
+                return [ref], value
         return None
 
     def _function_of_others(self, node: exp.Expression, alias: str) -> bool:
@@ -642,7 +652,12 @@ class SelectModel:
             if table is None or not table.keys_known:
                 info = KeyInfo([], False)
             else:
-                keys = self.catalog.unique_key_sets(table)
+                # the constants this SELECT holds the source's columns at (WHERE is_current_flag = TRUE)
+                pinned = {}
+                for (ref_alias, column), value in self.bound.items():
+                    if ref_alias == alias and isinstance(value, (exp.Literal, exp.Boolean)):
+                        pinned[self.catalog.column_key(column)] = value.name if isinstance(value, exp.Literal) else bool(value.this)
+                keys = self.catalog.unique_key_sets(table, pinned)
                 info = KeyInfo(keys, bool(keys))
         elif source.kind == "derived" and source.scope is not None:
             base = self.cache.output_keys(source.scope)

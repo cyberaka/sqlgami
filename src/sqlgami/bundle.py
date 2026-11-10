@@ -171,6 +171,8 @@ def compile_bundle(
         catalog.snapshot_columns.update({k.lower(): v for k, v in config["snapshot_columns"].items()})
     for rule in config.get("required_predicates") or []:
         catalog.required_predicates.append(RequiredPredicate.coerce(rule))
+    unique_keys = unique_key_facts(config)
+    apply_unique_keys(catalog, unique_keys)
 
     terms_source = config.get("terms")
     catalogue: Catalogue | None = None
@@ -296,6 +298,7 @@ def compile_bundle(
         # a statement reading one gets no fixture verdict.
         "untranslatable_views": dict(__import__("sqlgami.fixtures", fromlist=["UNTRANSLATABLE_VIEWS"]).UNTRANSLATABLE_VIEWS),
         "column_types": column_types_of(catalog),
+        "unique_keys": unique_keys,
         # References whose question states a number that no slot or parameter binds ("the two
         # counts"): a question compares under them only when it states the same number, so the
         # host may want to reword the reference, or write that number as a {slot}.
@@ -322,6 +325,45 @@ def _ddl_text(catalog: Catalog) -> str:
     from .consistency import describe_schema
 
     return describe_schema(catalog, limit=10_000)
+
+
+def unique_key_facts(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Uniqueness facts the host states, as ``{table, columns, where}``: the ``unique_keys:``
+    block of the compile config, and every ``one_true`` fixture rule (one TRUE row per ``per``
+    group is one row per group where the flag is TRUE — a fact about the real table that the
+    fixtures were built to honour)."""
+    facts: list[dict[str, Any]] = []
+    for item in config.get("unique_keys") or []:
+        if not isinstance(item, dict) or not item.get("table") or not item.get("columns"):
+            raise ConfigurationError(f"unique_keys entry {item!r}: needs table: and columns: [..] (and optionally where: {{column: value}})")
+        where = item.get("where")
+        if where is not None and (not isinstance(where, dict) or len(where) != 1):
+            raise ConfigurationError(f"unique_keys entry {item!r}: where: must be one {{column: value}}")
+        facts.append({"table": str(item["table"]), "columns": [str(c) for c in item["columns"]], "where": dict(where) if where else None})
+    for rule in (config.get("fixtures") or {}).get("rules") or []:
+        if isinstance(rule, dict) and rule.get("kind") == "one_true" and rule.get("column") and rule.get("per"):
+            table, _, column = str(rule["column"]).rpartition(".")
+            facts.append({"table": table, "columns": [str(c) for c in rule["per"]], "where": {column: True}})
+    return facts
+
+
+def apply_unique_keys(catalog: Catalog, facts: Sequence[Mapping[str, Any]]) -> None:
+    """Declare ``facts`` (see :func:`unique_key_facts`) on ``catalog``; a fact about a table the
+    catalogue does not have is skipped (a rule may name a table of another engine's spelling)."""
+    from .catalog import CatalogError
+
+    for fact in facts:
+        table = str(fact["table"])
+        schema, _, name = table.rpartition(".")
+        where = fact.get("where") or None
+        condition = next(iter(where.items())) if where else None
+        try:
+            catalog.declare_unique(name, list(fact["columns"]), schema or None, where=condition)
+        except CatalogError:
+            try:
+                catalog.declare_unique(table, list(fact["columns"]), None, where=condition)
+            except CatalogError:
+                continue
 
 
 def _references(config: dict[str, Any], catalogue: Catalogue | None) -> list[Reference]:
@@ -613,6 +655,11 @@ class Bundle:
     @property
     def untranslatable_views(self) -> dict[str, str]:
         return dict(self.manifest.get("untranslatable_views") or {})
+
+    @property
+    def unique_keys(self) -> list[dict[str, Any]]:
+        """Uniqueness facts the bundle was compiled with (see :func:`unique_key_facts`)."""
+        return list(self.manifest.get("unique_keys") or [])
 
     @property
     def column_types(self) -> dict[str, str]:

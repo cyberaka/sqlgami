@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .catalog import Catalog, RequiredPredicate
 from .engines import dialect_for, get_adapter
@@ -117,6 +117,7 @@ class Scorer:
         prober: Any = None,
         terms: Any = None,
         bundle: Any = None,
+        unique_keys: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -173,10 +174,19 @@ class Scorer:
                 raise ConfigurationError("the bundle was compiled against a different schema; recompile it (sqlgami compile)")
             if terms is None and self.bundle.terms_path() is not None:
                 terms = self.bundle.terms_path()
+            if self.catalog is not None and self.bundle.unique_keys:
+                from .bundle import apply_unique_keys
+
+                apply_unique_keys(self.catalog, self.bundle.unique_keys)  # one current period per frequency, as the fixtures were built
             if self.catalog is not None and self.bundle.tables:
                 # the host's names for the catalogue's tables (```proj-x.hr.snapshot```), as declared at compile
                 self.catalog.table_aliases.update({str(k).strip("`").lower(): str(v) for k, v in self.bundle.tables.items()})
             self.bundle.warm()  # the fixtures are loaded once, here, not inside the first deadline
+        if unique_keys and self.catalog is not None:
+            # facts the host states directly: {table, columns, where: {column: value}}
+            from .bundle import apply_unique_keys
+
+            apply_unique_keys(self.catalog, list(unique_keys))
         self.terms = load_terms(terms, self.dialect) if terms is not None else None
         if self.terms is None and isinstance(glossary, str) and "terms:" in glossary:
             self.terms = catalogue_from_yaml_glossary(glossary)

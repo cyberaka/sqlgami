@@ -198,7 +198,10 @@ AS (
 CREATE OR REPLACE TABLE FUNCTION `acme-people-prod.hr.leavers`(manager_id INT64, n_periods INT64)
 AS (
   SELECT eps.assoc_id, eps.period_end_dt, eps.invol_exit_ind,
-         IF(eps.invol_exit_ind = 1, 'involuntary', 'voluntary') AS leave_kind
+         CASE WHEN eps.invol_exit_ind = 1 THEN 'involuntary'
+              WHEN eps.invol_exit_ind = 0 THEN 'voluntary'
+              ELSE 'unknown'
+         END AS leave_kind
     FROM `acme-people-prod.hr.emp_period_snapshot` eps
     JOIN `acme-people-prod.hr.pay_period_dim` pp
       ON pp.ppe_dt = eps.period_end_dt AND pp.freq_cd = 'B'
@@ -258,6 +261,12 @@ AS (
     FROM `acme-people-prod.hr.period_window`(n) pw
 );
 
+-- NOTE: current_pay_period_v resolves the current period via period_window(1),
+-- i.e. the biweekly row with period_seq = 0. The alternative surface,
+-- pay_period_dim.is_current_flag = TRUE, is kept consistent with period_seq=0
+-- by the fixture rules (see glossary: current_pay_period), so the two surfaces
+-- always agree in-scope. Callers should treat them as interchangeable; this
+-- view is the one to use when invoking via a TVF chain.
 CREATE OR REPLACE VIEW `acme-people-prod.hr.current_pay_period_v`
 AS
   SELECT period_seq, period_start_dt, period_end_dt

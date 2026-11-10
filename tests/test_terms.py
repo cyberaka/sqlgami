@@ -518,3 +518,34 @@ def test_an_output_list_after_a_colon_is_read_as_the_list():
     two = _q022_sql().replace("p.period_seq, p.period_end_dt, COUNT", "p.period_seq, COUNT")
     report = scorer().score(two, question, params={"manager_id": 12003})
     assert "output_columns" in {f.code for f in report.findings}
+
+
+# ------------------------------------------------------------ declared uniqueness facts
+
+
+def test_a_one_true_fact_makes_the_current_period_subquery_single_row(tmp_path):
+    """`= (SELECT ppe_dt FROM pay_period_dim WHERE is_current_flag = TRUE AND freq_cd = 'B')` is
+    one row by the data rule "one current period per frequency"; declared (or carried by a
+    one_true fixture rule into the bundle), scalar_subquery_rows stays quiet — and it still
+    fires where the condition is not pinned."""
+    from sqlgami.bundle import apply_unique_keys, unique_key_facts
+    from sqlgami.catalog import Catalog
+
+    current = "(SELECT ppe_dt FROM hr_pay_period_dim WHERE is_current_flag = TRUE AND freq_cd = 'B')"
+    sql = f"SELECT COUNT(DISTINCT e.assoc_id) FROM hr_emp_period_snapshot e WHERE e.period_end_dt = {current} AND e.snap_dt = e.period_end_dt"
+    codes = {f.code for f in Scorer("duckdb", catalog=HR_DDL).score(sql).findings}
+    assert "scalar_subquery_rows" in codes
+    facts = unique_key_facts({"fixtures": {"rules": [{"kind": "one_true", "column": "hr_pay_period_dim.is_current_flag", "per": ["freq_cd"], "at": "middle"}]}})
+    assert facts == [{"table": "hr_pay_period_dim", "columns": ["freq_cd"], "where": {"is_current_flag": True}}]
+    cat = Catalog.from_ddl(HR_DDL, "duckdb")
+    apply_unique_keys(cat, facts)
+    assert "scalar_subquery_rows" not in {f.code for f in Scorer("duckdb", catalog=cat).score(sql).findings}
+    # the same fact stated directly to the Scorer
+    stated = Scorer("duckdb", catalog=HR_DDL, unique_keys=[{"table": "hr_pay_period_dim", "columns": ["freq_cd"], "where": {"is_current_flag": True}}])
+    assert "scalar_subquery_rows" not in {f.code for f in stated.score(sql).findings}
+    # without the flag pinned the subquery is not single-row
+    loose = sql.replace("is_current_flag = TRUE AND ", "")
+    assert "scalar_subquery_rows" in {f.code for f in stated.score(loose).findings}
+    # a serialised catalogue keeps the fact
+    again = Catalog.from_dict(cat.to_dict(), "duckdb")
+    assert "scalar_subquery_rows" not in {f.code for f in Scorer("duckdb", catalog=again).score(sql).findings}

@@ -10,7 +10,7 @@ from __future__ import annotations
 import difflib
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Mapping, Protocol
 
 import sqlglot
 from sqlglot import exp
@@ -76,6 +76,9 @@ class Table:
     columns: list[Column] = field(default_factory=list)
     primary_key: tuple[str, ...] = ()
     unique_keys: list[tuple[str, ...]] = field(default_factory=list)
+    # (columns, condition column, value): the columns identify a row among those where the
+    # condition column holds the value — "one row per freq_cd where is_current_flag is TRUE".
+    conditional_keys: list[tuple[tuple[str, ...], str, Any]] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     kind: str = TABLE
     definition: str | None = None  # the query text, for views
@@ -119,6 +122,7 @@ class Table:
             "columns": [c.to_dict() for c in self.columns],
             "primary_key": list(self.primary_key),
             "unique_keys": [list(k) for k in self.unique_keys],
+            "conditional_keys": [[list(c), cond, v] for c, cond, v in self.conditional_keys],
             "foreign_keys": [fk.to_dict() for fk in self.foreign_keys],
             "definition": self.definition,
             "view_columns": list(self.view_columns),
@@ -516,14 +520,27 @@ class Catalog:
     def column_keys(self, table: Table) -> set[str]:
         return {self.column_key(c.name) for c in table.columns}
 
-    def unique_key_sets(self, table: Table) -> list[frozenset[str]]:
-        return [frozenset(self.column_key(c) for c in key) for key in table.all_unique_keys()]
+    def unique_key_sets(self, table: Table, pinned: Mapping[str, Any] | None = None) -> list[frozenset[str]]:
+        """The column sets that identify a row of ``table``; with ``pinned`` (column key → the
+        constant a query holds it at), a conditional key whose condition the query pins counts too:
+        ``WHERE is_current_flag = TRUE`` makes ``freq_cd`` a key of pay_period_dim."""
+        keys = [frozenset(self.column_key(c) for c in key) for key in table.all_unique_keys()]
+        if pinned:
+            for columns, condition, value in table.conditional_keys:
+                held = pinned.get(self.column_key(condition), _UNSET)
+                if held is not _UNSET and _same_value(held, value):
+                    key = frozenset(self.column_key(c) for c in columns)
+                    if key not in keys:
+                        keys.append(key)
+        return keys
 
-    def declare_unique(self, table: str, columns: Iterable[str], schema: str | None = None) -> None:
+    def declare_unique(self, table: str, columns: Iterable[str], schema: str | None = None, where: tuple[str, Any] | None = None) -> None:
         """Tell sqlgami that these columns identify a row, where the database does not enforce it.
 
         Warehouses often have no enforced keys. Declaring them lets checks about
-        repeated rows and single-row subqueries reason properly.
+        repeated rows and single-row subqueries reason properly. With ``where=(column, value)``
+        the key holds only among rows where that column has the value (one current period per
+        frequency: ``declare_unique("pay_period_dim", ["freq_cd"], where=("is_current_flag", True))``).
         """
         found = self.resolve(table, schema, quoted=True) or self.resolve(table, schema)
         if found is None:
@@ -535,6 +552,14 @@ class Catalog:
                 raise CatalogError(f"table {found.qualified_name} has no column {name!r}")
             names.append(column.name)
         key = tuple(names)
+        if where is not None:
+            condition = self.column(found, where[0])
+            if condition is None:
+                raise CatalogError(f"table {found.qualified_name} has no column {where[0]!r}")
+            entry = (key, condition.name, where[1])
+            if entry not in found.conditional_keys:
+                found.conditional_keys.append(entry)
+            return
         if key and key != tuple(found.primary_key) and key not in found.unique_keys:
             found.unique_keys.append(key)
         found.keys_known = True
@@ -615,6 +640,7 @@ class Catalog:
                     columns=columns,
                     primary_key=tuple(entry.get("primary_key") or ()),
                     unique_keys=[tuple(k) for k in entry.get("unique_keys") or []],
+                    conditional_keys=[(tuple(c), cond, v) for c, cond, v in entry.get("conditional_keys") or []],
                     foreign_keys=[
                         ForeignKey(
                             columns=tuple(fk["columns"]),
@@ -699,6 +725,31 @@ class Catalog:
 
 def _quoted(identifier: Any) -> bool:
     return bool(isinstance(identifier, exp.Identifier) and identifier.args.get("quoted"))
+
+
+_UNSET = object()
+
+
+def _same_value(held: Any, declared: Any) -> bool:
+    """A pinned constant against a declared one: TRUE/true/1 agree, '2024-01-01' and a date agree."""
+    def plain(v: Any) -> Any:
+        if isinstance(v, str):
+            low = v.strip().strip("'\"").lower()
+            if low in ("true", "false"):
+                return low == "true"
+            try:
+                return float(low)
+            except ValueError:
+                return low
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return float(v)
+        return v
+    a, b = plain(held), plain(declared)
+    if isinstance(a, bool) or isinstance(b, bool):
+        return (a in (True, 1.0)) == (b in (True, 1.0)) if a in (True, False, 1.0, 0.0) and b in (True, False, 1.0, 0.0) else a == b
+    return a == b
 
 
 def schema_name_of(node: exp.Table, dialect: str) -> str | None:
