@@ -404,21 +404,23 @@ class SelectModel:
                     self._bind(ref, values[0], conjunct)
                 elif self.filters(ref, conjunct):
                     self.restricted.add(ref)
+            elif ref is None:
+                # 7 IN (lvl_2_id, lvl_3_id, ...): one value against several columns, an OR chain
+                # by another name.
+                choices = self._column_choices(expr)
+                if choices is not None and len(choices[0]) >= 2:
+                    self.or_groups.append((choices[0], True, expr))
         elif isinstance(expr, exp.Or):
             refs: list[ColRef] = []
             values: list[exp.Expression] = []
             for branch in flatten_or(expr):
-                if not isinstance(branch, exp.EQ):
+                part = self._column_choices(branch)
+                if part is None:
                     refs = []
                     break
-                left, right = strip(branch.this), strip(branch.expression)
-                ref = self._local_ref(left) or self._local_ref(right)
-                value = right if self._local_ref(left) else left
-                if ref is None or not self._is_constant(value):
-                    refs = []
-                    break
-                refs.append(ref)
-                values.append(value)
+                branch_refs, value = part
+                refs.extend(branch_refs)
+                values.extend([value] * len(branch_refs))
             if len(refs) >= 2:
                 same = all(v == values[0] for v in values)
                 self.or_groups.append((refs, same, expr))
@@ -434,6 +436,28 @@ class SelectModel:
             ref = self._local_ref(strip(expr.this))
             if ref:
                 self._bind(ref, exp.false(), conjunct)
+
+    def _column_choices(self, branch: exp.Expression) -> tuple[list[ColRef], exp.Expression] | None:
+        """``col = v`` gives ``([col], v)``; ``v IN (c1, c2, ...)`` gives ``([c1, c2, ...], v)``; else None.
+
+        ``v`` must be a constant for the whole SELECT (a literal, a parameter, an outer column)."""
+        branch = strip(branch)
+        if isinstance(branch, exp.EQ):
+            left, right = strip(branch.this), strip(branch.expression)
+            ref = self._local_ref(left) or self._local_ref(right)
+            value = right if self._local_ref(left) else left
+            if ref is None or not self._is_constant(value):
+                return None
+            return [ref], value
+        if isinstance(branch, exp.In) and not branch.args.get("query") and branch.expressions:
+            value = strip(branch.this)
+            if not self._is_constant(value):
+                return None
+            refs = [self._local_ref(strip(e)) for e in branch.expressions]
+            if not refs or any(r is None for r in refs):
+                return None
+            return [r for r in refs if r is not None], value
+        return None
 
     def _function_of_others(self, node: exp.Expression, alias: str) -> bool:
         """``node`` is a plain expression over columns of sources other than ``alias``."""

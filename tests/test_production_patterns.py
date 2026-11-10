@@ -520,3 +520,61 @@ def test_a_template_that_renders_into_nonsense_is_a_finding_not_a_crash(scorer):
     # Either the gate refuses the rendered text, or the engine's planner rejects it; both are gates.
     assert (report.has("render_error") or report.has("dry_run_error")) and report.verdict.value == "invalid"
     assert report.stage("dry_run").status.value == "failed" and report.stage("sample").status.value == "not_run"
+
+
+
+HIER_DDL = """
+CREATE TABLE snap (
+    assoc_id INTEGER, period_end_dt DATE, snap_dt DATE, status_cd TEXT,
+    lvl_2_id INTEGER, lvl_3_id INTEGER, lvl_4_id INTEGER, lvl_5_id INTEGER, lvl_6_id INTEGER, lvl_7_id INTEGER,
+    lvl_2_id_fn INTEGER, lvl_3_id_fn INTEGER, lvl_4_id_fn INTEGER, lvl_5_id_fn INTEGER, lvl_6_id_fn INTEGER, lvl_7_id_fn INTEGER,
+    PRIMARY KEY (assoc_id, period_end_dt, snap_dt)
+);
+"""
+_REPORTING = ", ".join(f"s.lvl_{n}_id" for n in range(2, 8))
+_FUNCTIONAL = ", ".join(f"s.lvl_{n}_id_fn" for n in range(2, 8))
+_RULE = {
+    "name": "hierarchy_access",
+    "tables": ["snap"],
+    "groups": [[f"lvl_{n}_id" for n in range(2, 8)], [f"lvl_{n}_id_fn" for n in range(2, 8)]],
+    "match": "or_chain",
+}
+
+
+def _hier(sql: str):
+    return Scorer("duckdb", catalog=HIER_DDL, required_predicates=[_RULE]).explain(sql, "headcount under a manager")
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        f"{{manager_id}} IN ({_REPORTING})",  # value IN column list, one set
+        f"{{manager_id}} IN ({_FUNCTIONAL})",  # the other set
+        f"{{manager_id}} IN ({_REPORTING}) OR {{manager_id}} IN ({_FUNCTIONAL})",  # OR'ed IN lists across the sets
+        f"{{manager_id}} IN ({_REPORTING}, {_FUNCTIONAL})",  # one IN list mixing both sets
+        " OR ".join(f"s.lvl_{n}_id = {{manager_id}}" for n in range(2, 8)),  # the plain OR chain
+        f"12003 IN ({_REPORTING})",  # a literal rather than a parameter
+    ],
+)
+def test_value_in_column_list_satisfies_an_or_chain_rule(where):
+    report = _hier(f"SELECT COUNT(*) FROM snap s WHERE s.snap_dt = s.period_end_dt AND ({where})")
+    assert not report.has("required_predicate"), report.summary()
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        ", ".join(f"s.lvl_{n}_id" for n in range(2, 7)),  # lvl_7 left out
+        ", ".join(f"s.lvl_{n}_id" for n in (2, 3, 4)),  # half the levels
+        ", ".join(f"s.lvl_{n}_id_fn" for n in range(3, 8)),  # _fn set without lvl_2
+    ],
+)
+def test_incomplete_column_list_still_fires(where):
+    report = _hier(f"SELECT COUNT(*) FROM snap s WHERE s.snap_dt = s.period_end_dt AND {{manager_id}} IN ({where})")
+    finding = next(f for f in report.findings if f.code == "required_predicate")
+    assert finding.severity == Severity.HIGH and "leaves out" in finding.message
+
+
+def test_in_list_of_values_is_not_an_access_chain():
+    report = _hier("SELECT COUNT(*) FROM snap s WHERE s.lvl_3_id IN (1, 2, 3)")
+    assert report.has("required_predicate")
