@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trusting LLM-written SQL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#EDF0F5; --ink:#16213A; --soft:#5B6580; --rule:#CBD2E0; --fold:#2B4FD8;
+  --right:#16866A; --unsure:#B7800F; --wrong:#B83A33;
+  --display:"Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --body:"Instrument Sans", "Helvetica Neue", system-ui, sans-serif;
+  --mono:"JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#D9DEE8;color:var(--ink);font-family:var(--body);overflow:hidden}
+.viewport{position:fixed;inset:0;display:grid;place-items:center}
+.stage{width:1600px;height:900px;position:relative;transform-origin:center center;background:var(--paper);box-shadow:0 30px 80px rgba(22,33,58,.18)}
+.slide{position:absolute;inset:0;padding:96px 120px;display:none}
+.slide.on{display:block}
+h1,h2{font-family:var(--display);font-weight:800;letter-spacing:-.025em;margin:0;color:var(--ink)}
+h1{font-size:76px;line-height:1.02;max-width:1150px}
+h2{font-size:60px;line-height:1.05;max-width:1200px}
+.lede{font-size:28px;line-height:1.45;color:var(--soft);max-width:900px;margin:28px 0 0}
+.small{font-size:20px;line-height:1.5;color:var(--soft)}
+.foot{position:absolute;left:120px;bottom:56px;font-size:16px;color:var(--soft);max-width:1300px}
+.page{position:absolute;right:120px;bottom:56px;font-size:16px;color:var(--soft);font-variant-numeric:tabular-nums}
+
+/* the confidence scale: the one memorable element */
+.scale{position:relative;height:200px;margin-top:110px}
+.scale .bar{position:absolute;left:0;right:0;top:92px;height:30px;display:flex}
+.scale .z{height:100%;position:relative}
+.scale .z.w{flex:40;background:var(--wrong)}
+.scale .z.u{flex:30;background:var(--unsure)}
+.scale .z.r{flex:30;background:var(--right)}
+.scale .z::after{content:"";position:absolute;right:0;top:0;bottom:0;width:10px;background:linear-gradient(90deg,transparent,rgba(0,0,0,.18))}
+.scale .zl{position:absolute;top:140px;font-size:20px;font-weight:600}
+.scale .ticks{position:absolute;top:100px;left:0;right:0;font-size:16px;color:var(--soft);font-variant-numeric:tabular-nums}
+.pin{position:absolute;top:0;transform:translateX(-50%);text-align:center;white-space:nowrap}
+.pin .dot{width:0;height:0;border-left:11px solid transparent;border-right:11px solid transparent;border-top:14px solid var(--ink);margin:8px auto 0}
+.pin .v{font-family:var(--display);font-weight:800;font-size:40px;line-height:1}
+.pin .t{font-size:17px;color:var(--soft);margin-bottom:6px}
+
+/* problem slide */
+.split{display:grid;grid-template-columns:1.15fr 1fr;gap:90px;margin-top:56px;align-items:start}
+pre.sql{font-family:var(--mono);font-size:21px;line-height:1.6;margin:0;padding:28px 30px;background:#fff;border-left:4px solid var(--fold);white-space:pre}
+pre.sql .hl{background:rgba(184,58,51,.14);color:var(--wrong);font-weight:600}
+pre.sql .ok{background:rgba(22,134,106,.14);color:var(--right);font-weight:600}
+.bars{display:grid;gap:22px}
+.brow{display:grid;grid-template-columns:200px 1fr 70px;align-items:center;gap:18px;font-size:20px}
+.brow .track{height:18px;background:#DCE1EB;position:relative}
+.brow .fill{position:absolute;inset:0 auto 0 0;background:var(--ink)}
+.brow .fill.hi{background:var(--fold)}
+.brow .num{font-variant-numeric:tabular-nums;font-weight:600;text-align:right}
+
+/* pipeline */
+.pipe{display:grid;grid-template-columns:1fr 1fr 1fr 1.35fr;margin-top:90px;height:340px}
+.layer{position:relative;padding:34px 32px;border-right:1px solid var(--rule);background:#fff}
+.layer:nth-child(1){background:#F7F8FB}.layer:nth-child(2){background:#F2F4F9}.layer:nth-child(3){background:#ECEFF6}
+.layer.key{background:var(--ink);color:#fff;border:none}
+.layer h3{font-family:var(--display);font-weight:600;font-size:30px;margin:0 0 16px;letter-spacing:-.01em}
+.layer p{font-size:20px;line-height:1.5;margin:0;color:var(--soft)}
+.layer.key p{color:#C9D2EA}
+.layer .k{font-family:var(--display);font-size:20px;font-weight:600;color:var(--soft);margin-bottom:40px}
+.layer.key .k{color:#8FA6F0}
+.layer:not(:last-child)::after{content:"";position:absolute;right:-15px;top:50%;width:28px;height:28px;background:inherit;border-right:1px solid var(--rule);border-top:1px solid var(--rule);transform:translateY(-50%) rotate(45deg);z-index:2}
+
+/* report */
+.report{margin-top:54px;background:#fff;padding:40px 46px;font-size:22px;max-width:1360px}
+.verdict{display:flex;align-items:baseline;gap:22px;margin-bottom:26px}
+.verdict .lab{font-family:var(--display);font-weight:800;font-size:44px;color:var(--wrong)}
+.verdict .sc{font-size:24px;color:var(--soft)}
+.finding{display:grid;grid-template-columns:96px 1fr;gap:16px;padding:16px 0;border-top:1px solid var(--rule);line-height:1.45}
+.sev{font-weight:600;color:var(--wrong)}
+.finding code{font-family:var(--mono);font-size:19px}
+
+/* evidence */
+.ev{display:grid;grid-template-columns:repeat(3,1fr);gap:70px;margin-top:70px}
+.ev .n{font-family:var(--display);font-weight:800;font-size:118px;line-height:.9;letter-spacing:-.04em}
+.ev .n.c{color:var(--fold)}
+.ev p{font-size:21px;line-height:1.45;color:var(--soft);margin:18px 0 0;max-width:380px}
+.auroc{margin-top:72px;display:grid;gap:18px;max-width:1240px}
+.arow{display:grid;grid-template-columns:420px 1fr;align-items:center;gap:26px;font-size:20px}
+.atrack{position:relative;height:30px;background:#E2E6EF;margin-right:90px}
+.atrack .a1,.atrack .a2{position:absolute;top:0;bottom:0;left:0}
+.atrack .a1{background:#9AA5BD}
+.atrack .a2{background:var(--fold);height:12px;top:9px}
+.atrack span{position:absolute;top:50%;transform:translateY(-50%);font-size:17px;font-weight:600;font-variant-numeric:tabular-nums}
+
+/* preparation */
+.steps{display:grid;grid-template-columns:repeat(5,1fr);margin-top:120px;position:relative}
+.steps::before{content:"";position:absolute;left:30px;right:30px;top:30px;height:2px;background:var(--rule)}
+.step{position:relative;padding-right:30px}
+.step .no{width:60px;height:60px;border-radius:50%;background:var(--paper);border:2px solid var(--ink);display:grid;place-items:center;font-family:var(--display);font-weight:800;font-size:26px;position:relative;z-index:1}
+.step.auto .no{border-style:dashed;color:var(--soft);border-color:var(--soft)}
+.step h3{font-family:var(--display);font-weight:600;font-size:29px;margin:30px 0 8px;letter-spacing:-.01em}
+.step .who{font-size:17px;color:var(--fold);font-weight:600;margin-bottom:12px}
+.step p{font-size:19px;line-height:1.5;color:var(--soft);margin:0}
+
+/* limits */
+.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:70px;margin-top:70px}
+.cols h3{font-family:var(--display);font-weight:600;font-size:30px;margin:0 0 22px;padding-top:18px;border-top:6px solid var(--right)}
+.cols .c2 h3{border-color:var(--unsure)}
+.cols .c3 h3{border-color:var(--rule)}
+.cols ul{margin:0;padding:0;list-style:none}
+.cols li{font-size:21px;line-height:1.45;color:var(--ink);padding:12px 0;border-bottom:1px solid var(--rule)}
+
+/* ask */
+.timeline{margin-top:70px;display:grid;grid-template-columns:2fr 4fr;height:96px}
+.phase{padding:22px 26px;color:#fff}
+.phase.p1{background:var(--ink)}.phase.p2{background:var(--fold)}
+.phase b{font-family:var(--display);font-size:26px;display:block}
+.phase span{font-size:18px;opacity:.85}
+.weeks{display:grid;grid-template-columns:repeat(6,1fr);font-size:16px;color:var(--soft);margin-top:10px}
+.crit{display:grid;grid-template-columns:repeat(4,1fr);gap:50px;margin-top:66px}
+.crit .n{font-family:var(--display);font-weight:800;font-size:64px;letter-spacing:-.03em;line-height:1}
+.crit p{font-size:19px;line-height:1.45;color:var(--soft);margin:12px 0 0}
+
+
+.brand{display:flex;align-items:baseline;justify-content:space-between;margin:-28px 0 56px;border-bottom:1px solid var(--rule);padding-bottom:18px}
+.brand .mark{font-family:var(--display);font-weight:800;font-size:40px;letter-spacing:-.03em;color:var(--fold)}
+.brand .by{font-size:22px;font-weight:600;color:var(--ink)}
+.contact{display:grid;grid-template-columns:repeat(3,auto);justify-content:start;gap:72px;margin-top:52px}
+.contact span{display:block;font-size:16px;color:var(--soft);margin-bottom:6px}
+.contact a{font-family:var(--display);font-weight:600;font-size:28px;color:var(--fold);text-decoration:none}
+.contact a:focus-visible{outline:3px solid var(--fold);outline-offset:3px}
+/* depth slides */
+table.t{width:100%;border-collapse:collapse;margin-top:48px;font-size:20px;background:#fff}
+table.t th{text-align:left;font-weight:600;color:var(--soft);font-size:16px;padding:14px 18px;border-bottom:2px solid var(--ink)}
+table.t td{padding:14px 18px;border-bottom:1px solid var(--rule);vertical-align:top;line-height:1.4}
+table.t td.n{font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
+table.t tr.us td{background:#E6ECFB}
+.yes{color:var(--right);font-weight:600}.neg{color:var(--wrong);font-weight:600}.mid{color:var(--unsure);font-weight:600}
+.chain{display:grid;grid-template-columns:repeat(6,1fr);gap:0;margin-top:60px}
+.chain .s{padding:22px 20px;border-left:1px solid var(--rule);min-height:250px;background:#fff}
+.chain .s:first-child{border-left:none}
+.chain .s b{display:block;font-family:var(--display);font-size:24px;margin-bottom:10px}
+.chain .s p{font-size:18px;line-height:1.45;color:var(--soft);margin:0}
+.chain .s.hot{background:var(--ink);color:#fff}.chain .s.hot p{color:#C9D2EA}
+.twocol{display:grid;grid-template-columns:1fr 1fr;gap:80px;margin-top:50px}
+.twocol h3{font-family:var(--display);font-weight:600;font-size:28px;margin:0 0 14px}
+.twocol ul{margin:0;padding-left:22px}.twocol li{font-size:21px;line-height:1.45;margin:8px 0;color:var(--ink)}
+.twocol p{font-size:21px;line-height:1.5;color:var(--soft);margin:0 0 12px}
+pre.code{font-family:var(--mono);font-size:18px;line-height:1.55;background:#fff;padding:24px 26px;margin:0;border-left:4px solid var(--fold);white-space:pre;overflow:hidden}
+
+nav{position:fixed;right:22px;bottom:18px;display:flex;gap:8px;z-index:9}
+nav button{font:600 15px var(--body);color:var(--ink);background:#fff;border:1px solid var(--rule);padding:8px 14px;cursor:pointer}
+nav button:focus-visible{outline:3px solid var(--fold);outline-offset:2px}
+@media print{nav{display:none}}
+</style>
+</head>
+<body>
+<div class="viewport"><div class="stage" id="stage">
+
+<!-- 1 -->
+<section class="slide on" aria-label="Title">
+  <div class="brand"><span class="mark">sqlgami</span><span class="by">Abhinav Anand</span></div>
+  <h1>Every query an LLM writes, with a confidence score attached.</h1>
+  <p class="lede">A deterministic check that tells you, in milliseconds, whether AI-written SQL actually answers the question.</p>
+  <div class="scale" aria-label="Confidence scale from 0 to 1 with two example queries">
+    <div class="pin" style="left:3%;transform:translateX(-22px);text-align:left"><style>.pin[style*="left:3%"] .dot{margin-left:11px}</style><div class="t">off-by-one window</div><div class="v" style="color:var(--wrong)">0.03</div><div class="dot"></div></div>
+    <div class="pin" style="left:81%"><div class="t">correct query</div><div class="v" style="color:var(--right)">0.81</div><div class="dot"></div></div>
+    <div class="bar"><div class="z w"></div><div class="z u"></div><div class="z r"></div></div>
+    <div class="zl" style="left:0;color:var(--wrong)">Likely wrong</div>
+    <div class="zl" style="left:40%;color:var(--unsure)">Uncertain</div>
+    <div class="zl" style="left:70%;color:var(--right)">Likely right</div>
+  </div>
+  <div class="foot">sqlgami folds every check on a query into one confidence score.</div>
+</section>
+
+<!-- 2 -->
+<section class="slide" aria-label="The problem">
+  <h2>Wrong SQL doesn't crash. It returns a believable number.</h2>
+  <div class="split">
+<pre class="sql">-- "active headcount, last 8 pay periods"
+SELECT p.period_seq,
+       COUNT(DISTINCT e.assoc_id) AS active_n
+FROM   pay_period_dim p
+JOIN   emp_period_snapshot e
+  ON   e.period_end_dt = p.ppe_dt
+WHERE  p.period_seq <span class="hl">BETWEEN -8 AND -1</span>
+  -- correct: <span class="ok">BETWEEN -7 AND 0</span>
+  AND  e.status_cd = 'A'
+GROUP  BY 1</pre>
+    <div>
+      <p class="small" style="margin:0 0 30px">How often models got our hard test questions right</p>
+      <div class="bars">
+        <div class="brow"><span>Frontier model A</span><div class="track"><div class="fill hi" style="width:100%"></div></div><span class="num">100%</span></div>
+        <div class="brow"><span>Frontier model B</span><div class="track"><div class="fill hi" style="width:100%"></div></div><span class="num">100%</span></div>
+        <div class="brow"><span>Open model, 14B</span><div class="track"><div class="fill" style="width:29%"></div></div><span class="num">29%</span></div>
+        <div class="brow"><span>Open model, 70B</span><div class="track"><div class="fill" style="width:6%"></div></div><span class="num">0–17%</span></div>
+        <div class="brow"><span>Open model, 27B</span><div class="track"><div class="fill" style="width:6%"></div></div><span class="num">0–17%</span></div>
+      </div>
+      <p class="small" style="margin-top:34px">The same agent can produce both. Nobody reviews a 70-line script that runs fine.</p>
+    </div>
+  </div>
+  <div class="foot">Internal test suite of complex HR-analytics questions on synthetic data.</div>
+</section>
+
+
+<section class="slide" aria-label="Alternatives">
+  <h2>Why the usual answers don't work</h2>
+  <table class="t">
+    <tr><th>Approach</th><th>Catches a plausible wrong number</th><th>Same answer every time</th><th>Fits in an agent loop</th><th>Ongoing cost</th></tr>
+    <tr><td>Human review</td><td class="mid">Sometimes</td><td class="neg">No</td><td class="neg">No</td><td>Reviewer time per query</td></tr>
+    <tr><td>Ask another LLM to judge</td><td class="mid">Sometimes</td><td class="neg">No</td><td class="mid">Seconds, per call</td><td>Model calls per query</td></tr>
+    <tr><td>"Does it run?" checks</td><td class="neg">No</td><td class="yes">Yes</td><td class="yes">Yes</td><td>Negligible</td></tr>
+    <tr class="us"><td><b>Rules + definitions + answer check</b></td><td class="yes">Yes, on registered patterns</td><td class="yes">Yes</td><td class="yes">~50 ms, in-process</td><td>One-time preparation</td></tr>
+  </table>
+  <p class="small" style="margin-top:28px;max-width:1200px">In our tests the open models we could call cheaply were right 0–29% of the time on hard questions, so a judge built from them would be unreliable, and a strong judge adds latency and cost to every query.</p>
+</section>
+
+<!-- 3 -->
+<section class="slide" aria-label="How it works">
+  <h2>Four layers of evidence, no AI in the loop.</h2>
+  <div class="pipe">
+    <div class="layer"><div class="k">Layer 1</div><h3>Safety &amp; schema</h3><p>Checked against the real tables, views and table functions. Anything unsafe is refused.</p></div>
+    <div class="layer"><div class="k">Layer 2</div><h3>Rule checks</h3><p>About 40 known failure patterns: join fan-out, NULL traps, wrong grain, missing scope.</p></div>
+    <div class="layer"><div class="k">Layer 3</div><h3>Our definitions</h3><p>"Active", "last N pay periods", "my organisation": checked against what the SQL does.</p></div>
+    <div class="layer key"><div class="k">Layer 4</div><h3>Check the answer</h3><p>Run the query on small mock datasets built to expose mistakes, and compare its answer with a verified reference query. This catches errors no rule can see.</p></div>
+  </div>
+  <div class="foot">Same SQL, same score, every time. Runs inside the application in about 50 ms.</div>
+</section>
+
+
+<section class="slide" aria-label="Inside the answer check">
+  <h2>Inside the answer check</h2>
+  <div class="chain">
+    <div class="s"><b>Recognise</b><p>Match the question's phrases to your defined terms: "last 13 pay periods", "my organisation".</p></div>
+    <div class="s"><b>Bind values</b><p>Pull out the numbers and parameters: n = 13, manager = 52002. Never guessed: an unbound number means "can't check".</p></div>
+    <div class="s"><b>Find the reference</b><p>Look up the verified query registered for that pattern, written as a template.</p></div>
+    <div class="s"><b>Run both</b><p>Execute the reference and the candidate on 6–7 small mock datasets, each under the same values.</p></div>
+    <div class="s hot"><b>Compare</b><p>Fingerprint both results. Any difference on any dataset is a high-severity finding, with the rows as evidence.</p></div>
+    <div class="s"><b>Report</b><p>Verdict, score and range, findings in plain English, and which checks ran or were skipped.</p></div>
+  </div>
+  <p class="small" style="margin-top:34px;max-width:1300px">The mock datasets are deliberately awkward: ties at a rank boundary, NULL statuses, restated snapshot rows, empty periods, people reachable only through the functional chain, segments that vanish. Six small datasets exposed all 41 planted mistakes in our HR suite; each query runs in about 5 ms on them.</p>
+</section>
+
+<!-- 4 -->
+<section class="slide" aria-label="What a score looks like">
+  <h2>What the team sees</h2>
+  <div class="report">
+    <div class="verdict"><span class="lab">Likely wrong</span><span class="sc">confidence 0.03 · scored in 29 ms</span></div>
+    <div class="finding"><span class="sev">High</span><span>On a test dataset the query returns <code>[-8, 2026-02-28, 74]</code>. The verified reference never produces that row.</span></div>
+    <div class="finding"><span class="sev">High</span><span>"Last 8 pay periods" is defined as <code>period_seq -7..0</code>. The query uses <code>-8..-1</code>.</span></div>
+  </div>
+  <div class="foot">Actual output for the query on the previous slide.</div>
+</section>
+
+
+<section class="slide" aria-label="BigQuery">
+  <h2>BigQuery fidelity, proven against BigQuery itself</h2>
+  <div class="twocol">
+    <div>
+      <h3>How it works</h3>
+      <p>Live scoring never calls BigQuery. Candidate SQL is translated to an embedded engine through an allow-list in which every construct has passing cases run on real BigQuery: dates and weeks, COUNTIF, SAFE_DIVIDE, QUALIFY, UNNEST, NUMERIC, LIKE, DECLARE/SET scripts.</p>
+      <p>Anything outside the list returns "can't check", never a verdict.</p>
+    </div>
+    <div>
+      <h3>What we checked</h3>
+      <ul>
+        <li><b>770 / 770</b> expected-answer runs identical natively and translated, on 11 datasets</li>
+        <li><b>0</b> value disagreements across ~490 comparisons of 224 real LLM queries</li>
+        <li><b>40</b> defects found by an independent red team (unsafe system-table reads, week boundaries, offsets, division by zero), all fixed and turned into tests</li>
+        <li>4 inherent engine differences documented, not hidden</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 5 -->
+<section class="slide" aria-label="Evidence">
+  <h2>Tested on questions it had never seen</h2>
+  <div class="ev">
+    <div><div class="n c">0.973</div><p>AUROC on reworded questions with new values, 124 LLM answers. 1.0 is perfect separation.</p></div>
+    <div><div class="n">770/770</div><p>expected-answer runs matched real BigQuery exactly.</p></div>
+    <div><div class="n">0.8%</div><p>of correct LLM queries wrongly flagged as likely wrong.</p></div>
+  </div>
+  <div class="auroc" aria-label="AUROC with and without the answer check">
+    <div class="arow"><span>Rules + definitions only</span><div class="atrack"><div class="a1" style="width:82.2%"></div><span style="left:calc(82.2% + 12px)">0.911</span></div></div>
+    <div class="arow"><span>+ answer check</span><div class="atrack"><div class="a1" style="width:94.6%;background:var(--fold)"></div><span style="left:calc(94.6% + 12px)">0.973</span></div></div>
+    <div class="arow"><span>Same, under a strict 50 ms budget</span><div class="atrack"><div class="a1" style="width:91.0%;background:#7D92E6"></div><span style="left:calc(91.0% + 12px)">0.955</span></div></div>
+    <div class="arow"><span></span><div style="display:flex;justify-content:space-between;font-size:15px;color:var(--soft);margin-right:90px"><span>0.5 = chance</span><span>1.0 = perfect</span></div></div>
+  </div>
+  <div class="foot">Each test was scored once, before any tuning on it. BigQuery re-test done on a harder held-out set (w5v): 0.82 AUROC at first contact (0.86 after fixes found on that set), lower than the first run (0.778 → 0.912).</div>
+</section>
+
+
+<section class="slide" aria-label="Method">
+  <h2>How we kept the numbers honest</h2>
+  <div class="twocol">
+    <div>
+      <h3>Test data</h3>
+      <ul>
+        <li>Production-shaped HR snapshot schema with views and table functions; 11 seeded datasets, half deliberately nasty</li>
+        <li>Expected answers written by one agent, then re-derived blind by an independent auditor and compared on every dataset. This caught more than a dozen wrong expected answers before any scoring</li>
+        <li>Candidate SQL written blind by 6 models, frontier and open</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Scoring discipline</h3>
+      <ul>
+        <li>Each test set is hidden from the builder until scored, and scored once</li>
+        <li>The reference bundle is frozen and fingerprinted before release</li>
+        <li>Right and wrong labels come from execution, on BigQuery for BigQuery tests</li>
+        <li>Any set used for fixes becomes tuning data; only untouched sets are reported as results</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="slide" aria-label="Detailed results">
+  <h2>Results in detail</h2>
+  <table class="t">
+    <tr><th>Measure</th><th>Result</th><th>What it means</th></tr>
+    <tr><td>Separation of right vs wrong, held-out (DuckDB)</td><td class="n">0.973 AUROC</td><td>With references; 0.911 from rules and definitions alone</td></tr>
+    <tr><td>Same, strict 50 ms budget</td><td class="n">0.955 AUROC</td><td>Some answer checks are cut for time and reported as skipped</td></tr>
+    <tr><td>BigQuery held-out, first run</td><td class="n">0.912 AUROC</td><td>Before 40 BigQuery fixes</td></tr>
+    <tr><td>BigQuery held-out, re-test (w5v)</td><td class="n">0.82 AUROC</td><td>First contact, after the 40 BigQuery fixes; a harder set (33/168 correct) — lower than the first run; 0.86 after fixes found on it</td></tr>
+    <tr><td>Correct LLM queries wrongly flagged</td><td class="n">1 of 63</td><td>Real BigQuery gold, static checks</td></tr>
+    <tr><td>Median score of correct queries</td><td class="n">0.81</td><td>Static checks on BigQuery dev set, after false-alarm fixes</td></tr>
+    <tr><td>Planted mistakes caught by rules alone</td><td class="n">8 of 15</td><td>The rest are value errors that need the answer check</td></tr>
+    <tr><td>Latency, rules path</td><td class="n">p50 ~12–25 ms</td><td>Long 70-line scripts: answer check ~100–160 ms, run as a follow-up</td></tr>
+  </table>
+</section>
+
+<!-- 6 -->
+<section class="slide" aria-label="Preparation">
+  <h2>What a team prepares</h2>
+  <div class="steps">
+    <div class="step"><div class="no">1</div><h3>Export schema</h3><div class="who">Data engineer</div><p>One DDL export of tables, views and table functions from INFORMATION_SCHEMA.</p></div>
+    <div class="step"><div class="no">2</div><h3>Define terms</h3><div class="who">Business + data engineer</div><p>An Excel sheet of terms and KPIs: the words people use, and what they mean in data.</p></div>
+    <div class="step"><div class="no">3</div><h3>Write references</h3><div class="who">Analyst</div><p>One verified query per recurring question pattern. Start with the top 10–20.</p></div>
+    <div class="step"><div class="no">4</div><h3>Declare data rules</h3><div class="who">Data engineer</div><p>A few lines describing realistic data. Mock data comes from these; no production rows leave.</p></div>
+    <div class="step auto"><div class="no">5</div><h3>Compile</h3><div class="who">Automated</div><p>References verified, mock data built, one versioned bundle kept in git.</p></div>
+  </div>
+  <div class="foot">An undefined term lowers the confidence. The system never guesses what a term means.</div>
+</section>
+
+
+<section class="slide" aria-label="Integration">
+  <h2>What integration looks like</h2>
+  <div class="twocol">
+<pre class="code">from sqlgami import Scorer
+
+scorer = Scorer("bigquery",
+    catalog=open("schema.sql").read(),
+    terms="metadata/terms.xlsx",
+    bundle="bundle/")
+
+report = scorer.score(sql, question,
+    params={"manager_id": 12003})
+
+report.verdict        # likely_right
+report.confidence     # 0.81 (0.69–0.93)
+report.findings       # plain-English list
+report.timing         # ms per stage</pre>
+    <div>
+      <h3>Operating model</h3>
+      <ul>
+        <li>A Python library inside the agent or app: no service, no network call</li>
+        <li>The bundle is a versioned folder in git, rebuilt by CI when terms or references change</li>
+        <li>Shadow mode first: log scores, block nothing</li>
+        <li>Then gate: route below-threshold queries to a person</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 7 -->
+<section class="slide" aria-label="Limits">
+  <h2>What it guarantees, and what it doesn't</h2>
+  <div class="cols">
+    <div class="c1"><h3>Guaranteed</h3><ul><li>Deterministic, with no AI at scoring time</li><li>Unsafe SQL is never run</li><li>Unsupported SQL says "can't check", never a guess</li></ul></div>
+    <div class="c2"><h3>Depends on preparation</h3><ul><li>The answer check needs a reference for that question pattern</li><li>Undefined terms reduce confidence</li><li>Mock data is only as good as its rules</li></ul></div>
+    <div class="c3"><h3>Still maturing</h3><ul><li>70+ line scripts may get rules only within 50 ms</li><li>Table-function support in final testing</li><li>Score calibration on our data</li></ul></div>
+  </div>
+</section>
+
+
+<section class="slide" aria-label="Roadmap">
+  <h2>Risks and next steps</h2>
+  <div class="cols">
+    <div class="c1"><h3>Next</h3><ul><li>Table-valued function support and its held-out test</li><li>Two-step scoring with caching for long scripts</li><li>Score calibration on real-world data</li></ul></div>
+    <div class="c2"><h3>Risks</h3><ul><li>Coverage depends on how many question patterns get references</li><li>Unusual phrasing may not match a defined term</li><li>Our tests are synthetic; real-world use is the real test</li></ul></div>
+    <div class="c3"><h3>Mitigations</h3><ul><li>Start with the top 10–20 patterns; expand from usage logs</li><li>Offline phrase suggestions, reviewed by the team</li><li>Run in shadow mode until the numbers hold on your data</li></ul></div>
+  </div>
+</section>
+
+
+<section class="slide" aria-label="Architecture">
+  <h2>Architecture</h2>
+  <svg viewBox="0 0 1360 600" width="1360" height="600" style="margin-top:34px;display:block" role="img" aria-label="Offline compile produces a bundle; live scoring uses the bundle inside the application">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#16213A"/></marker>
+      <marker id="arb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2B4FD8"/></marker>
+    </defs>
+    <style>
+      .lane{font:600 17px 'Instrument Sans',sans-serif;fill:#5B6580}
+      .bx{fill:#fff;stroke:#CBD2E0;stroke-width:1.5}
+      .bk{fill:#16213A}
+      .bb{fill:#2B4FD8}
+      .t{font:600 19px 'Bricolage Grotesque',sans-serif;fill:#16213A}
+      .tw{font:600 19px 'Bricolage Grotesque',sans-serif;fill:#fff}
+      .s{font:15px 'Instrument Sans',sans-serif;fill:#5B6580}
+      .sw{font:15px 'Instrument Sans',sans-serif;fill:#C9D2EA}
+      .ln{stroke:#16213A;stroke-width:2;fill:none}
+      .lb{stroke:#2B4FD8;stroke-width:2.5;fill:none}
+      .dash{stroke:#5B6580;stroke-width:1.5;stroke-dasharray:6 6;fill:none}
+    </style>
+    <text class="lane" x="0" y="18">Offline, once per change (an LLM may suggest phrasings here; every suggestion is verified)</text>
+    <rect class="bx" x="0" y="40" width="250" height="56"/><text class="t" x="16" y="66">Schema DDL</text><text class="s" x="16" y="86">tables, views, table functions</text>
+    <rect class="bx" x="0" y="106" width="250" height="56"/><text class="t" x="16" y="132">Terms &amp; KPIs</text><text class="s" x="16" y="152">Excel / CSV workbook</text>
+    <rect class="bx" x="0" y="172" width="250" height="56"/><text class="t" x="16" y="198">Reference queries</text><text class="s" x="16" y="218">one per question pattern</text>
+    <rect class="bx" x="0" y="238" width="250" height="56"/><text class="t" x="16" y="264">Data rules</text><text class="s" x="16" y="284">for realistic mock data</text>
+    <path class="ln" d="M250,68 H300 V166 H330" marker-end="url(#ar)"/><path class="ln" d="M250,134 H300"/><path class="ln" d="M250,200 H300"/><path class="ln" d="M250,266 H300 V166"/>
+    <rect class="bk" x="335" y="96" width="300" height="140"/><text class="tw" x="355" y="130">sqlgami compile</text><text class="sw" x="355" y="158">verifies every reference</text><text class="sw" x="355" y="180">builds adversarial mock datasets</text><text class="sw" x="355" y="202">stores reference fingerprints</text>
+    <path class="ln" d="M635,166 H690" marker-end="url(#ar)"/>
+    <rect class="bx" x="695" y="96" width="250" height="140" style="stroke:#2B4FD8;stroke-width:2.5"/><text class="t" x="715" y="130">Bundle</text><text class="s" x="715" y="158">versioned folder in git</text><text class="s" x="715" y="180">catalogue, fixtures,</text><text class="s" x="715" y="202">fingerprints, schema hash</text>
+    <rect x="1010" y="96" width="350" height="140" fill="none" stroke="#5B6580" stroke-dasharray="6 6"/><text class="t" x="1030" y="130">BigQuery sandbox</text><text class="s" x="1030" y="158">offline only: proves each translated</text><text class="s" x="1030" y="180">construct gives BigQuery's answer,</text><text class="s" x="1030" y="202">and labels test sets</text>
+    <path class="dash" d="M1010,166 H945"/>
+    <line x1="0" y1="330" x2="1360" y2="330" stroke="#CBD2E0"/>
+    <text class="lane" x="0" y="364">Live, inside the agent or application, ≤50 ms, no network, no LLM</text>
+    <rect class="bx" x="0" y="392" width="160" height="88"/><text class="t" x="16" y="426">Agent / app</text><text class="s" x="16" y="450">SQL + question</text><text class="s" x="16" y="468">+ parameters</text>
+    <path class="ln" d="M160,436 H198" marker-end="url(#ar)"/>
+    <rect class="bx" x="202" y="392" width="170" height="88"/><text class="t" x="218" y="426">Parse &amp; gate</text><text class="s" x="218" y="450">schema, safety,</text><text class="s" x="218" y="468">allow-lists</text>
+    <path class="ln" d="M372,436 H404" marker-end="url(#ar)"/>
+    <rect class="bx" x="408" y="392" width="170" height="88"/><text class="t" x="424" y="426">Rule checks</text><text class="s" x="424" y="450">~40 failure</text><text class="s" x="424" y="468">patterns</text>
+    <path class="ln" d="M578,436 H610" marker-end="url(#ar)"/>
+    <rect class="bx" x="614" y="392" width="170" height="88"/><text class="t" x="630" y="426">Terms &amp; KPIs</text><text class="s" x="630" y="450">your definitions</text><text class="s" x="630" y="468">vs the SQL</text>
+    <path class="ln" d="M784,436 H816" marker-end="url(#ar)"/>
+    <rect class="bk" x="820" y="392" width="260" height="88"/><text class="tw" x="836" y="426">Answer check</text><text class="sw" x="836" y="450">run on mock data via proven</text><text class="sw" x="836" y="468">translation; compared to reference</text>
+    <path class="ln" d="M1080,436 H1112" marker-end="url(#ar)"/>
+    <rect class="bb" x="1116" y="392" width="244" height="88"/><text class="tw" x="1132" y="426">Report</text><text class="sw" x="1132" y="450">verdict, confidence + range,</text><text class="sw" x="1132" y="468">findings, timing</text>
+    <path class="lb" d="M820,236 V300 H950 V392" marker-end="url(#arb)"/>
+    <text class="s" x="958" y="300">bundle loaded once at start-up</text>
+    <text class="s" x="0" y="520">Anything the system cannot verify (an unsupported construct, an undefined term, no matching reference) is reported as "can't check" and lowers confidence. It is never guessed.</text>
+  </svg>
+</section>
+
+<section class="slide" aria-label="Thank you">
+  <div class="brand"><span class="mark">sqlgami</span><span class="by">Abhinav Anand</span></div>
+  <h1 style="font-size:140px;margin-top:56px">Thank you.</h1>
+  <p class="lede">Questions, ideas and hard SQL to throw at it are welcome.</p>
+  <div class="contact">
+    <div><span>Website</span><a href="https://abhinav-anand.com/">abhinav-anand.com</a></div>
+    <div><span>Blog</span><a href="https://www.cyberaka.com/">cyberaka.com</a></div>
+    <div><span>Email</span><a href="mailto:cyberaka@cyberaka.com">cyberaka@cyberaka.com</a></div>
+  </div>
+  <div class="scale" style="margin-top:56px;height:60px"><div class="bar" style="top:0"><div class="z w"></div><div class="z u"></div><div class="z r"></div></div></div>
+</section>
+</div></div>
+<nav><button id="prev" aria-label="Previous slide">Previous</button><button id="next" aria-label="Next slide">Next</button></nav>
+<script>
+(function(){
+  var stage=document.getElementById('stage'),s=[].slice.call(stage.querySelectorAll('.slide')),i=0;
+  s.forEach(function(el,k){var p=document.createElement('div');p.className='page';p.textContent=(k+1)+' / '+s.length;el.appendChild(p);});
+  function fit(){var k=Math.min(window.innerWidth/1600,window.innerHeight/900)*0.96;stage.style.transform='scale('+k+')';}
+  function show(n){i=Math.max(0,Math.min(s.length-1,n));s.forEach(function(e,k){e.classList.toggle('on',k===i)});}
+  window.addEventListener('resize',fit);fit();
+  var h=parseInt((location.hash||'').slice(1),10);if(h>0)show(h-1);
+  document.getElementById('prev').onclick=function(){show(i-1)};document.getElementById('next').onclick=function(){show(i+1)};
+  document.addEventListener('keydown',function(e){if(['ArrowRight',' ','PageDown'].indexOf(e.key)>-1)show(i+1);if(['ArrowLeft','PageUp'].indexOf(e.key)>-1)show(i-1)});
+  var x0=null;document.addEventListener('touchstart',function(e){x0=e.touches[0].clientX},{passive:true});
+  document.addEventListener('touchend',function(e){if(x0===null)return;var dx=e.changedTouches[0].clientX-x0;if(Math.abs(dx)>50)show(i+(dx<0?1:-1));x0=null});
+})();
+</script>
+</body></html>

@@ -6,7 +6,10 @@ weeks you decide what the number is worth. Nothing in this setup sends data anyw
 of your tables is read, no query runs on BigQuery, no model is called at scoring time.
 
 sqlgami's report is advisory. It is not a guarantee of correctness and comes with no
-warranty; the report says so itself.
+warranty; the report says so itself. The release notes for this build — supported constructs,
+the deadline behaviour, the measured numbers, known limitations — are in
+[`../RELEASE.md`](../RELEASE.md); what each verdict rests on is in [`guarantees.md`](guarantees.md);
+the engineering map is [`../HANDOVER.md`](../HANDOVER.md).
 
 ## 1. Install
 

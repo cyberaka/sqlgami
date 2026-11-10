@@ -16,6 +16,15 @@ to show anything, is up to your application.
 
 ## Status
 
+**On a work laptop beside a live warehouse: read [`docs/PRODUCTION_RUNBOOK.md`](docs/PRODUCTION_RUNBOOK.md) first.**
+
+First release candidate for a production test: **v0.1.0-rc1** — what it is, how to set it up
+in shadow mode, the measured numbers and the known limitations are in [`RELEASE.md`](RELEASE.md);
+what a report does and does not promise is in [`docs/guarantees.md`](docs/guarantees.md); the
+map for the next engineer or agent (architecture, bench, sandbox rules, open work) is
+[`HANDOVER.md`](HANDOVER.md); the overview presentation is
+[`docs/pitch/sqlgami-pitch.html`](docs/pitch/sqlgami-pitch.html) (open it in a browser).
+
 Early and private. Working today: the core, the static and question checks,
 adapters for SQLite, DuckDB and Postgres, and BigQuery through the fixture
 path (static checks, terms, and fixtures reached through a verified
@@ -770,3 +779,6 @@ several tenants, soft-deleted rows, boundary dates).
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+Author: Abhinav Anand — https://abhinav-anand.com/ · blog https://www.cyberaka.com/ ·
+cyberaka@cyberaka.com
