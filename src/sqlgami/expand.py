@@ -107,6 +107,14 @@ def propose_phrases(chat: Chat, catalogue: Catalogue, name: str, k: int) -> list
             "Placeholders: " + ", ".join("{" + s + "}" for s in slots)
             + " stand for a number the question states and must appear, spelled exactly like that, in every wording you propose."
         )
+    qualifiers = tuple(term.qualifiers) if term else ()
+    if qualifiers:
+        user.append(
+            "Qualifiers the term allows inside a wording: " + ", ".join(qualifiers)
+            + ". Include some wordings with a qualifier inserted (\"trailing {n} biweekly pay periods\") and some with the words in another order."
+        )
+    else:
+        user.append("Include some wordings with the words in another order (\"{n} pay periods, most recent\").")
     user.append(
         f"Propose up to {k} further wordings a person might use for the same term in a question: lower case, "
         f"at most {MAX_PHRASE_WORDS} words, no punctuation, no new placeholders, none of the existing wordings, "
@@ -150,7 +158,7 @@ def propose_variants(chat: Chat, reference: Reference, k: int, slot_choices: dic
 
 
 def _with_phrase(catalogue: Catalogue, name: str, phrase: str) -> Catalogue:
-    terms = [Term(t.name, t.phrases + ((phrase,) if t.name.lower() == name.lower() else ()), t.kind, t.table, t.sql, t.nulls, t.description, dict(t.dialects), t.row) for t in catalogue.terms]
+    terms = [Term(t.name, t.phrases + ((phrase,) if t.name.lower() == name.lower() else ()), t.kind, t.table, t.sql, t.nulls, t.description, dict(t.dialects), t.row, t.qualifiers) for t in catalogue.terms]
     kpis = []
     for k in catalogue.kpis:
         copy = type(k)(k.name, k.phrases + ((phrase,) if k.name.lower() == name.lower() else ()), k.formula, k.format, k.requires, k.reference_sql, k.description, k.row)
@@ -198,7 +206,7 @@ def accept_phrase(
     except re.error:
         return None, "does not compile"
     trial = _with_phrase(catalogue, name, phrase)
-    pattern = _phrase_pattern(phrase)
+    pattern = _phrase_pattern(phrase, term.qualifiers if term else ())
     # No registered question may change its pattern or its slots, and the wording must not already
     # occur in one where it does not stand for the term ("customers" offered for "paid").
     for qid, text in questions:

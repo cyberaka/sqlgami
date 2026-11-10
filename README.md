@@ -338,7 +338,10 @@ data terms is reported as `undefined_term` and caps confidence at 0.75:
 sqlgami never guesses what a word means.
 
 `Terms.csv` (one row per term; `phrases` separated by `;`, `{n}` a number from
-the question, `{manager_id}` a template parameter):
+the question, `{manager_id}` a template parameter; an optional `qualifiers`
+column lists single words a question may put inside a wording without
+changing it — `biweekly;authoritative` lets "trailing 8 biweekly pay periods"
+match "trailing {n} pay periods"; nothing is inferred without it):
 
 ```csv
 term,phrases,kind,table,sql,nulls,description

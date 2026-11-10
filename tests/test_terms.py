@@ -230,6 +230,21 @@ def test_a_number_free_top_n_paraphrase_is_not_the_bare_headcount_question():
     assert "top_dense_ranks" in with_top and with_top != bare
 
 
+def test_declared_qualifiers_may_sit_inside_a_phrase():
+    """A term declares the words a question may put inside its wording ("biweekly"); nothing is
+    inferred — without the declaration the same question does not match."""
+    plain = Catalogue.from_sheets({"terms": TERMS})
+    assert [m.name for m in plain.match("the trailing 8 biweekly pay periods")] == []
+    sheet = TERMS.replace("nulls,description\n", "nulls,description,qualifiers\n").replace("last {n} pay periods,window", "last {n} pay periods;trailing {n} pay periods,window")
+    qualified = Catalogue.from_sheets({"terms": sheet.replace("period_seq BETWEEN -({n}-1) AND 0,,\n", "period_seq BETWEEN -({n}-1) AND 0,,,biweekly;authoritative\n")})
+    assert qualified.term("last_n_pay_periods").qualifiers == ("biweekly", "authoritative")
+    assert [m.name for m in qualified.match("the trailing 8 biweekly pay periods")] == ["last_n_pay_periods"]
+    assert [(m.name, m.bindings) for m in qualified.match("the last 8 biweekly authoritative pay periods")] == [("last_n_pay_periods", {"n": "8"})]
+    assert [m.name for m in qualified.match("the trailing 8 fiscal pay periods")] == []  # not declared
+    bad = Catalogue.from_sheets({"terms": sheet.replace("period_seq BETWEEN -({n}-1) AND 0,,\n", "period_seq BETWEEN -({n}-1) AND 0,,,pay period\n")})
+    assert any("not a single word" in str(p) for p in bad.validate())
+
+
 def test_source_term_flags_a_column_read_from_the_wrong_table():
     question = "People in my organisation hired in the last 13 pay periods"
     wrong = (

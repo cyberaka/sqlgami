@@ -184,6 +184,17 @@ def test_pattern_matching_with_slots(tmp_path):
         # a reference fixed at one value cannot serve another: not run, never guessed
         report = scorer.explain("SELECT id FROM orders WHERE status = 'paid' ORDER BY total DESC LIMIT 4", "The top 4 paid orders")
         assert report.stage("fixtures").status == StageStatus.NOT_RUN and "no reference for these values" in (report.stage("fixtures").detail or "")
+        # a number no term binds must agree, and the reason names the number and its wording;
+        # "both" and "one" are prose
+        prose = scorer.explain(
+            "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.name ORDER BY spend DESC LIMIT 3",
+            "The top 3 customers by paid spend, both name and spend, in one list, so if four customers tie all four appear",
+        )
+        detail = prose.stage("fixtures").detail or ""
+        assert prose.stage("fixtures").status == StageStatus.NOT_RUN, detail
+        assert '4 in "list so if four customers tie"' in detail and '4 in "customers tie all four appear"' in detail and "top3 states none" in detail, detail
+        assert "3 in" not in detail  # the 3 is bound by top_n; "both" and "one" are not numbers
+        assert "reword the reference" in detail
 
 
 def test_pattern_is_closed_over_what_the_catalogue_declares():

@@ -157,7 +157,7 @@ def _judge_chain(ctx: CheckContext, term: Term, match: Match, dialect: str, outc
     if not columns:
         return outcome, None
     if len(columns) == 1:
-        single = Term(term.name, term.phrases, "filter", term.table, f"{columns[0]} = {right.strip()}", term.nulls, term.description, term.dialects, term.row)
+        single = Term(term.name, term.phrases, "filter", term.table, f"{columns[0]} = {right.strip()}", term.nulls, term.description, term.dialects, term.row, term.qualifiers)
         try:
             node = parse_term_sql(single, dialect)
         except Exception:
@@ -199,7 +199,7 @@ def _bind(term: Term, bindings: dict[str, str]) -> Term:
             continue
         sql = sql.replace("{" + key + "}", str(number))
         dialects = {d: s.replace("{" + key + "}", str(number)) for d, s in dialects.items()}
-    return Term(term.name, term.phrases, term.kind, term.table, sql, term.nulls, term.description, dialects, term.row)
+    return Term(term.name, term.phrases, term.kind, term.table, sql, term.nulls, term.description, dialects, term.row, term.qualifiers)
 
 
 def _reads_column_of(ctx: CheckContext, term: Term, dialect: str) -> bool:

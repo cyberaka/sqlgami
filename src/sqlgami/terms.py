@@ -48,7 +48,7 @@ from .errors import ConfigurationError
 KINDS = ("filter", "formula", "window", "source", "chain", "rank")
 RANK_METHODS = ("limit", "rank", "dense_rank", "row_number")
 NULLS = ("", "include", "exclude", "separate")
-TERM_COLUMNS = ("term", "phrases", "kind", "table", "sql", "nulls", "description")
+TERM_COLUMNS = ("term", "phrases", "kind", "table", "sql", "nulls", "description", "qualifiers")
 KPI_COLUMNS = ("kpi", "phrases", "formula", "format", "requires", "reference_sql", "description")
 EXAMPLE_COLUMNS = ("id", "question", "params", "correct_sql", "expected_result", "dataset")
 PARAMETER_COLUMNS = ("name", "type", "example_values")
@@ -78,6 +78,7 @@ class Term:
     description: str = ""
     dialects: dict[str, str] = field(default_factory=dict)  # dialect -> sql override
     row: int = 0
+    qualifiers: tuple[str, ...] = ()  # words a question may put inside a phrase ("trailing {n} biweekly pay periods")
 
     @property
     def enforceable(self) -> bool:
@@ -262,6 +263,9 @@ class Catalogue:
                 problems.append(Problem("Terms", term.row, "phrases", "is blank; the term can never be matched"))
             if term.kind and term.kind not in KINDS:
                 problems.append(Problem("Terms", term.row, "kind", f"'{term.kind}' is not one of {', '.join(KINDS)}"))
+            for qualifier in term.qualifiers:
+                if len(normalise(qualifier).split()) != 1:
+                    problems.append(Problem("Terms", term.row, "qualifiers", f"'{qualifier}' is not a single word"))
             if term.nulls not in NULLS:
                 problems.append(Problem("Terms", term.row, "nulls", f"'{term.nulls}' is not include, exclude or separate"))
             if term.sql.strip() and not term.kind:
@@ -386,7 +390,7 @@ class Catalogue:
                     if re.fullmatch(r"\w+", column) and column not in {normalise(p).strip() for p in phrases}:
                         phrases.append(column)
                 for phrase in phrases:
-                    entries.append((_phrase_pattern(phrase), term.name, phrase, term.kind if term.enforceable else "", len(phrase)))
+                    entries.append((_phrase_pattern(phrase, term.qualifiers), term.name, phrase, term.kind if term.enforceable else "", len(phrase)))
             for kpi in self.kpis:
                 for phrase in kpi.phrases:
                     entries.append((_phrase_pattern(phrase), kpi.name, phrase, "kpi" if kpi.enforceable else "", len(phrase)))
@@ -434,10 +438,11 @@ _NUMBER_WORDS = {
 }
 
 
-def _phrase_pattern(phrase: str) -> re.Pattern[str]:
+def _phrase_pattern(phrase: str, qualifiers: Sequence[str] = ()) -> re.Pattern[str]:
     """A phrase becomes a regular expression over the normalised question: words may take a
     plural s, ``{n}``/``{m}`` take a number (digits or a number word), other placeholders take a
-    word."""
+    word. ``qualifiers`` are words the term declares a question may put between the phrase's
+    words without changing its meaning ("trailing {n} biweekly pay periods")."""
     parts: list[str] = []
     for token in normalise(phrase).split():
         marker = re.fullmatch(r"\{(\w+)\}", token)
@@ -454,7 +459,11 @@ def _phrase_pattern(phrase: str) -> re.Pattern[str]:
             # period window" in a question, and "pay period" finds "pay periods".
             stem = token[:-2] if token.endswith("es") and len(token) > 4 and token[-3] in "sxz" else token[:-1] if token.endswith("s") and len(token) > 3 else token
             parts.append(re.escape(stem) + "(?:s|es)?")
-    return re.compile(r"(?<=\s)" + r"\s+".join(parts) + r"(?=\s)")
+    gap = r"\s+"
+    words = [normalise(q).strip() for q in qualifiers if normalise(q).strip()]
+    if words:
+        gap = r"\s+(?:(?:" + "|".join(re.escape(w) for w in words) + r")\s+)*"
+    return re.compile(r"(?<=\s)" + gap.join(parts) + r"(?=\s)")
 
 
 def bound_number(value: str) -> int | None:
@@ -537,6 +546,7 @@ def _term(row: dict[str, Any], number: int) -> Term:
         description=_text(row.get("description") or row.get("meaning")),
         dialects={k: str(v) for k, v in (dialects or {}).items()},
         row=int(row.get("_row") or number),
+        qualifiers=tuple(q.strip().lower() for q in _split_phrases(row.get("qualifiers"))),
     )
 
 

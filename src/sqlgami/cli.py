@@ -72,8 +72,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {entry['name']:16} {entry['rows']:6} rows   reference query p50 {entry['reference_ms'] or 0:.1f} ms, max {entry['reference_max_ms'] or 0:.1f} ms")
         if manifest["rejected"]:
             print(f"  see {bundle.path / 'rejected.jsonl'}")
-        for key, numbers in (manifest.get("references_with_free_numbers") or {}).items():
-            print(f"  note: reference {key} states {numbers} and no slot binds it; only a question stating the same compares under it")
+        for key, entries in (manifest.get("references_with_free_numbers") or {}).items():
+            said = "; ".join(f"{e['number']:g} in \"{e['phrase']}\"" for e in entries)
+            print(f"  note: reference {key} states {said} and no slot binds it: only a question stating the same number compares under it — reword without the number, or make it a {{slot}} of a term")
         if expansion := manifest.get("expansion"):
             print(
                 f"  expansion ({expansion['model']}): {expansion['proposals']} proposals, {len(expansion['phrases'])} wordings to review in "

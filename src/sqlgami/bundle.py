@@ -279,7 +279,9 @@ def compile_bundle(
         # counts"): a question compares under them only when it states the same number, so the
         # host may want to reword the reference, or write that number as a {slot}.
         "references_with_free_numbers": {
-            r.key: list(free_numbers(r.question, r.slots, r.params or {})) for r in kept if free_numbers(r.question, r.slots, r.params or {})
+            r.key: [{"number": v, "phrase": phrase} for v, phrase in free_number_phrases(r.question, r.slots, r.params or {})]
+            for r in kept
+            if free_number_phrases(r.question, r.slots, r.params or {})
         },
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
@@ -359,36 +361,43 @@ def slot_values(matches: Sequence[Any]) -> dict[str, Any]:
     return found
 
 
-def free_numbers(question: str, slots: dict[str, Any], params: dict[str, Any]) -> tuple:
-    """The numbers a question states that neither a term slot nor a parameter accounts for, as a
-    sorted tuple (with repeats): two questions compare under a reference only when these agree."""
+def free_number_phrases(question: str, slots: dict[str, Any], params: dict[str, Any]) -> list[tuple[float, str]]:
+    """The numbers a question states that neither a term slot nor a parameter accounts for, each
+    with the few words around it ("if four nodes tie"), so a host can see which wording is meant.
+    Digits and number words from two up count ("one" is prose); years are dates, not quantities."""
     import re
 
     from .terms import _NUMBER_WORDS, normalise
 
-    text = normalise(question)
-    found: list[float] = []
-    for token in text.split():
-        # digits, and number words from two up ("top five", "last eight"); "one" is prose ("one customer")
+    tokens = normalise(question).split()
+    found: list[tuple[float, str]] = []
+    for index, token in enumerate(tokens):
         if re.fullmatch(r"\d+(?:\.\d+)?", token):
-            found.append(float(token))
+            value = float(token)
         elif token in _NUMBER_WORDS and _NUMBER_WORDS[token] != "1":
-            found.append(float(_NUMBER_WORDS[token]))
-    accounted: list[float] = []
+            value = float(_NUMBER_WORDS[token])
+        else:
+            continue
+        if 1900 <= value <= 2100:
+            continue
+        found.append((value, " ".join(tokens[max(0, index - 3) : index + 3])))
     for value in list(slots.values()) + list(params.values()):
-        values = value if isinstance(value, (list, tuple)) else [value]
-        for v in values:
+        for v in value if isinstance(value, (list, tuple)) else [value]:
             try:
-                accounted.append(float(v))
+                number = float(v)
             except (TypeError, ValueError):
                 continue
-    for v in accounted:
-        if v in found:
-            found.remove(v)
-    years = [v for v in found if 1900 <= v <= 2100]  # dates in prose are not quantities
-    for v in years:
-        found.remove(v)
-    return tuple(sorted(found))
+            for entry in found:
+                if entry[0] == number:
+                    found.remove(entry)
+                    break
+    return sorted(found)
+
+
+def free_numbers(question: str, slots: dict[str, Any], params: dict[str, Any]) -> tuple:
+    """The free numbers alone, as a sorted tuple (with repeats): two questions compare under a
+    reference only when these agree."""
+    return tuple(v for v, _ in free_number_phrases(question, slots, params))
 
 
 def _parse_params(text: str) -> dict[str, Any]:

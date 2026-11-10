@@ -172,8 +172,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"bundle: {bundle.path}  references {m['references']} (rejected {m['rejected']})  hash {bundle_hash(bundle.path)[:16]}")
             for entry in m["fixtures"]:
                 print(f"  {entry['name']:16} {entry['rows']:6} rows   gold p50 {entry['reference_ms'] or 0:.1f} ms  max {entry['reference_max_ms'] or 0:.1f} ms   bugs diverging {entry.get('discrimination', '-')}/{m.get('bugs_measured', '-')}")
-            for key, numbers in (m.get("references_with_free_numbers") or {}).items():
-                print(f"  note: reference {key} states {numbers} and no slot binds it; only a question stating the same compares under it")
+            for key, entries in (m.get("references_with_free_numbers") or {}).items():
+                said = "; ".join(f"{e['number']:g} in \"{e['phrase']}\"" for e in entries)
+                print(f"  note: reference {key} states {said} and no slot binds it: only a question stating the same number compares under it — reword without the number, or make it a {{slot}} of a term")
             return 0
         if args.command == "latency":
             from .latency import format_result, measure, write_result

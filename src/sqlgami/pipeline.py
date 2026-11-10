@@ -681,10 +681,17 @@ def _fixture_stage(
         return
     # Numbers the questions state that no term binds ("top 3" when no top_n term exists) must be
     # the same in both questions, or the comparison would silently use the reference's number.
-    free_here = B.free_numbers(question or "", slots, params or {})
-    free_there = B.free_numbers(reference.question, reference.slots, reference.params)
-    if free_here != free_there:
-        _stage(report, name, StageStatus.NOT_RUN, f"no reference for these values: the question's numbers {sorted(free_here)} differ from the reference's {sorted(free_there)} and no term binds them")
+    here = B.free_number_phrases(question or "", slots, params or {})
+    there = B.free_number_phrases(reference.question, reference.slots, reference.params)
+    if [v for v, _ in here] != [v for v, _ in there]:
+        def _say(entries: list) -> str:
+            return ", ".join(f"{int(v) if float(v).is_integer() else v} in \"{phrase}\"" for v, phrase in entries) or "none"
+
+        _stage(
+            report, name, StageStatus.NOT_RUN,
+            f"no reference for these values: the question states {_say(here)} and the reference {reference.key} states {_say(there)}; "
+            "no term binds these numbers, so they must agree (reword the reference without illustrative numbers, or give the number a {slot} term)",
+        )
         report.signals["fixtures"] = {"reference": reference.key, "matched_by": how, "verdict": "unverified", "reason": "free_numbers", "slots": slots, "params": live_params, "fixtures": []}
         return
     live_slots = dict(reference.slots)
