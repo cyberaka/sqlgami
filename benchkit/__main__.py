@@ -65,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
     p_lat.add_argument("--mode", action="append", help="static, dry or sample; repeatable; default static and sample")
     p_lat.add_argument("--repeat", type=int, default=3)
     p_lat.add_argument("--stretch", help="pad statements to this line range, e.g. 40-80")
+    p_lat.add_argument("--deadline", type=float, help="deadline in ms (default: none)")
+    p_lat.add_argument("--bundle", help="a compiled bundle to score with")
+    p_lat.add_argument("--no-scripts", action="store_true", help="leave out the <engine>_script golds")
 
     p_build = sub.add_parser("build", help="generate data and build the databases")
     p_build.add_argument("suite")
@@ -206,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.stretch:
                 low, _, high = args.stretch.partition("-")
                 lines = (int(low), int(high or low))
-            result = measure(suite, args.engine, args.mode or ["static", "sample"], repeat=args.repeat, lines=lines)
+            result = measure(suite, args.engine, args.mode or ["static", "sample"], repeat=args.repeat, lines=lines, deadline_ms=args.deadline, bundle=args.bundle, scripts=not args.no_scripts)
             print(format_result(result))
             write_result(result, RUNS_DIR / "latency.json")
             return 0

@@ -460,16 +460,21 @@ def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str,
         sql = sql.replace("{" + slot + "}", str(int(value)) if isinstance(value, (int, float)) and float(value).is_integer() else str(value))
     prepared = template.prepare(sql, dialect, params or None)
     text = prepared.executable_sql or sql
-    if dialect in A._SCRIPT_DIALECTS:
-        # A DECLARE/SET script runs as its final query with the variables bound (ADR 0003 B1).
-        text, unbound = A.bind_script_text(text, dialect)
-        if unbound:
-            raise Untranslatable("script variable " + ", ".join(unbound) + " has no value the script gives it (no DEFAULT or SET)")
-    if dialect != "duckdb":
-        text = translate(text, dialect, tables).sql
-    elif not isinstance(text, str):
-        text = text.sql(dialect="duckdb")
-    return text
+    if dialect == "duckdb":
+        return text
+    # Parsed once: a script becomes its final query with the variables bound (ADR 0003 B1), a
+    # statement is translated as the tree it parsed to.
+    statements = [st for st in sqlglot.parse(text, read=dialect) if st is not None]
+    if len(statements) > 1 and dialect in A._SCRIPT_DIALECTS and A._is_script(statements):
+        script = A.bind_script(statements, dialect)
+        if script.unbound:
+            raise Untranslatable("script variable " + ", ".join(script.unbound) + " has no value the script gives it (no DEFAULT or SET)")
+        tree = script.query
+    elif len(statements) == 1:
+        tree = statements[0]
+    else:
+        return translate(text, dialect, tables).sql
+    return translate(tree, dialect, tables).sql
 
 
 def _run_on(
@@ -483,17 +488,20 @@ def _run_on(
     allowed_tables: Sequence[str] = (),
     grace_s: float | None = None,
     tables: Mapping[str, str] | None = None,
+    executable: str | None = None,
 ) -> dict[str, Any]:
     """Run ``sql`` on a fixture connection and return the stored form of its result. The same
     gate as everywhere applies: a statement that is not a single read-only query over known
     functions and tables is not sent. ``grace_s`` bounds how long past ``timeout_s`` the engine
-    is given to stop before the cursor is abandoned (a live deadline passes what it has left)."""
+    is given to stop before the cursor is abandoned (a live deadline passes what it has left).
+    ``executable`` is the already-translated DuckDB text, when the caller prepared it once for
+    several fixtures."""
     from .engines.duckdb import DuckDBAdapter
     from .errors import UnsafeQueryError
     from .translate import Untranslatable
 
     try:
-        text = _executable(sql, dialect, params, slots, tables)
+        text = executable if executable is not None else _executable(sql, dialect, params, slots, tables)
     except Untranslatable as exc:
         return {"ok": False, "error": str(exc), "untranslatable": exc.construct}
     except Exception as exc:

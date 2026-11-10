@@ -40,6 +40,13 @@ def stretch(sql: str, lines: tuple[int, int]) -> str:
     current = sql.count("\n") + 1
     if current >= low:
         return sql
+    head = ""
+    if sql.lstrip().upper().startswith("DECLARE"):
+        # a script: the padding belongs to the final query, after the declarations
+        cut = max(sql.rfind(";\nSELECT"), sql.rfind(";\nWITH"), sql.rfind(";\n\nSELECT"), sql.rfind(";\n\nWITH"))
+        if cut > 0:
+            head, sql = sql[: cut + 1] + "\n", sql[cut + 1 :].lstrip("\n")
+            current = sql.count("\n") + 1
     target = (low + high) // 2
     body = sql.rstrip().rstrip(";")
     extra = max(1, target - current - 2)
@@ -50,8 +57,8 @@ def stretch(sql: str, lines: tuple[int, int]) -> str:
         for c in range(ctes)
     )
     if body.lstrip().upper().startswith("WITH "):
-        return f"WITH {filler.lstrip()},\n{body.lstrip()[5:]}"
-    return f"WITH {filler.lstrip()}\n{body}"
+        return head + f"WITH {filler.lstrip()},\n{body.lstrip()[5:]}"
+    return head + f"WITH {filler.lstrip()}\n{body}"
 
 
 def measure(
@@ -60,6 +67,9 @@ def measure(
     modes: list[str],
     repeat: int = 3,
     lines: tuple[int, int] | None = None,
+    deadline_ms: float | None = None,
+    bundle: str | None = None,
+    scripts: bool = True,
 ) -> dict[str, Any]:
     ddl = suite.schema_file(engine).read_text(encoding="utf-8")
     config = suite.scorer_config(engine)
@@ -67,8 +77,12 @@ def measure(
     glossary_file = suite.path / "glossary.yaml"
     glossary = glossary_file.read_text(encoding="utf-8") if glossary_file.exists() else None
     terms = suite.terms_source(engine)
-    kwargs: dict[str, Any] = dict(glossary=glossary, terms=str(terms) if terms else None, options=Options(deadline_ms=None), **config)
+    if bundle:
+        terms = Path(bundle) / "terms" if (Path(bundle) / "terms").exists() else terms
+    kwargs: dict[str, Any] = dict(glossary=glossary, terms=str(terms) if terms else None, options=Options(deadline_ms=deadline_ms), bundle=bundle, **config)
     statements = [(q.gold(engine), q.question, q.param_values() or None) for q in suite.questions if q.gold(engine)]
+    if scripts:
+        statements += [((q.gold_sql or {}).get(f"{engine}_script"), q.question, q.param_values() or None) for q in suite.questions if (q.gold_sql or {}).get(f"{engine}_script")]
     if lines:
         statements = [(stretch(sql, lines), question, params) for sql, question, params in statements]
     result: dict[str, Any] = {"suite": suite.name, "engine": engine, "statements": len(statements), "lines": None, "modes": {}}
@@ -85,13 +99,19 @@ def measure(
         for sql, question, params in statements[:3]:  # warm the caches, as a long-running host would be
             method(sql, question, params=params)
         samples: list[float] = []
+        fixtures_ran = 0
         for _ in range(repeat):
             for sql, question, params in statements:
                 started = time.perf_counter()
-                method(sql, question, params=params)
+                report = method(sql, question, params=params)
                 samples.append((time.perf_counter() - started) * 1000)
+                if any(f.get("status") in ("match", "mismatch") for f in (report.signals.get("fixtures") or {}).get("fixtures", [])):
+                    fixtures_ran += 1
         scorer.close()
-        result["modes"][mode] = percentiles(samples)
+        stats = percentiles(samples)
+        stats["over_50ms"] = sum(1 for s in samples if s > 50)
+        stats["fixtures_ran"] = fixtures_ran
+        result["modes"][mode] = stats
     return result
 
 
@@ -100,7 +120,7 @@ def format_result(result: dict[str, Any]) -> str:
              + (f", {result['lines']['p50']} lines median ({result['lines']['min']}-{result['lines']['max']})" if result.get("lines") else "")]
     for mode, stats in result["modes"].items():
         if stats:
-            lines.append(f"  {mode:7} p50 {stats['p50']:6.1f} ms  p90 {stats['p90']:6.1f} ms  p99 {stats['p99']:6.1f} ms  max {stats['max']:6.1f} ms  (n={stats['n']})")
+            lines.append(f"  {mode:7} p50 {stats['p50']:6.1f} ms  p90 {stats['p90']:6.1f} ms  p99 {stats['p99']:6.1f} ms  max {stats['max']:6.1f} ms  (n={stats['n']}, over 50 ms {stats.get('over_50ms', 0)}, fixtures ran {stats.get('fixtures_ran', 0)})")
     return "\n".join(lines)
 
 

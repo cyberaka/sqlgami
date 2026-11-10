@@ -712,6 +712,28 @@ def _fixture_stage(
 
     clock = _Clock()
     outcome: dict[str, Any] = {"bundle": bundle.hash[:16], "reference": reference.key, "matched_by": how, "params": live_params, "slots": live_slots, "reference_rerun": not same_values, "fixtures": []}
+    # Translate once for every fixture (a long statement costs milliseconds to parse and
+    # transpile), inside the deadline's accounting: an unverified construct or an unbound
+    # script variable is known here, before any fixture is touched.
+    from .translate import Untranslatable
+
+    try:
+        executable = B._executable(sql, dialect, live_params, live_slots, bundle.tables or None)
+        reference_executable = B._executable(reference.sql, dialect, live_params, live_slots, bundle.tables or None) if not same_values else None
+    except Untranslatable as exc:
+        why = str(exc) if "script variable" in str(exc) else f"{exc}: the translation of this construct to the fixture engine is not verified"
+        report.signals["fixtures"] = {**outcome, "verdict": "unverified", "untranslatable": exc.construct, "fixtures": [{"fixture": e["name"], "status": "untranslatable", "reason": str(exc)} for e in bundle.fixture_order()[:1]]}
+        _stage(report, name, StageStatus.NOT_RUN, why, clock.lap())
+        return
+    except Exception as exc:
+        report.signals["fixtures"] = {**outcome, "verdict": "unverified", "fixtures": []}
+        _stage(report, name, StageStatus.NOT_RUN, f"could not prepare the statement for the fixtures: {str(exc)[:160]}", clock.lap())
+        return
+    if deadline.remaining_ms() is not None and deadline.remaining_ms() <= deadline.reserve_ms:
+        deadline.cut(name)
+        report.signals["fixtures"] = {**outcome, "verdict": "unverified", "reason": DEADLINE}
+        _stage(report, name, StageStatus.SKIPPED, "no fixture could be run in time", clock.lap())
+        return
     matched = 0
     mismatch: Finding | None = None
     for entry in bundle.fixture_order():
@@ -740,7 +762,7 @@ def _fixture_stage(
             outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": str(exc)[:160]})
             continue
         if not same_values:
-            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s, tables=bundle.tables or None)
+            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s, tables=bundle.tables or None, executable=reference_executable)
             if not stored.get("ok"):
                 error = str(stored.get("error") or "")
                 if "stopped" in error or "abandoned" in error:
@@ -760,7 +782,7 @@ def _fixture_stage(
             # An empty reference result proves nothing: any query returning nothing would match.
             outcome["fixtures"].append({"fixture": fixture_name, "status": "no_evidence", "reason": "the reference returns no rows on this fixture"})
             continue
-        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s, tables=bundle.tables or None)
+        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s, tables=bundle.tables or None, executable=executable)
         if result.get("untranslatable"):
             # A construct whose DuckDB translation is not verified: the fixtures cannot judge
             # this statement at all. Say which construct; never a verdict.

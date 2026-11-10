@@ -31,7 +31,9 @@ class _Supported:
     """Engines benchkit can build right now. Postgres counts only when a server is configured."""
 
     def _engines(self) -> tuple[str, ...]:
-        return ("sqlite", "duckdb") + (("postgres",) if pg_dsn() else ())
+        # BigQuery counts when the sandbox project is configured: its "databases" are the seeds
+        # loaded into the sandbox (offline bench use only).
+        return ("sqlite", "duckdb") + (("postgres",) if pg_dsn() else ()) + (("bigquery",) if os.environ.get("SQLGAMI_BQ_PROJECT") else ())
 
     def __contains__(self, engine: object) -> bool:
         return engine in self._engines()
