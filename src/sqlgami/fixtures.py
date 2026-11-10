@@ -476,6 +476,7 @@ def _rows_for(
                     seen_keys.add(restated_key)
                     rows.append(restated)
     R.apply_column_rules(rules.column_rules, qualified, names, rows)
+    R.apply_derived(rules.column_rules, qualified, names, [_fixture_type(c.type, catalog.dialect) for c in columns], rows)
     if key_columns and any(r.kind != "grid" and r.table == qualified for r in rules.column_rules):
         keys = [tuple(r[names.index(c.name.lower())] for c in columns if c.name.lower() in key_columns) for r in rows]
         if len(set(keys)) != len(keys):

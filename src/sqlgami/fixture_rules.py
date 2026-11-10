@@ -15,7 +15,10 @@ column names; a rule names its columns and is validated against the catalogue.
           copy: {hire_dt: hr.employee_dim.hire_dt, term_dt: hr.employee_dim.term_dt}
           snapshot: {column: snap_dt, equals: period_end_dt, restated_rate: 0.3}
 
-``date_step`` spaces a date column evenly within each group; ``one_true`` makes exactly one row
+``derive`` sets a column from a SQL expression over the row's other columns (``{kind: derive,
+column: hr.pay_period_dim.period_start_dt, sql: "ppe_dt - INTERVAL 13 DAY"}``), evaluated by
+DuckDB after the table is generated; ``date_step`` spaces a date column evenly within each group
+(``anchor: 2026-06-20`` puts that date on the middle row so the dates run either side of it); ``one_true`` makes exactly one row
 per group TRUE; ``sequence`` numbers rows consecutively in ``order_by`` order, zero at the row
 where ``zero_where`` is TRUE (negative before, positive after); ``grid`` replaces a table's
 generated rows with one row per combination of the named parent values (filtered, bounded by a
@@ -33,7 +36,7 @@ from typing import Any, Callable, Sequence
 
 from .errors import ConfigurationError
 
-KINDS = ("date_step", "one_true", "sequence", "grid")
+KINDS = ("date_step", "one_true", "sequence", "grid", "derive")
 
 
 @dataclass
@@ -85,6 +88,8 @@ def validate_rules(rules: Sequence[ColumnRule], columns_of: Callable[[str], list
                     check(rule.table, str(spec["zero_where"]), "sequence zero_where")
             if rule.kind == "date_step" and not spec.get("step"):
                 problems.append(f"date_step {spec['column']}: step is required ('14 days' or {{group: '14 days'}})")
+            if rule.kind == "derive" and not str(spec.get("sql") or "").strip():
+                problems.append(f"derive {spec['column']}: sql is required")
         else:
             for column, source in spec["per"].items():
                 check(rule.table, column, f"grid per {column}")
@@ -131,6 +136,31 @@ def _add(date: dt.date, step: dt.timedelta | tuple[str, int], times: int) -> dt.
     return dt.date(date.year + year, month + 1, min(date.day, 28))
 
 
+def apply_derived(rules: Sequence[ColumnRule], table: str, names: list[str], types: Sequence[str], rows: list[list[Any]]) -> None:
+    """``derive`` rules: each column set from its SQL expression over the row, through DuckDB
+    (the fixture engine), in the order declared."""
+    derived = [r for r in rules if r.table == table and r.kind == "derive"]
+    if not derived or not rows:
+        return
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute("SET TimeZone = 'UTC'")
+    conn.execute("CREATE TABLE t (" + ", ".join(f'"{n}" {t}' for n, t in zip(names, types)) + ")")
+    conn.executemany("INSERT INTO t VALUES (" + ", ".join("?" for _ in names) + ")", [tuple(r) for r in rows])
+    conn.execute("ALTER TABLE t ADD COLUMN __ord INTEGER")
+    conn.execute("UPDATE t SET __ord = rowid")
+    for rule in derived:
+        column = rule.spec["column"].rpartition(".")[2].lower()
+        try:
+            conn.execute(f'UPDATE t SET "{column}" = ({rule.spec["sql"]})')
+        except Exception as exc:
+            raise ConfigurationError(f"derive {rule.spec['column']}: {exc}") from exc
+    fresh = conn.execute("SELECT " + ", ".join(f'"{n}"' for n in names) + " FROM t ORDER BY __ord").fetchall()
+    for i, row in enumerate(fresh):
+        rows[i][:] = list(row)
+
+
 def _groups(rows: list[list[Any]], names: list[str], per: Sequence[str]) -> dict[tuple, list[int]]:
     groups: dict[tuple, list[int]] = {}
     indexes = [names.index(p.lower()) for p in per]
@@ -151,12 +181,19 @@ def apply_column_rules(rules: Sequence[ColumnRule], table: str, names: list[str]
         per = [str(p) for p in (spec.get("per") or [])]
         if rule.kind == "date_step":
             start = spec.get("start")
-            start_date = dt.date.fromisoformat(str(start)) if start else dt.date(2024, 1, 5)
+            anchor = spec.get("anchor")
             steps = spec["step"]
             for key, members in _groups(rows, names, per).items():
                 step = _step(steps.get(str(key[0]), next(iter(steps.values()))) if isinstance(steps, dict) and key else steps if not isinstance(steps, dict) else next(iter(steps.values())))
-                for n, i in enumerate(members):
-                    rows[i][col] = _add(start_date, step, n)
+                if anchor:
+                    # the middle row carries the anchor date; earlier rows run back from it
+                    middle = len(members) // 2
+                    for n, i in enumerate(members):
+                        rows[i][col] = _add(dt.date.fromisoformat(str(anchor)), step, n - middle)
+                else:
+                    start_date = dt.date.fromisoformat(str(start)) if start else dt.date(2024, 1, 5)
+                    for n, i in enumerate(members):
+                        rows[i][col] = _add(start_date, step, n)
         elif rule.kind == "one_true":
             at = str(spec.get("at") or "middle")
             for members in _groups(rows, names, per).values():

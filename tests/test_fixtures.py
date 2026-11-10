@@ -12,6 +12,7 @@ from sqlgami import Catalog, fixtures
 from sqlgami.errors import ConfigurationError
 
 duckdb = pytest.importorskip("duckdb")
+D = dt.date
 
 
 def _catalog() -> Catalog:
@@ -140,7 +141,7 @@ def test_fixtures_depend_on_logical_schema_only_not_the_dialect_spelling():
 
 
 HR_SHAPE = """
-CREATE TABLE hr.pay_period_dim (ppe_dt DATE, freq_cd TEXT, period_seq INTEGER, is_current_flag BOOLEAN, PRIMARY KEY (ppe_dt, freq_cd));
+CREATE TABLE hr.pay_period_dim (ppe_dt DATE, period_start_dt DATE, freq_cd TEXT, period_seq INTEGER, is_current_flag BOOLEAN, PRIMARY KEY (ppe_dt, freq_cd));
 CREATE TABLE hr.employee_dim (assoc_id INTEGER PRIMARY KEY, hire_dt DATE, term_dt DATE);
 CREATE TABLE hr.emp_period_snapshot (assoc_id INTEGER REFERENCES hr.employee_dim(assoc_id), period_end_dt DATE, snap_dt DATE, status_cd TEXT, hire_dt DATE, term_dt DATE,
     PRIMARY KEY (assoc_id, period_end_dt, snap_dt));
@@ -149,9 +150,12 @@ HR_RULES = {
     "seed": 5,
     "profiles": ["clean"],
     "rows": {"hr.pay_period_dim": 30, "hr.employee_dim": 12},
+    "dates": {"start": "2025-01-01", "end": "2027-06-30"},
     "values": {"hr.pay_period_dim.freq_cd": ["B", "W"], "hr.emp_period_snapshot.status_cd": ["A", "L", "T"]},
     "rules": [
-        {"kind": "date_step", "column": "hr.pay_period_dim.ppe_dt", "per": ["freq_cd"], "step": {"B": "14 days", "W": "7 days"}, "start": "2024-01-05"},
+        {"kind": "derive", "column": "hr.employee_dim.term_dt", "sql": "CASE WHEN term_dt < hire_dt THEN NULL ELSE term_dt END"},  # a leaver left after joining
+        {"kind": "date_step", "column": "hr.pay_period_dim.ppe_dt", "per": ["freq_cd"], "step": {"B": "14 days", "W": "7 days"}, "anchor": "2026-06-20"},
+        {"kind": "derive", "column": "hr.pay_period_dim.period_start_dt", "sql": "ppe_dt - INTERVAL 13 DAY"},
         {"kind": "one_true", "column": "hr.pay_period_dim.is_current_flag", "per": ["freq_cd"], "at": "middle"},
         {"kind": "sequence", "column": "hr.pay_period_dim.period_seq", "order_by": "ppe_dt", "per": ["freq_cd"], "zero_where": "is_current_flag"},
         {
@@ -175,7 +179,8 @@ def test_declared_rules_shape_period_and_snapshot_tables():
     assert conn.execute("SELECT freq_cd, COUNT(*) FILTER (WHERE is_current_flag) FROM hr.pay_period_dim GROUP BY freq_cd ORDER BY 1").fetchall() == [("B", 1), ("W", 1)]
     gaps = conn.execute("SELECT DISTINCT ppe_dt - LAG(ppe_dt) OVER (ORDER BY ppe_dt) FROM hr.pay_period_dim WHERE freq_cd = 'B' QUALIFY LAG(ppe_dt) OVER (ORDER BY ppe_dt) IS NOT NULL").fetchall()
     assert gaps == [(14,)]  # DuckDB DATE - DATE is days
-    assert conn.execute("SELECT period_seq FROM hr.pay_period_dim WHERE freq_cd = 'B' AND is_current_flag").fetchone() == (0,)
+    assert conn.execute("SELECT period_seq, ppe_dt FROM hr.pay_period_dim WHERE freq_cd = 'B' AND is_current_flag").fetchone() == (0, D(2026, 6, 20))  # the anchor is the current period
+    assert conn.execute("SELECT COUNT(*) FROM hr.pay_period_dim WHERE period_start_dt <> ppe_dt - INTERVAL 13 DAY").fetchone()[0] == 0  # derived
     seqs = [r[0] for r in conn.execute("SELECT period_seq FROM hr.pay_period_dim WHERE freq_cd = 'B' ORDER BY ppe_dt").fetchall()]
     assert seqs == list(range(seqs[0], seqs[0] + len(seqs))) and seqs[0] < 0 < seqs[-1]
     # the snapshot grid: biweekly periods only, inside each employee's tenure, snap_dt = period_end_dt plus restatements
