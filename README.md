@@ -438,6 +438,17 @@ fixtures:
   param_columns: {manager_id: [hr.emp_period_snapshot.lvl_3_id]}
 ```
 
+Synthetic fixtures follow the schema's keys and your `values`/`null_rate`
+declarations; for period and snapshot tables that is not enough (a random
+`is_current_flag`, a `period_seq` unrelated to its date), so the `fixtures:`
+block takes declared **rules**, applied as written and validated against the
+catalogue: `date_step` (a date column evenly spaced per group), `one_true`
+(exactly one TRUE per group), `sequence` (consecutive integers in a column's
+order, zero at the TRUE row), and `grid` (a table's rows are one per
+combination of parent values — each employee × each biweekly period within
+their tenure — with copied parent columns and a snapshot date plus restated
+rows). See `sqlgami.fixture_rules`.
+
 Live, `Scorer("duckdb", db=conn, bundle="bundle/")` loads only the bundle (its
 schema hash must match the catalogue; the fixtures go into in-memory DuckDB
 once, at construction). For a question with a reference — chosen by

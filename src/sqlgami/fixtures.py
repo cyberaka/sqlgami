@@ -61,6 +61,7 @@ class FixtureRules:
     params: dict[str, list[Any]] = field(default_factory=dict)
     param_columns: dict[str, list[str]] = field(default_factory=dict)
     critical_rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    column_rules: list[Any] = field(default_factory=list)  # declared date_step / one_true / sequence / grid rules
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "FixtureRules":
@@ -82,6 +83,7 @@ class FixtureRules:
             params={str(k): list(v) if isinstance(v, (list, tuple)) else [v] for k, v in (data.get("params") or {}).items()},
             param_columns={str(k): [str(c).lower() for c in v] for k, v in (data.get("param_columns") or {}).items()},
             critical_rows={str(k).lower(): [dict(r) for r in v] for k, v in (data.get("critical_rows") or {}).items()},
+            column_rules=__import__("sqlgami.fixture_rules", fromlist=["parse_rules"]).parse_rules(data.get("rules")),
         )
 
 
@@ -250,14 +252,25 @@ def build(catalog: Catalog, rules: FixtureRules | dict[str, Any] | None = None, 
 def build_one(catalog: Catalog, rules: FixtureRules, profile: str) -> Fixture:
     if profile not in PROFILES:
         raise ConfigurationError(f"unknown fixture profile {profile!r}")
+    from . import fixture_rules as R
+
     tables = _tables(catalog)
-    order = _topological(tables)
+    grid_parents: dict[str, list[str]] = {}
+    for rule in rules.column_rules:
+        if rule.kind == "grid":
+            sources = list(rule.spec["per"].values()) + list((rule.spec.get("copy") or {}).values()) + list((rule.spec.get("where") or {}).keys())
+            grid_parents[rule.table] = sorted({str(v).rpartition(".")[0].lower() for v in sources})
+    order = _topological(tables, grid_parents)
+    problems = R.validate_rules(rules.column_rules, lambda t: [c.name for c in tables[t].columns] if t in tables else None)
+    if problems:
+        raise ConfigurationError("fixture rules: " + "; ".join(problems))
     rng = random.Random(f"sqlgami-fixture:{profile}:{rules.seed}")
     data: dict[str, tuple[list[str], list[tuple]]] = {}
     for qualified in order:
         table = tables[qualified]
         columns = [c.name.lower() for c in table.columns]  # fixtures are case-insensitive DuckDB: one spelling
-        rows = _rows_for(catalog, table, qualified, tables, data, rules, profile, rng)
+        grid = next((r for r in rules.column_rules if r.kind == "grid" and r.table == qualified), None)
+        rows = _rows_for(catalog, table, qualified, tables, data, rules, profile, rng, grid=grid)
         data[qualified] = (columns, rows)
     name = f"{profile}-s{rules.seed}"
     ddl, types = _ddl(catalog, [tables[q] for q in order], [q for q in order])
@@ -350,16 +363,17 @@ def _parent_of(fk: Any, tables: dict[str, Table], qualified: str) -> str | None:
     return None
 
 
-def _topological(tables: dict[str, Table]) -> list[str]:
+def _topological(tables: dict[str, Table], extra_parents: dict[str, list[str]] | None = None) -> list[str]:
+    """Parents before children: by foreign key, and by the parents a grid rule draws from."""
     order: list[str] = []
     seen: set[str] = set()
 
     def visit(name: str, stack: tuple[str, ...]) -> None:
         if name in seen or name in stack:
             return
-        for fk in tables[name].foreign_keys:
-            parent = _parent_of(fk, tables, name)
-            if parent and parent != name:
+        parents = [_parent_of(fk, tables, name) for fk in tables[name].foreign_keys] + list((extra_parents or {}).get(name, []))
+        for parent in parents:
+            if parent and parent != name and parent in tables:
                 visit(parent, stack + (name,))
         seen.add(name)
         order.append(name)
@@ -378,7 +392,10 @@ def _rows_for(
     rules: FixtureRules,
     profile: str,
     rng: random.Random,
+    grid: Any = None,
 ) -> list[tuple]:
+    from . import fixture_rules as R
+
     columns = list(table.columns)
     names = [c.name.lower() for c in columns]
     is_parent = any(_parent_of(fk, tables, q) == qualified for q, t in tables.items() for fk in t.foreign_keys)
@@ -405,6 +422,20 @@ def _rows_for(
             parent_pool[col] = pool
     attempts = 0
     base = 0  # generated rows, not counting duplicates and restatements
+    if grid is not None:
+        # The host declared the table's grain: one row per combination of parent values.
+        by_name = {c.name.lower(): c for c in columns}
+
+        def generate(name: str, index: int) -> Any:
+            column = by_name[name]
+            value = _value(column, name, f"{qualified}.{name}", index, rules, profile, rng, catalog, table)
+            rate = rules.null_rate.get(f"{qualified}.{name}", rules.null_rate.get(f"{table.name.lower()}.{name}"))
+            if rate is None:
+                rate = 0.0 if column.nullable is False else (0.2 if profile == "nulls" else 0.0 if profile == "clean" else 0.05)
+            return None if value is not None and rate and rng.random() < rate else value
+
+        rows = R.grid_rows(grid, names, data, generate, rng)
+        count = 0  # nothing else generated
     while base < count and attempts < count * 10:
         attempts += 1
         row: list[Any] = []
@@ -444,6 +475,11 @@ def _rows_for(
                 if not key_columns or restated_key not in seen_keys:
                     seen_keys.add(restated_key)
                     rows.append(restated)
+    R.apply_column_rules(rules.column_rules, qualified, names, rows)
+    if key_columns and any(r.kind != "grid" and r.table == qualified for r in rules.column_rules):
+        keys = [tuple(r[names.index(c.name.lower())] for c in columns if c.name.lower() in key_columns) for r in rows]
+        if len(set(keys)) != len(keys):
+            raise ConfigurationError(f"fixture rules on {qualified} produce duplicate keys {sorted(key_columns)}: add the grouping column to the key or to per:")
     # the parameter values questions are asked with must occur in the columns they select on
     for param, values in rules.params.items():
         for qualified_column in rules.param_columns.get(param, []):

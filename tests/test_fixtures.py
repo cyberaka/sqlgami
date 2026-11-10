@@ -137,3 +137,62 @@ def test_fixtures_depend_on_logical_schema_only_not_the_dialect_spelling():
     assert a.digest() == c.digest(), (a.ddl, c.ddl)  # a three-part BigQuery name is the logical schema.table
     assert a.views_digest() == c.views_digest(), (a.ddl, c.ddl)
     assert set(a.tables) == set(c.tables) == {"shop.customers", "shop.orders"}
+
+
+HR_SHAPE = """
+CREATE TABLE hr.pay_period_dim (ppe_dt DATE, freq_cd TEXT, period_seq INTEGER, is_current_flag BOOLEAN, PRIMARY KEY (ppe_dt, freq_cd));
+CREATE TABLE hr.employee_dim (assoc_id INTEGER PRIMARY KEY, hire_dt DATE, term_dt DATE);
+CREATE TABLE hr.emp_period_snapshot (assoc_id INTEGER REFERENCES hr.employee_dim(assoc_id), period_end_dt DATE, snap_dt DATE, status_cd TEXT, hire_dt DATE, term_dt DATE,
+    PRIMARY KEY (assoc_id, period_end_dt, snap_dt));
+"""
+HR_RULES = {
+    "seed": 5,
+    "profiles": ["clean"],
+    "rows": {"hr.pay_period_dim": 30, "hr.employee_dim": 12},
+    "values": {"hr.pay_period_dim.freq_cd": ["B", "W"], "hr.emp_period_snapshot.status_cd": ["A", "L", "T"]},
+    "rules": [
+        {"kind": "date_step", "column": "hr.pay_period_dim.ppe_dt", "per": ["freq_cd"], "step": {"B": "14 days", "W": "7 days"}, "start": "2024-01-05"},
+        {"kind": "one_true", "column": "hr.pay_period_dim.is_current_flag", "per": ["freq_cd"], "at": "middle"},
+        {"kind": "sequence", "column": "hr.pay_period_dim.period_seq", "order_by": "ppe_dt", "per": ["freq_cd"], "zero_where": "is_current_flag"},
+        {
+            "kind": "grid",
+            "table": "hr.emp_period_snapshot",
+            "per": {"assoc_id": "hr.employee_dim.assoc_id", "period_end_dt": "hr.pay_period_dim.ppe_dt"},
+            "where": {"hr.pay_period_dim.freq_cd": "B"},
+            "between": {"column": "period_end_dt", "start": "hr.employee_dim.hire_dt", "end": "hr.employee_dim.term_dt"},
+            "copy": {"hire_dt": "hr.employee_dim.hire_dt", "term_dt": "hr.employee_dim.term_dt"},
+            "snapshot": {"column": "snap_dt", "equals": "period_end_dt", "restated_rate": 0.3},
+        },
+    ],
+}
+
+
+def test_declared_rules_shape_period_and_snapshot_tables():
+    cat = Catalog.from_ddl(HR_SHAPE, "duckdb", snapshot_columns={"hr.emp_period_snapshot": "snap_dt"})
+    fixture = fixtures.build(cat, HR_RULES)[0]
+    conn = fixture.connect()
+    # exactly one current period per frequency, 14-day biweekly steps, period_seq consecutive and 0 at the current one
+    assert conn.execute("SELECT freq_cd, COUNT(*) FILTER (WHERE is_current_flag) FROM hr.pay_period_dim GROUP BY freq_cd ORDER BY 1").fetchall() == [("B", 1), ("W", 1)]
+    gaps = conn.execute("SELECT DISTINCT ppe_dt - LAG(ppe_dt) OVER (ORDER BY ppe_dt) FROM hr.pay_period_dim WHERE freq_cd = 'B' QUALIFY LAG(ppe_dt) OVER (ORDER BY ppe_dt) IS NOT NULL").fetchall()
+    assert gaps == [(14,)]  # DuckDB DATE - DATE is days
+    assert conn.execute("SELECT period_seq FROM hr.pay_period_dim WHERE freq_cd = 'B' AND is_current_flag").fetchone() == (0,)
+    seqs = [r[0] for r in conn.execute("SELECT period_seq FROM hr.pay_period_dim WHERE freq_cd = 'B' ORDER BY ppe_dt").fetchall()]
+    assert seqs == list(range(seqs[0], seqs[0] + len(seqs))) and seqs[0] < 0 < seqs[-1]
+    # the snapshot grid: biweekly periods only, inside each employee's tenure, snap_dt = period_end_dt plus restatements
+    assert conn.execute("SELECT COUNT(*) FROM hr.emp_period_snapshot s WHERE s.period_end_dt NOT IN (SELECT ppe_dt FROM hr.pay_period_dim WHERE freq_cd = 'B')").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM hr.emp_period_snapshot s JOIN hr.employee_dim e USING (assoc_id) WHERE s.period_end_dt < e.hire_dt OR (e.term_dt IS NOT NULL AND s.period_end_dt > e.term_dt)").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM hr.emp_period_snapshot WHERE snap_dt = period_end_dt").fetchone()[0] > 0
+    assert conn.execute("SELECT COUNT(*) FROM hr.emp_period_snapshot WHERE snap_dt > period_end_dt").fetchone()[0] > 0
+    assert conn.execute("SELECT COUNT(*) FROM hr.emp_period_snapshot WHERE hire_dt IS NULL").fetchone()[0] == 0  # copied from the parent
+    # "headcount at the current period" is a real number on this fixture, not zero
+    assert conn.execute("SELECT COUNT(DISTINCT assoc_id) FROM hr.emp_period_snapshot s JOIN hr.pay_period_dim p ON p.ppe_dt = s.period_end_dt WHERE p.is_current_flag AND p.freq_cd = 'B' AND s.snap_dt = s.period_end_dt").fetchone()[0] > 0
+    # deterministic
+    assert fixtures.build(cat, HR_RULES)[0].digest() == fixture.digest()
+
+
+def test_rules_are_validated_against_the_catalogue():
+    cat = Catalog.from_ddl(HR_SHAPE, "duckdb")
+    with pytest.raises(ConfigurationError, match="no column nope"):
+        fixtures.build(cat, {"profiles": ["clean"], "rules": [{"kind": "one_true", "column": "hr.pay_period_dim.nope"}]})
+    with pytest.raises(ConfigurationError, match="kind must be one of"):
+        fixtures.build(cat, {"profiles": ["clean"], "rules": [{"kind": "magic", "column": "hr.pay_period_dim.ppe_dt"}]})
