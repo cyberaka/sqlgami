@@ -19,8 +19,13 @@ duckdb = ["duckdb>=1.1"]
 postgres = [
     "psycopg[binary]>=3.2",
 ]
-bigquery = ["google-cloud-bigquery>=3.25"]
+bigquery = ["google-cloud-bigquery>=3.25"]  # offline only: dry runs and native reference runs in the sandbox
 excel = ["openpyxl>=3.1"]  # reading a term catalogue from .xlsx; CSV needs nothing
+# The compile step (fixtures + reference fingerprints) and the live fixture stage run on DuckDB
+# and read a YAML config.
+bundle = ["duckdb>=1.1", "pyyaml>=6"]
+# Everything a shadow-mode pilot needs: the bundle, a workbook, and the doctor.
+pilot = ["duckdb>=1.1", "pyyaml>=6", "openpyxl>=3.1"]
 # The Hugging Face generator for the consistency stage uses only the standard library.
 hf = []
 
@@ -38,6 +43,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sqlgami"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/sqlgami", "README.md", "LICENSE", "docs/adr", "examples/terms"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

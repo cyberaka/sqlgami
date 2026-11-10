@@ -1,0 +1,3 @@
+kpi,phrases,formula,format,requires,reference_sql,description
+headcount,headcount;active headcount;active_n,COUNT(DISTINCT {assoc_id}),integer,active;authoritative_snapshot,,"Distinct active associates at a period."
+basis_points,basis points;bp,CAST(FLOOR({rate} * 10000) AS INT64),integer floor,,,"A rate reported in basis points, floored to an integer."

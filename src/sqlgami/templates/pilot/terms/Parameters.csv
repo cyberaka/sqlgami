@@ -1,0 +1,5 @@
+name,type,example_values
+manager_id,integer,12003
+n,integer,8
+assoc_id,input,
+rate,input,

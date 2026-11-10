@@ -47,6 +47,15 @@ def _parser() -> argparse.ArgumentParser:
     compile_ = sub.add_parser("compile", help="build the bundle live scoring loads: fixtures and reference fingerprints (offline; also: train)")
     compile_.add_argument("config", help="a YAML config: dialect, schema, terms, fixtures, references")
     compile_.add_argument("-o", "--out", required=True, help="the bundle folder to write")
+
+    init = sub.add_parser("init", help="write the pilot template (a BigQuery snapshot-style schema, workbook and compile config) into a folder")
+    init.add_argument("folder")
+    init.add_argument("--force", action="store_true", help="overwrite files that exist")
+
+    doctor = sub.add_parser("doctor", help="check a compile config offline: the workbook, the fixture rules, the table map, and which constructs in your queries the fixture translation has not verified")
+    doctor.add_argument("config", help="the compile config (sqlgami.yaml)")
+    doctor.add_argument("--queries", help="a .sql file or a folder of .sql files: your own queries, read locally, never executed")
+    doctor.add_argument("--json", action="store_true")
     return parser
 
 
@@ -55,6 +64,28 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "train":
         argv[0] = "compile"
     args = _parser().parse_args(argv)
+    if args.command == "init":
+        from .doctor import init_pilot
+
+        try:
+            written = init_pilot(args.folder, force=args.force)
+        except SqlgamiError as exc:
+            print(f"sqlgami: {exc}", file=sys.stderr)
+            return 2
+        for path in written:
+            print(f"wrote {path}")
+        print(f"next: edit {args.folder}/schema.sql and {args.folder}/terms/, then: sqlgami doctor {args.folder}/sqlgami.yaml")
+        return 0
+    if args.command == "doctor":
+        from .doctor import _json, diagnose
+
+        try:
+            diagnosis = diagnose(args.config, args.queries)
+        except SqlgamiError as exc:
+            print(f"sqlgami: {exc}", file=sys.stderr)
+            return 2
+        print(_json(diagnosis) if args.json else diagnosis.text())
+        return 0 if diagnosis.ok else 1
     if args.command == "compile":
         from .bundle import compile_bundle
 

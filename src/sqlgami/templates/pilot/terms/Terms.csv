@@ -1,0 +1,12 @@
+term,phrases,kind,table,sql,nulls,description,qualifiers
+active,active;currently active;active headcount,filter,hr.emp_period_snapshot,status_cd = 'A',,"An authoritative snapshot row is active when status_cd = 'A'. NULL is not active.",authoritative
+on_leave,on leave,filter,hr.emp_period_snapshot,status_cd = 'L',,"status_cd = 'L'.",
+not_on_leave,not on leave,filter,hr.emp_period_snapshot,status_cd IS DISTINCT FROM 'L',include,"Everyone whose status is not 'L'; an unknown (NULL) status counts as not on leave.",
+authoritative_snapshot,authoritative;authoritative snapshot;as of period end,filter,hr.emp_period_snapshot,snap_dt = period_end_dt,,"The row taken at the period's end; later snap_dt rows are restatements.",current
+current_pay_period,current pay period;this pay period,filter,hr.pay_period_dim,is_current_flag = TRUE AND freq_cd = 'B',,"The single biweekly period flagged current.",biweekly
+last_n_pay_periods,last {n} pay periods;past {n} pay periods;trailing {n} pay periods,window,hr.pay_period_dim,period_seq BETWEEN -({n}-1) AND 0,,"A window of N biweekly periods ending at the current one.",biweekly
+n_pay_periods_ago,{n} pay periods ago,window,hr.pay_period_dim,period_seq = -{n},,"The single period N before the current one.",biweekly
+hire_date,hire date;hired,source,,hr.employee_dim.hire_dt,,"Hire dates are read from employee_dim, never from the snapshot's copy.",
+my_organisation,my organisation;my org;my team,chain,hr.emp_period_snapshot,"lvl_2_id, lvl_3_id, lvl_4_id, lvl_2_id_fn, lvl_3_id_fn, lvl_4_id_fn = {manager_id}",,"A manager's organisation: every row whose reporting OR functional chain contains the manager.",
+not_contractor,not contractors;non-contractors,filter,hr.emp_period_snapshot,assoc_type IS DISTINCT FROM 'Contractor',include,"Anyone whose employment type is not 'Contractor'; unknown counts as not a contractor.",
+top_dense_ranks,top {n} ranks;top {n} dense ranks,rank,,DENSE_RANK() <= {n},,"The top N dense ranks: ties kept, no rank skipped.",

@@ -344,3 +344,28 @@ def test_every_term_kind_and_policy_applies_to_three_part_names():
     assert not report.has("term_source_not_read") and not report.has("required_predicate")
     # the policy still bites when the chain is absent
     assert sc.explain(sql.replace(" AND {manager_id} IN (s.lvl_2_id, s.lvl_3_id)", ""), "active people", params={"manager_id": 7}).has("required_predicate")
+
+
+def test_pilot_template_initialises_passes_the_doctor_and_compiles(tmp_path):
+    """The shipped pilot template is a working shadow-mode setup: init, doctor (clean), compile
+    synthetic-only, score with the bundle; the doctor names unverified constructs in a query file."""
+    from sqlgami import Scorer
+    from sqlgami.doctor import diagnose, init_pilot
+
+    written = init_pilot(tmp_path / "pilot")
+    assert {p.name for p in written} >= {"schema.sql", "sqlgami.yaml", "Terms.csv", "Examples.csv"}
+    (tmp_path / "pilot" / "q.sql").write_text("SELECT JSON_EXTRACT_SCALAR(segment, '$.a') FROM `my-project.hr.emp_period_snapshot`")
+    diagnosis = diagnose(tmp_path / "pilot" / "sqlgami.yaml", tmp_path / "pilot" / "q.sql")
+    assert diagnosis.ok, diagnosis.problems
+    assert diagnosis.unverified == {"func:JSON_EXTRACT_SCALAR": ["q.sql"]}
+    from sqlgami.bundle import compile_bundle
+
+    bundle = compile_bundle(tmp_path / "pilot" / "sqlgami.yaml", tmp_path / "pilot" / "bundle")
+    assert bundle.manifest["references"] == 2 and bundle.manifest["rejected"] == 0
+    with Scorer("bigquery", catalog=(tmp_path / "pilot" / "schema.sql").read_text(), bundle=tmp_path / "pilot" / "bundle") as scorer:
+        report = scorer.score("DECLARE mgr INT64 DEFAULT 12003;\nSELECT COUNT(DISTINCT s.assoc_id) AS active_n FROM `my-project.hr.emp_period_snapshot` s JOIN `my-project.hr.pay_period_dim` p ON p.ppe_dt = s.period_end_dt AND p.freq_cd = 'B' WHERE p.is_current_flag AND s.snap_dt = s.period_end_dt AND s.status_cd = 'A' AND mgr IN (s.lvl_2_id, s.lvl_3_id, s.lvl_4_id, s.lvl_2_id_fn, s.lvl_3_id_fn, s.lvl_4_id_fn)", "What is the current active headcount of my organisation?")
+        assert report.signals["fixtures"]["verdict"] == "match" and report.verdict.value == "likely_right"
+    # a broken workbook is a named problem, not a crash
+    (tmp_path / "pilot" / "terms" / "Terms.csv").write_text("term,phrases,kind,table,sql,nulls,description\nactive,active,filtr,hr.emp_period_snapshot,status_cd = 'A',,\n")
+    broken = diagnose(tmp_path / "pilot" / "sqlgami.yaml")
+    assert not broken.ok and any("kind" in p for p in broken.problems)

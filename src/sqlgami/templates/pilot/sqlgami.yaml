@@ -1,0 +1,53 @@
+# sqlgami compile config for the pilot (ADR 0002): everything the live scorer needs is built
+# offline from this file into bundle/. No model is called unless you add an expansion: block.
+dialect: bigquery
+schema: schema.sql
+terms: terms            # the workbook: a folder of CSV sheets, or terms.xlsx
+
+# Your BigQuery names -> the fixture tables. Every three-part name in schema.sql is mapped
+# automatically; add entries only for names your queries use that the schema does not declare
+# (an alias dataset, a view in another project).
+tables: {}
+
+snapshot_columns:
+  hr.emp_period_snapshot: snap_dt
+
+required_predicates:
+  - name: hierarchy_access
+    description: Every read of the snapshot is scoped to a manager's subtree over both chains.
+    tables: [hr.emp_period_snapshot]
+    columns: [lvl_2_id, lvl_3_id, lvl_4_id, lvl_2_id_fn, lvl_3_id_fn, lvl_4_id_fn]
+    match: or_chain
+    severity: high
+
+# SYNTHETIC fixtures only (the default): no row of your data is read. Declare what the data
+# must look like; nothing is inferred.
+fixtures:
+  seed: 1
+  profiles: [clean, nulls, duplicates, ties, sparse, edges]
+  rows: {hr.pay_period_dim: 80, hr.employee_dim: 90, hr.emp_period_snapshot: 3000}
+  values:
+    hr.pay_period_dim.freq_cd: [B, W]
+    hr.emp_period_snapshot.status_cd: [A, A, A, L, T]
+    hr.emp_period_snapshot.assoc_type: [FTE, FTE, Contractor, Intern]
+    hr.emp_period_snapshot.segment: [Enterprise, MidMarket, SMB]
+  null_rate: {hr.emp_period_snapshot.assoc_type: 0.1, hr.employee_dim.term_dt: 0.6}
+  dates: {start: "2025-01-01", end: "2027-06-30"}
+  params: {manager_id: [12003]}
+  param_columns: {manager_id: [hr.emp_period_snapshot.lvl_3_id, hr.emp_period_snapshot.lvl_3_id_fn]}
+  rules:
+    - {kind: date_step, column: hr.pay_period_dim.ppe_dt, per: [freq_cd], step: {B: 14 days, W: 7 days}, anchor: "2026-06-20"}
+    - {kind: derive, column: hr.pay_period_dim.period_start_dt, sql: "CASE WHEN freq_cd = 'B' THEN ppe_dt - INTERVAL 13 DAY ELSE ppe_dt - INTERVAL 6 DAY END"}
+    - {kind: derive, column: hr.employee_dim.term_dt, sql: "CASE WHEN term_dt < hire_dt THEN NULL ELSE term_dt END"}
+    - {kind: one_true, column: hr.pay_period_dim.is_current_flag, per: [freq_cd], at: middle}
+    - {kind: sequence, column: hr.pay_period_dim.period_seq, order_by: ppe_dt, per: [freq_cd], zero_where: is_current_flag}
+    - kind: grid
+      table: hr.emp_period_snapshot
+      per: {assoc_id: hr.employee_dim.assoc_id, period_end_dt: hr.pay_period_dim.ppe_dt}
+      where: {hr.pay_period_dim.freq_cd: B}
+      between: {column: period_end_dt, start: hr.employee_dim.hire_dt, end: hr.employee_dim.term_dt}
+      copy: {hire_dt: hr.employee_dim.hire_dt, term_dt: hr.employee_dim.term_dt}
+      snapshot: {column: snap_dt, equals: period_end_dt, restated_rate: 0.3}
+
+# Optional, offline, one model call per term and per example; the live path never sees it.
+# expansion: {model: "hf:meta-llama/Llama-3.3-70B-Instruct", per_term: 6, per_example: 4}
