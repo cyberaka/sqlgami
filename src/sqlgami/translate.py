@@ -45,7 +45,7 @@ CORE = frozenset(
         "func:ARRAY_AGG", "func:GROUP_CONCAT", "func:ROW_NUMBER", "func:RANK", "func:DENSE_RANK", "func:LAG", "func:LEAD",
         "func:FIRST_VALUE", "func:LAST_VALUE", "clause:window",
         # scalar
-        "func:CAST", "func:TRY_CAST", "func:COALESCE", "func:IF", "func:CASE", "func:NULLIF", "func:GREATEST", "func:LEAST", "func:ABS", "func:ROUND",
+        "func:CAST", "func:TRY_CAST", "func:COALESCE", "func:IF", "func:CASE", "func:EXISTS", "func:NULLIF", "func:GREATEST", "func:LEAST", "func:ABS", "func:ROUND",
         "func:FLOOR", "func:CEIL", "func:SAFE_DIVIDE", "func:LOWER", "func:UPPER", "func:TRIM", "func:LENGTH",
         "func:CONCAT", "func:SUBSTRING", "func:STARTS_WITH", "func:ENDS_WITH", "func:REGEXP_LIKE",
         # dates
@@ -134,11 +134,11 @@ def map_tables(tree: exp.Expression, tables: Mapping[str, str] | None) -> dict[s
     return done
 
 
-def translate(sql: str, dialect: str, tables: Mapping[str, str] | None = None, target: str = "duckdb") -> Translation:
-    """``sql`` in ``dialect`` as DuckDB SQL, or :class:`Untranslatable`."""
+def translate(sql: str | exp.Expression, dialect: str, tables: Mapping[str, str] | None = None, target: str = "duckdb") -> Translation:
+    """``sql`` (text, or a parsed tree) in ``dialect`` as DuckDB SQL, or :class:`Untranslatable`."""
     if dialect == target:
-        return Translation(sql)
-    tree = sqlglot.parse_one(sql, read=dialect)
+        return Translation(sql if isinstance(sql, str) else sql.sql(dialect=target))
+    tree = sqlglot.parse_one(sql, read=dialect) if isinstance(sql, str) else sql.copy()
     used = constructs_of(tree)
     allowed = VERIFIED.get(dialect, CORE)
     unverified = sorted(c for c in used if c not in allowed)

@@ -224,11 +224,15 @@ def _reads_column_of(ctx: CheckContext, term: Term, dialect: str) -> bool:
 
 
 def _reads(ctx: CheckContext, tables: str) -> bool:
-    wanted = {t.strip().lower() for t in tables.split(";") if t.strip()}
+    wanted = {t.strip().lower().strip("`") for t in tables.split(";") if t.strip()}
     read: set[str] = set()
     for table in ctx.analysis.tables.values():
-        read.add(table.qualified_name.lower())
+        qualified = table.qualified_name.lower()
+        read.add(qualified)
         read.add(table.name.lower())
+        parts = qualified.split(".")
+        if len(parts) >= 3:
+            read.add(".".join(parts[-2:]))  # a three-part name is dataset.table to a term written without the project
     return any(w in read or w.split(".")[-1] in read for w in wanted)
 
 
@@ -366,7 +370,10 @@ def _conditions(ctx: CheckContext, column: str) -> list[tuple[_Cond, SelectModel
                 where = node.args.get("expression")
                 if where is not None:
                     tests.extend(flatten_and(where.this if isinstance(where, exp.Where) else where))
-            elif isinstance(node, exp.If) and isinstance(node.parent, exp.Case):
+            elif isinstance(node, exp.If):
+                # a CASE WHEN, or BigQuery's IF(cond, x, NULL) / IFF: the same conditional measure
+                tests.extend(flatten_and(node.this))
+            elif isinstance(node, exp.CountIf) and node.this is not None:
                 tests.extend(flatten_and(node.this))
             elif isinstance(node, exp.Anonymous) and (node.name or "").lower() in ("countif", "count_if") and node.expressions:
                 tests.extend(flatten_and(node.expressions[0]))

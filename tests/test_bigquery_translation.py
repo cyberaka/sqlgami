@@ -81,6 +81,8 @@ CASES = [
     ("SELECT FIRST_VALUE(id) OVER (ORDER BY d) AS f, LAST_VALUE(id) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM t ORDER BY id LIMIT 1", [(2, 4)], {"func:FIRST_VALUE", "func:LAST_VALUE"}),
     ("SELECT id FROM t WHERE d >= (SELECT MIN(d) FROM t) AND d < DATE_ADD((SELECT MIN(d) FROM t), INTERVAL 1 MONTH) ORDER BY id", [(2,)], set()),  # scalar-subquery date bounds; Jan 31 + 1 month clamps to Feb 29
     ("SELECT g, SUM(n) AS total FROM (SELECT g, d, COUNT(*) AS n FROM t GROUP BY g, d) GROUP BY g ORDER BY g", [("a", 2), ("b", 1), ("c", 1)], set()),  # two-level aggregation
+    ("SELECT id FROM t AS a WHERE EXISTS (SELECT 1 FROM t AS b WHERE b.g = a.g AND b.id <> a.id) ORDER BY id", [(1,), (3,)], {"func:EXISTS"}),
+    ("SELECT g, COUNT(DISTINCT IF(x > 5, id, NULL)) AS big FROM t GROUP BY g ORDER BY g", [("a", 1), ("b", 1), ("c", 0)], set()),  # IF() conditional aggregation
 ]
 
 
@@ -202,3 +204,104 @@ def test_native_bigquery_agrees_with_the_translation_on_every_case(conn, tmp_pat
         if sorted(map(repr, got)) != sorted(map(repr, translated)):
             disagreements.append((sql, got, translated))
     assert not disagreements, disagreements
+
+
+SCRIPT_TERMS = BQ_TERMS + "recent,recent;last {n} days,window,shop.orders,created_at >= DATE_SUB(DATE '2024-07-01'{comma} INTERVAL {n} DAY),,\n".replace("{comma}", ",")
+
+
+def test_declare_and_set_are_bound_into_the_final_query(bq_bundle):
+    """DECLARE … DEFAULT, SET (incl. reassignment and tuple SET), a variable declared without a
+    default and SET later, a variable used twice, an ARRAY used with IN UNNEST, and a scalar
+    subquery default: all bound before the term checks and the fixture run."""
+    from sqlgami import analysis as A
+
+    script = """
+    DECLARE start_dt DATE DEFAULT DATE_SUB(DATE '2024-07-01', INTERVAL 6 MONTH);
+    DECLARE cutoff DATE;
+    DECLARE regions ARRAY<STRING> DEFAULT ['north', 'south'];
+    DECLARE min_total NUMERIC DEFAULT 5;
+    SET cutoff = DATE '2024-07-01';
+    SET min_total = min_total * 2;
+    SET (lo, hi) = (1, 100);
+    SELECT c.region, COUNTIF(o.status = 'paid') AS paid_n, SAFE_DIVIDE(SUM(o.total), COUNT(*)) AS avg_total
+    FROM `proj-x.shop.orders` AS o JOIN `proj-x.shop.customers` AS c ON c.id = o.customer_id
+    WHERE o.created_at >= start_dt AND o.created_at < cutoff AND o.total >= min_total AND o.total BETWEEN lo AND hi
+      AND c.region IN UNNEST(regions)
+    GROUP BY c.region
+    """
+    bound, unbound = A.bind_script_text(script, "bigquery")
+    text = bound.sql(dialect="bigquery")
+    assert unbound == []
+    assert "start_dt" not in text and "cutoff" not in text and "min_total" not in text and "regions" not in text
+    assert "INTERVAL" in text and "'2024-07-01'" in text and "(5 * 2)" in text and "BETWEEN 1 AND 100" in text and "['north', 'south']" in text
+    # the fixture stage runs the bound query through the translation
+    from sqlgami.bundle import _executable
+
+    executable = _executable(script, "bigquery", {}, None, {"proj-x.shop.orders": "shop.orders", "proj-x.shop.customers": "shop.customers"})
+    assert "shop.orders" in executable and "UNNEST" in executable
+    # a variable the script never gives a value is not guessed
+    bound, unbound = A.bind_script_text("DECLARE k INT64;\nSELECT id FROM `proj-x.shop.orders` WHERE customer_id = k", "bigquery")
+    assert unbound == ["k"]
+    from sqlgami.translate import Untranslatable
+
+    with pytest.raises(Untranslatable, match="script variable k has no value"):
+        _executable("DECLARE k INT64;\nSELECT id FROM `proj-x.shop.orders` WHERE customer_id = k", "bigquery", {}, None, {"proj-x.shop.orders": "shop.orders"})
+
+
+def test_a_script_gets_a_fixture_verdict_and_its_terms_see_the_bound_values(bq_bundle):
+    from sqlgami import Scorer
+    from sqlgami.report import StageStatus
+
+    question = "Paid order count and average order total per region over the last six months"
+    script = (
+        "DECLARE since DATE DEFAULT DATE_SUB(DATE '2024-07-01', INTERVAL 6 MONTH);\n"
+        "SELECT c.region, COUNTIF(o.status = 'paid') AS paid_n, SAFE_DIVIDE(SUM(o.total), COUNT(*)) AS avg_total "
+        "FROM `proj-x.shop.orders` AS o JOIN `proj-x.shop.customers` AS c ON c.id = o.customer_id "
+        "WHERE o.created_at >= since GROUP BY c.region"
+    )
+    with Scorer("bigquery", catalog=BQ_DDL, bundle=bq_bundle) as scorer:
+        report = scorer.explain(script, question)
+        assert report.signals["script"]["statements"] == ["DECLARE", "SELECT"]
+        assert report.signals["fixtures"]["verdict"] == "match", report.summary()
+        assert report.stage("fixtures").status == StageStatus.PASSED
+        # the same script with a shifted window differs from the reference: a verdict, not an error
+        wrong = scorer.explain(script.replace("INTERVAL 6 MONTH", "INTERVAL 2 MONTH"), question)
+        assert wrong.signals["fixtures"]["verdict"] == "mismatch"
+        # an unbound variable: the fixtures cannot run it, and say so
+        unbound = scorer.explain("DECLARE since DATE;\n" + script.split(";\n", 1)[1], question)
+        assert unbound.stage("fixtures").status == StageStatus.NOT_RUN and "script variable since has no value" in (unbound.stage("fixtures").detail or "")
+
+
+def test_group_by_survives_script_parsing():
+    """sqlglot's multi-statement parse turns GROUP BY pp.ppe_dt into the projection alias; where a
+    joined table also has a column of that name, the bare alias would bind to the column."""
+    from sqlgami import analysis as A
+
+    script = (
+        "DECLARE n INT64 DEFAULT 1;\n"
+        "SELECT pp.period_seq, pp.ppe_dt AS period_end_dt, COUNT(*) AS c FROM periods AS pp LEFT JOIN snap AS e ON e.period_end_dt = pp.ppe_dt "
+        "WHERE pp.period_seq >= n GROUP BY pp.period_seq, pp.ppe_dt"
+    )
+    bound, _ = A.bind_script_text(script, "bigquery")
+    assert bound.args["group"].sql() == "GROUP BY pp.period_seq, pp.ppe_dt"
+
+
+def test_policies_and_terms_declared_without_a_project_apply_to_three_part_names():
+    """A rule or term written for hr.snap applies to `proj-x.hr.snap`, and a view read by its
+    three-part name is expanded to the base table the term is declared on."""
+    from sqlgami import Scorer
+    from sqlgami.terms import Catalogue
+
+    ddl = """
+    CREATE TABLE `proj-x.hr.snap` (assoc_id INT64, status_cd STRING, lvl_2_id INT64, lvl_3_id INT64, lvl_2_id_fn INT64, lvl_3_id_fn INT64);
+    CREATE VIEW `proj-x.hr.current_v` AS SELECT * FROM `proj-x.hr.snap` WHERE status_cd = 'A';
+    """
+    chain = {"name": "access", "tables": ["hr.snap"], "match": "or_chain", "columns": ["lvl_2_id", "lvl_3_id", "lvl_2_id_fn", "lvl_3_id_fn"]}
+    terms = Catalogue.from_sheets({"terms": "term,phrases,kind,table,sql,nulls,description\nactive,active,filter,hr.snap,status_cd = 'A',,\nmy_org,my organisation,chain,hr.snap,\"lvl_2_id, lvl_3_id, lvl_2_id_fn, lvl_3_id_fn = {manager_id}\",,\n", "parameters": "name,type,example_values\nmanager_id,integer,7\n"})
+    sc = Scorer("bigquery", catalog=ddl, required_predicates=[chain], terms=terms)
+    full = "SELECT COUNT(DISTINCT s.assoc_id) FROM `proj-x.hr.current_v` AS s WHERE s.status_cd = 'A' AND {manager_id} IN (s.lvl_2_id, s.lvl_3_id, s.lvl_2_id_fn, s.lvl_3_id_fn)"
+    report = sc.explain(full, "active headcount of my organisation", params={"manager_id": 7})
+    assert not report.has("required_predicate") and not report.has("term_source_not_read"), report.summary()
+    assert [o["status"] for o in report.signals["terms"]["outcomes"] if o["term"] in ("active", "my_org")] == ["satisfied", "satisfied"]
+    none = sc.explain("SELECT COUNT(DISTINCT s.assoc_id) FROM `proj-x.hr.current_v` AS s WHERE s.status_cd = 'A'", "active headcount of my organisation", params={"manager_id": 7})
+    assert none.has("required_predicate")

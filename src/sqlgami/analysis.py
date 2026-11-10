@@ -114,6 +114,11 @@ class Analysis:
     natural_joins: list[str] = field(default_factory=list)  # NATURAL joins as written, for reporting
     script_statements: list[str] = field(default_factory=list)
     variables: dict[str, str] = field(default_factory=dict)  # lower-cased name -> declared type
+    # Values the script gives its variables (DECLARE ... DEFAULT, SET), in script order; a
+    # variable the script never assigns has no entry. Bound into the final query before analysis.
+    variable_values: dict[str, exp.Expression] = field(default_factory=dict)
+    unbound_variables: list[str] = field(default_factory=list)  # referenced but never given a value
+    bound_sql: str | None = None  # the final query with its variables bound, for the fixture stage
     shadowed_variables: list[str] = field(default_factory=list)
 
     @property
@@ -178,17 +183,14 @@ def analyse(
         return analysis
     if len(statements) > 1 and dialect in _SCRIPT_DIALECTS and _is_script(statements):
         # A script: variable declarations and assignments, then the query that answers the question.
-        for statement in statements[:-1]:
-            analysis.script_statements.append(type(statement).__name__.upper())
-            if isinstance(statement, exp.Declare):
-                for item in statement.expressions:
-                    kind = item.args.get("kind")
-                    names = item.this if isinstance(item.this, list) else [item.this]
-                    for name in names:
-                        if name is not None:
-                            analysis.variables[name.name.lower()] = kind.sql(dialect=dialect) if kind else ""
-        analysis.script_statements.append("SELECT")
-        statements = statements[-1:]
+        shadowed = _shadowing_columns(statements[-1], catalog) if catalog is not None else set()
+        script = bind_script(statements, dialect, shadowed)
+        analysis.script_statements = [type(st).__name__.upper() for st in statements[:-1]] + ["SELECT"]
+        analysis.variables, analysis.variable_values, analysis.unbound_variables = script.variables, script.values, script.unbound
+        # The final query with its variables bound: what the term checks judge and the fixtures run.
+        statements = [script.query]
+        if not script.unbound:
+            analysis.bound_sql = script.query.sql(dialect=dialect)
     if len(statements) > 1:
         analysis.kind = MULTIPLE
         analysis.tree = statements[0]
@@ -231,6 +233,110 @@ def _sqlite_scalar_extremes(tree: exp.Expression) -> None:
 
 
 _SCRIPT_DIALECTS = {"bigquery"}
+
+
+@dataclass
+class BoundScript:
+    query: exp.Expression  # the final query with its variables bound
+    variables: dict[str, str] = field(default_factory=dict)  # name -> declared type
+    values: dict[str, exp.Expression] = field(default_factory=dict)
+    unbound: list[str] = field(default_factory=list)
+
+
+def _shadowing_columns(query: exp.Expression, catalog: Any) -> set[str]:
+    """Column names of the tables the query reads: a variable with such a name is shadowed by the
+    column in the engine, so it must not be substituted."""
+    names: set[str] = set()
+    for table in query.find_all(exp.Table):
+        try:
+            found = catalog.resolve(table.name, ".".join(p for p in (table.catalog, table.db) if p) or None, quoted=True) or catalog.resolve(table.name, ".".join(p for p in (table.catalog, table.db) if p) or None)
+        except Exception:
+            found = None
+        if found is not None:
+            names |= {c.name.lower() for c in found.columns}
+    return names
+
+
+def bind_script(statements: list[exp.Expression], dialect: str, shadowed: set[str] | None = None) -> BoundScript:
+    """DECLARE ... DEFAULT and SET, in script order, give the variables their values (a later SET
+    wins; a value may use earlier variables); the last statement is the query, returned with every
+    variable replaced by its value. A variable referenced without a value is listed in ``unbound``;
+    one whose name a column of the query's tables shadows is left to the column, as the engine does."""
+    out = BoundScript(_restore_group_aliases(statements[-1].copy()))
+    for statement in statements[:-1]:
+        if isinstance(statement, exp.Declare):
+            for item in statement.expressions:
+                kind = item.args.get("kind")
+                names = item.this if isinstance(item.this, list) else [item.this]
+                for name in names:
+                    if name is not None:
+                        out.variables[name.name.lower()] = kind.sql(dialect=dialect) if kind else ""
+                        default = item.args.get("default")
+                        if default is not None:
+                            out.values[name.name.lower()] = _substitute_variables(default.copy(), out.values)
+        elif isinstance(statement, exp.Set):
+            for item in statement.expressions:
+                target = item.this if isinstance(item, exp.SetItem) else item
+                if isinstance(target, exp.EQ):
+                    lhs, rhs = target.this, target.expression
+                    pairs = list(zip(lhs.expressions, rhs.expressions)) if isinstance(lhs, exp.Tuple) and isinstance(rhs, exp.Tuple) else [(lhs, rhs)]
+                    for var, value in pairs:
+                        if isinstance(var, (exp.Column, exp.Identifier, exp.Var)):
+                            out.values[var.name.lower()] = _substitute_variables(value.copy(), out.values)
+    usable = {k: v for k, v in out.values.items() if k not in (shadowed or set())}
+    out.query = _substitute_variables(out.query, usable)
+    for column in out.query.find_all(exp.Column):
+        name = column.name.lower()
+        if not column.table and name in out.variables and name not in usable and name not in (shadowed or set()) and name not in out.unbound:
+            out.unbound.append(name)
+    return out
+
+
+def _restore_group_aliases(tree: exp.Expression) -> exp.Expression:
+    """sqlglot's multi-statement parse rewrites ``GROUP BY pp.ppe_dt`` to the projection's alias
+    (``period_end_dt``); on an engine where a joined table also has that column, the bare name
+    binds to the column instead. Put the projected expression back."""
+    for select in tree.find_all(exp.Select):
+        group = select.args.get("group")
+        if group is None:
+            continue
+        aliases = {p.alias.lower(): p.this for p in select.expressions if isinstance(p, exp.Alias) and p.alias}
+        for item in list(group.expressions):
+            if isinstance(item, exp.Column) and not item.table and item.name.lower() in aliases:
+                item.replace(aliases[item.name.lower()].copy())
+    return tree
+
+
+def bind_script_text(sql: str, dialect: str) -> tuple[str | exp.Expression, list[str]]:
+    """``sql`` as the fixture stage runs it: a script becomes its final query (a tree, with the
+    variables bound — regenerating it as text would let the dialect's generator rewrite it); a
+    single statement is returned as it is."""
+    statements = [st for st in sqlglot.parse(sql, read=dialect) if st is not None]
+    if len(statements) <= 1 or not _is_script(statements):
+        return sql, []
+    script = bind_script(statements, dialect)
+    return script.query, script.unbound
+
+
+def _substitute_variables(tree: exp.Expression, values: dict[str, exp.Expression]) -> exp.Expression:
+    """Replace references to script variables with their values: a constant inline, a scalar
+    subquery as a subquery expression, an ARRAY as an array literal (``IN UNNEST(regions)`` becomes
+    ``IN UNNEST([...])``). Variables the script never assigned are left as they are."""
+    if not values:
+        return tree
+    for column in list(tree.find_all(exp.Column)):
+        if column.table:
+            continue
+        value = values.get(column.name.lower())
+        if value is None:
+            continue
+        replacement = value.copy()
+        if isinstance(replacement, exp.Select):
+            replacement = exp.Subquery(this=replacement)
+        elif not isinstance(replacement, (exp.Literal, exp.Subquery, exp.Array, exp.Null, exp.Boolean, exp.Cast, exp.Func, exp.Neg, exp.Interval, exp.Paren, exp.Tuple)):
+            replacement = exp.Paren(this=replacement)  # an expression keeps its own precedence
+        column.replace(replacement)
+    return tree
 
 
 def _is_script(statements: list[exp.Expression]) -> bool:

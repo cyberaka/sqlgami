@@ -452,15 +452,23 @@ def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str,
     """The statement as DuckDB SQL for a fixture: slots and parameters bound, and — for another
     dialect — translated through the verified allow-list (:mod:`sqlgami.translate`), raising
     ``Untranslatable`` for a construct whose translation is not proven."""
+    from . import analysis as A
     from . import template
-    from .translate import translate
+    from .translate import Untranslatable, translate
 
     for slot, value in (slots or {}).items():
         sql = sql.replace("{" + slot + "}", str(int(value)) if isinstance(value, (int, float)) and float(value).is_integer() else str(value))
     prepared = template.prepare(sql, dialect, params or None)
     text = prepared.executable_sql or sql
+    if dialect in A._SCRIPT_DIALECTS:
+        # A DECLARE/SET script runs as its final query with the variables bound (ADR 0003 B1).
+        text, unbound = A.bind_script_text(text, dialect)
+        if unbound:
+            raise Untranslatable("script variable " + ", ".join(unbound) + " has no value the script gives it (no DEFAULT or SET)")
     if dialect != "duckdb":
         text = translate(text, dialect, tables).sql
+    elif not isinstance(text, str):
+        text = text.sql(dialect="duckdb")
     return text
 
 

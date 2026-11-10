@@ -768,7 +768,8 @@ def _fixture_stage(
             outcome["verdict"] = "unverified"
             outcome["untranslatable"] = result["untranslatable"]
             report.signals["fixtures"] = outcome
-            _stage(report, name, StageStatus.NOT_RUN, f"{result['error']}: the translation of this construct to the fixture engine is not verified", clock.lap())
+            why = result["error"] if "script variable" in result["error"] else f"{result['error']}: the translation of this construct to the fixture engine is not verified"
+            _stage(report, name, StageStatus.NOT_RUN, why, clock.lap())
             return
         if not result.get("ok"):
             error = str(result.get("error") or "")

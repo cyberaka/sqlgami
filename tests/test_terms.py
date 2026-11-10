@@ -357,6 +357,19 @@ def test_conditions_inside_conditional_aggregation_count():
     assert _term_findings(report)["term_contradicted"].severity == Severity.HIGH
 
 
+def test_bigquery_if_and_countif_are_conditional_aggregation():
+    """COUNT(DISTINCT IF(cond, id, NULL)) and COUNTIF(cond) apply the condition as surely as CASE WHEN."""
+    sc = Scorer("bigquery", catalog=HR_DDL.replace("hr_emp_period_snapshot (", "hr_emp_period_snapshot (assoc_type TEXT, "), terms=Catalogue.from_sheets({"terms": TERMS + "not_contractor,not contractors;non-contractor,filter,hr_emp_period_snapshot,assoc_type IS DISTINCT FROM 'Contractor',include,\n", "parameters": PARAMS}))
+    base = f"FROM hr_emp_period_snapshot s WHERE s.status_cd = 'A' AND ({CHAIN})"
+    for sql in (
+        f"SELECT COUNT(DISTINCT IF(s.assoc_type IS DISTINCT FROM 'Contractor', s.assoc_id, NULL)) AS n {base}",
+        f"SELECT COUNTIF(s.assoc_type IS DISTINCT FROM 'Contractor') AS n {base}",
+    ):
+        report = sc.explain(sql, "How many people in my organisation are not contractors?", params={"manager_id": 7})
+        assert "term_missing" not in _term_findings(report), (sql, report.summary())
+        assert [o["status"] for o in report.signals["terms"]["outcomes"] if o["term"] == "not_contractor"] == ["satisfied"]
+
+
 def test_a_negated_phrase_expects_the_inverse_and_a_sibling_term_is_a_note():
     terms = (
         "term,phrases,kind,table,sql,nulls,description\n"

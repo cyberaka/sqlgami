@@ -165,8 +165,12 @@ class RequiredPredicate:
     def applies_to(self, table: "Table") -> bool:
         if not self.tables:
             return True
-        names = {table.name.lower(), table.qualified_name.lower()}
-        return any(t.lower() in names for t in self.tables)
+        qualified = table.qualified_name.lower()
+        names = {table.name.lower(), qualified}
+        parts = qualified.split(".")
+        if len(parts) >= 3:
+            names.add(".".join(parts[-2:]))  # `project.dataset.table` is dataset.table to a rule written without the project
+        return any(t.lower().strip("`") in names for t in self.tables)
 
     def to_dict(self) -> dict[str, Any]:
         return {
