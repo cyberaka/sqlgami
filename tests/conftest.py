@@ -158,3 +158,14 @@ def scorer(engine, db):
 
     with Scorer(engine, db=db) as s:
         yield s
+
+
+@pytest.fixture
+def scorer_factory(engine, db):
+    """``scorer_factory(**kwargs)`` gives a Scorer on the shop database with extra arguments."""
+    from sqlgami import Scorer
+
+    def make(**kwargs):
+        return Scorer(engine, db=db, **kwargs)
+
+    return make

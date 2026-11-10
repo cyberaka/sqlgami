@@ -133,3 +133,23 @@ def test_template_parameters_are_filled_into_probes(engine, db):
                      "relation": "equals_sum", "column": "spend"}],
         )
     assert _signal(report)["satisfied"] == 1
+
+
+def test_weak_sources_anchors_are_notes_and_differing_anchors_are_not_agreement(scorer_factory):
+    """Anchors from a source usually wrong: a violated one is a note. Two sources each violating
+    with DIFFERENT anchors is not agreement (no HIGH); the same anchor from two reliable sources is."""
+    weak_a = {"probe_sql": "SELECT SUM(total) * 2 FROM orders", "relation": "equals_sum", "column": "spend", "source": "weak-a"}
+    weak_b = {"probe_sql": "SELECT COUNT(*) FROM orders", "relation": "equals_row_count", "source": "weak-b"}
+    with scorer_factory(source_weights={"weak": 0.2, "strong": 0.85}) as scorer:
+        noted = scorer.sample(RIGHT, QUESTION, probes=[weak_a, weak_b])
+        finding = next(f for f in noted.findings if f.code == "reconciliation_mismatch")
+        assert finding.severity == Severity.LOW
+        strong = [dict(weak_a, source="strong-a"), dict(weak_b, source="strong-b")]
+        doubted = scorer.sample(RIGHT, QUESTION, probes=strong)
+        assert next(f for f in doubted.findings if f.code == "reconciliation_mismatch").severity == Severity.MEDIUM
+        agreed = [dict(weak_a, source="strong-a"), dict(weak_a, source="strong-b")]
+        verdict = scorer.sample(RIGHT, QUESTION, probes=agreed)
+        assert next(f for f in verdict.findings if f.code == "reconciliation_mismatch").severity == Severity.HIGH
+        weak_agreed = [dict(weak_a, source="weak-a"), dict(weak_a, source="weak-b")]
+        still = scorer.sample(RIGHT, QUESTION, probes=weak_agreed)
+        assert next(f for f in still.findings if f.code == "reconciliation_mismatch").severity == Severity.MEDIUM

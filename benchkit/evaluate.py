@@ -42,6 +42,7 @@ class Item:
     failed_stage: str = ""
     agreeing: int | None = None  # consistency stage: alternatives that returned the same result
     comparable: int | None = None
+    reconciliation: dict | None = None  # reconciliation stage counts, when the stage ran
 
 
 def auroc(scores: list[float], labels: list[bool]) -> float | None:

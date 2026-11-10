@@ -614,6 +614,7 @@ def _reconcile_stage(
         max_probes=options.reconcile_max_probes,
         allowed_functions=options.allowed_functions,
         allowed_tables=options.allowed_tables,
+        weights=options.source_weights or None,
     )
     report.signals["reconciliation"] = outcome.to_dict()
     if not outcome.ran:

@@ -25,7 +25,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Mapping, Any, Callable, Sequence
 
 from sqlglot import exp
 
@@ -117,6 +117,8 @@ class Outcome:
     # Per target: sources whose anchor values agree with one another, and the verdict.
     agreed_violations: int = 0  # targets where two or more sources agree on the anchor and the candidate violates it
     agreed_satisfied: int = 0
+    agreed_violation_weight: float = 0.0  # the heaviest such agreement, in summed source weight
+    violated_weight: float = 0.0  # the heaviest single violated anchor's source weight
     findings: list[Finding] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -125,6 +127,8 @@ class Outcome:
             "violated": self.violated,
             "agreed_violations": self.agreed_violations,
             "agreed_satisfied": self.agreed_satisfied,
+            "agreed_violation_weight": round(self.agreed_violation_weight, 3),
+            "violated_weight": round(self.violated_weight, 3),
             "probes": [r.to_dict() for r in self.results],
         }
 
@@ -313,8 +317,13 @@ def run(
     max_probes: int = 12,
     allowed_functions: Sequence[str] = (),
     allowed_tables: Sequence[str] = (),
+    weights: Mapping[str, float] | None = None,
 ) -> Outcome:
-    """Run each probe, evaluate its relation against the candidate's result, and weigh agreement."""
+    """Run each probe, evaluate its relation against the candidate's result, and weigh agreement.
+
+    ``weights`` are the sources' known shares of right answers (see :func:`consistency.run`):
+    an anchor from a source that is usually wrong is a note when violated, and two sources
+    agreeing on a violated anchor are a verdict only when together they are reliable enough."""
     import time
 
     outcome = Outcome()
@@ -395,6 +404,18 @@ def run(
     by_target: dict[tuple, list[ProbeResult]] = {}
     for result in comparable:
         by_target.setdefault(result.spec.target, []).append(result)
+    weights = weights or {}
+
+    def weight_of(sources: set[str]) -> float:
+        total = 0.0
+        for name in sources:
+            w = C.source_weight(name, weights) if not name.startswith("#") else None
+            total += C.DEFAULT_WEIGHT if w is None else w
+        return total
+
+    for result in comparable:
+        if result.status == VIOLATED:
+            outcome.violated_weight = max(outcome.violated_weight, weight_of(result.spec.sources or {f"#{id(result)}"}))
     for target, results in by_target.items():
         sources: set[str] = set()
         for r in results:
@@ -403,9 +424,10 @@ def run(
         agree = len(sources) >= 2 and all(_same(v, values[0]) for v in values)
         if agree and all(r.status == VIOLATED for r in results):
             outcome.agreed_violations += 1
+            outcome.agreed_violation_weight = max(outcome.agreed_violation_weight, weight_of(sources))
         elif agree and all(r.status == SATISFIED for r in results):
             outcome.agreed_satisfied += 1
-    outcome.findings = _judge(outcome)
+    outcome.findings = _judge(outcome, weighted=bool(weights))
     return outcome
 
 
@@ -426,11 +448,20 @@ def _describe(result: ProbeResult) -> str:
     return f"{what!s} gives {_plain(result.anchor)!r}, but {rel}{filt} in this query's result is {_plain(result.observed)!r}"
 
 
-def _judge(outcome: Outcome) -> list[Finding]:
+def _judge(outcome: Outcome, weighted: bool = False) -> list[Finding]:
+    """A violated anchor is a doubt (MEDIUM). Two independent sources proposing the SAME anchor
+    value that the result violates is a verdict (HIGH) — with weights, only when together they
+    are reliable enough; and a violated anchor from a source usually wrong is a note (LOW).
+    Several sources each violating with DIFFERENT anchors is not agreement."""
     violated = [r for r in outcome.results if r.status == VIOLATED]
     if not violated:
         return []
     agreed = outcome.agreed_violations > 0
+    if weighted:
+        verdict = agreed and outcome.agreed_violation_weight >= C.STRONG_AGAINST
+        note = not agreed and outcome.violated_weight < C.WEAK_SOURCE
+    else:
+        verdict, note = agreed, False
     sources: set[str] = set()
     for r in violated:
         sources |= r.spec.sources
@@ -438,10 +469,11 @@ def _judge(outcome: Outcome) -> list[Finding]:
     return [
         Finding(
             "reconciliation_mismatch",
-            Severity.HIGH if agreed or len(sources) >= 2 else Severity.MEDIUM,
+            Severity.HIGH if verdict else Severity.LOW if note else Severity.MEDIUM,
             f"{len(violated)} of {outcome.satisfied + len(violated)} anchor quer"
             f"{'y' if outcome.satisfied + len(violated) == 1 else 'ies'} disagree with this query's result: {detail}."
-            + (" Two independent sources agree on the anchor's value." if agreed else ""),
+            + (" Two independent sources agree on the anchor's value." if agreed else "")
+            + (" The anchors come from a source that is wrong more often than right, so this is a note." if note else ""),
             "reconciliation",
             suggestion="Compare the query with the anchor queries listed under signals.reconciliation.",
             evidence={
