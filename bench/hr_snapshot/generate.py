@@ -221,8 +221,9 @@ def generate(seed: int, profile: str, out_dir: Path):
         })
 
     has_fn_gaps = (profile != "clean")
-    # Seeds 45/46 use pooled person-id hierarchy; seeds 1-3/42/43/44 are UNCHANGED.
-    use_pooled = seed in (45, 46)
+    # Seeds 45/46/47 use pooled person-id hierarchy; seeds 1-3/42/43/44 are UNCHANGED.
+    use_pooled = seed in (45, 46, 47)
+    seed47_onleave_aid = None
     if use_pooled:
         AID_BASE = 12001
         N_EMP = 300
@@ -340,6 +341,19 @@ def generate(seed: int, profile: str, out_dir: Path):
             fn_chain_12003 = chain_for_leaf(fn_leaf_12003, fn_parent)
             for aid in fn_only:
                 assoc_assignments[aid]["fn_chain"] = fn_chain_12003
+            # Seed 47 ONLY: force one fn-only employee to be on-leave on the current
+            # authoritative snapshot and active in employee_dim. This exposes the AND/OR
+            # precedence bug (WHERE lvl_7_id_fn = m OR lvl_X_id = m AND status != 'L').
+            if seed == 47:
+                seed47_onleave_aid = sorted(fn_only)[0]
+                long_hire = AS_OF - timedelta(days=365 * 3)
+                assoc_assignments[seed47_onleave_aid]["hire_dt_d"] = long_hire
+                assoc_assignments[seed47_onleave_aid]["term_dt_d"] = None
+                for e in employees:
+                    if e["assoc_id"] == seed47_onleave_aid:
+                        e["hire_dt"] = long_hire.isoformat()
+                        e["term_dt"] = None
+                        break
 
     if inject_early_leavers_seed44:
         # Pick a leaf whose chain climbs to LVL_2 = 12003 (the big reporting org under {manager_id}=12003).
@@ -487,6 +501,17 @@ def generate(seed: int, profile: str, out_dir: Path):
                              and r["status_cd"] == "A")]
         # Duplicate-row hazard removed: it violated the declared PK (assoc_id, period_end_dt, snap_dt),
         # and the real production fact is keyed. Grain reasoning now trusts the declared key.
+
+    # Seed 47 ONLY: stamp status_cd='L' on the authoritative current snapshot for the
+    # pre-selected fn-only employee, so an AND/OR precedence bug that filters status only
+    # on the lvl_7_id_fn disjunct diverges from the correct (match) AND (status != 'L').
+    if seed47_onleave_aid is not None:
+        cur = CURRENT_PPE.isoformat()
+        for r in snapshots:
+            if (r["assoc_id"] == seed47_onleave_aid
+                    and r["snap_dt"] == cur
+                    and r["period_end_dt"] == cur):
+                r["status_cd"] = "L"
 
     # --- write JSONL per table (schema.table.jsonl)
     def jsonl(name: str, rows: list, keys: list):

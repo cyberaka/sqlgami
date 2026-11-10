@@ -194,6 +194,81 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+SYNC_FILE = ".source.json"
+SYNCED_FILES = ("questions.jsonl", "bugs.jsonl", "equivalents.jsonl", "suite.yaml", "glossary.yaml", "generate.py")
+
+
+def _md5(path: Path) -> str:
+    import hashlib
+
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def sync_suite(source: str | Path, dest: str | Path, *, keep_sqlgami_block: bool = True) -> dict[str, str]:
+    """Copy a suite's files from ``source`` (a shared or held-out folder) into ``dest`` and record
+    where they came from with their checksums, so a stale copy is refused later.
+
+    The ``sqlgami:`` block of the destination's suite.yaml is kept when the source has none (it is
+    the scorer's configuration, which the suite's author may not carry)."""
+    import shutil
+
+    source, dest = Path(source).expanduser().resolve(), Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    recorded: dict[str, str] = {}
+    for name in SYNCED_FILES:
+        src = source / name
+        if not src.exists():
+            continue
+        if name == "suite.yaml" and keep_sqlgami_block and (dest / name).exists():
+            text = src.read_text(encoding="utf-8")
+            if "\nsqlgami:" not in text:
+                old = (dest / name).read_text(encoding="utf-8")
+                marker = old.find("\nsqlgami:")
+                if marker >= 0:
+                    text = text.rstrip("\n") + "\n" + old[marker:]
+            (dest / name).write_text(text, encoding="utf-8")
+        else:
+            shutil.copy(src, dest / name)
+        recorded[name] = _md5(src)
+    if (source / "schema").is_dir():
+        shutil.copytree(source / "schema", dest / "schema", dirs_exist_ok=True)
+    record_file = dest / SYNC_FILE
+    sources: list[dict[str, Any]] = []
+    if record_file.exists():
+        try:
+            previous = json.loads(record_file.read_text(encoding="utf-8"))
+            sources = [r for r in previous.get("sources", []) if r.get("source") != str(source)]
+        except ValueError:
+            sources = []
+    # A file now taken from this source is no longer checked against an earlier one.
+    for record in sources:
+        record["files"] = {n: d for n, d in record.get("files", {}).items() if n not in recorded}
+    sources.append({"source": str(source), "files": recorded})
+    record_file.write_text(json.dumps({"sources": sources}, indent=1), encoding="utf-8")
+    return recorded
+
+
+def check_sync(path: Path) -> None:
+    """Refuse a suite copy whose source has moved on since it was synced."""
+    record_file = path / SYNC_FILE
+    if not record_file.exists():
+        return
+    try:
+        record = json.loads(record_file.read_text(encoding="utf-8"))
+        sources = [(Path(r["source"]), dict(r["files"])) for r in record["sources"]]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise SuiteError(f"{record_file} is unreadable: {exc}") from exc
+    for source, files in sources:
+        if not source.is_dir():
+            continue  # the source is not reachable from here; nothing to compare with
+        stale = [name for name, digest in files.items() if (source / name).exists() and _md5(source / name) != digest]
+        if stale:
+            raise SuiteError(
+                f"{path} is a stale copy: {', '.join(stale)} changed in {source} since the sync. "
+                f"Run: python -m benchkit sync {source} {path}"
+            )
+
+
 def load_suite(name_or_path: str | Path) -> Suite:
     path = Path(name_or_path)
     if not path.is_dir():
@@ -201,6 +276,7 @@ def load_suite(name_or_path: str | Path) -> Suite:
     config_file = path / "suite.yaml"
     if not config_file.exists():
         raise SuiteError(f"no suite.yaml in {path}")
+    check_sync(path)
     try:
         config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as exc:

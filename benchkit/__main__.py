@@ -35,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="benchkit", description="sqlgami bench tooling")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_sync = sub.add_parser("sync", help="copy a suite from its shared or held-out source and record the checksums")
+    p_sync.add_argument("source")
+    p_sync.add_argument("dest")
+
     p_build = sub.add_parser("build", help="generate data and build the databases")
     p_build.add_argument("suite")
     p_build.add_argument("--engine", action="append", help="repeatable; default: every supported engine")
@@ -118,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
             calibrator.save(args.out)
             print(json.dumps(report, indent=2))
             print(f"calibration: {args.out}")
+            return 0
+        if args.command == "sync":
+            from .suite import sync_suite
+
+            recorded = sync_suite(args.source, args.dest)
+            for name, digest in recorded.items():
+                print(f"{digest}  {name}")
             return 0
         suite = load_suite(args.suite)
         if args.command == "label":

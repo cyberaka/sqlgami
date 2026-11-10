@@ -1,0 +1,12 @@
+{
+ "sources": [
+  {
+   "source": "/Users/cyberaka/shared/sqlgami-bench/hr_snapshot",
+   "files": {
+    "suite.yaml": "c417af80c173f7b12a5d9c401d471770",
+    "glossary.yaml": "85618bf9b052d61baccdf18da15183b7",
+    "generate.py": "9342accde198a88d9520185ce9485fc7"
+   }
+  }
+ ]
+}

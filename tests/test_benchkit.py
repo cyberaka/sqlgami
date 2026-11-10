@@ -297,3 +297,38 @@ def test_complexity_statistics(suite):
     )
     assert (shape["joins"], shape["ctes"], shape["windows"]) == (1, 2, 1) and shape["depth"] >= 2
     assert "gold SQL complexity by difficulty" in validate.validate(suite, check_determinism=False).summary()
+
+
+def test_sync_records_checksums_and_refuses_a_stale_copy(tmp_path):
+    """A bench copy remembers where it came from; when the source moves on, scoring it is refused."""
+    import shutil
+
+    from benchkit.suite import SuiteError, load_suite, sync_suite
+
+    source = tmp_path / "shared"
+    shutil.copytree(MINI, source)
+    dest = tmp_path / "copy"
+    recorded = sync_suite(source, dest)
+    assert "questions.jsonl" in recorded and (dest / ".source.json").exists()
+    load_suite(dest)  # in sync: fine
+    with open(source / "questions.jsonl", "a", encoding="utf-8") as fh:
+        fh.write("\n")
+    with pytest.raises(SuiteError, match="stale copy"):
+        load_suite(dest)
+    sync_suite(source, dest)
+    load_suite(dest)  # resynced
+
+
+def test_sync_keeps_the_scorer_block_the_source_lacks(tmp_path):
+    import shutil
+
+    from benchkit.suite import load_suite, sync_suite
+
+    source = tmp_path / "shared"
+    shutil.copytree(MINI, source)
+    dest = tmp_path / "copy"
+    shutil.copytree(MINI, dest)
+    with open(dest / "suite.yaml", "a", encoding="utf-8") as fh:
+        fh.write("\nsqlgami:\n  snapshot_columns:\n    t: snap_dt\n")
+    sync_suite(source, dest)
+    assert load_suite(dest).config.get("sqlgami") == {"snapshot_columns": {"t": "snap_dt"}}

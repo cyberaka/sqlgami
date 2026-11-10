@@ -24,6 +24,7 @@ BUG_CLASSES = {
     "bq_current_date_utc", "cosmos_cross_container_join", "cosmos_missing_partition_key",
     "cosmos_array_vs_scalar", "cosmos_missing_field", "other",
     "snapshot_grain", "missing_required_predicate", "template_list_param", "scalar_subquery_multirow",
+    "avg_of_ratios",
 }
 OUTCOMES = {"error", "wrong_on_all_seeds", "wrong_on_nasty_only"}
 
@@ -412,8 +413,8 @@ def _check_question(suite: Suite, runner: Runner, question: Question, engines: l
 def _check_anchor(suite: Suite, runner: Runner, question: Question, engines: list[str], result: Validation) -> None:
     """Run a question's hand-verified probe and compare it with the rows written down for it."""
     check = question.check
-    if not check:
-        return
+    if not check or not check.get("probe_sql"):
+        return  # not a seed anchor (other tooling keeps its own notes under "check")
     seed = next((s for s in suite.seeds if s.seed == check.get("seed")), None)
     if seed is None:
         result.add(ERROR, question.id, f"check names seed {check.get('seed')!r}, which the suite does not have")

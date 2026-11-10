@@ -23,7 +23,18 @@ definitions:
     meaning: >
       A window counted back from the current biweekly pay period, using period_seq. For
       example "the last 13 pay periods" spans today's period and the 12 biweekly periods
-      before it; "the last 26 pay periods" spans today and the 25 before.
+      before it; "the last 26 pay periods" spans today and the 25 before. In period_seq
+      terms the window is -(N-1) through 0 inclusive, i.e. N biweekly periods ending at
+      the current one.
+
+  n_pay_periods_ago:
+    meaning: >
+      The single biweekly pay period exactly N periods before the current one, i.e. the
+      period at period_seq = -N. This is distinct from "the last N pay periods", which is
+      a window of N periods ending at the current one. So "the pay period 26 periods ago"
+      means the single period at period_seq = -26 (one period older than the start of
+      "the last 26 pay periods"). "A year ago" means 26 biweekly periods ago by the same
+      rule.
 
   authoritative_snapshot:
     meaning: >
@@ -85,8 +96,9 @@ definitions:
     meaning: >
       Year-over-year change in a count, expressed as basis points of the anchor value:
       (current - prior) × 10000 / prior, floored (rounded down, toward negative infinity)
-      to an integer. "A year ago" is the pay period 26 biweekly periods before the current
-      one. The result is NULL when the prior anchor count is 0.
+      to an integer. The prior anchor is the count 26 biweekly pay periods ago (see
+      n_pay_periods_ago), i.e. the single period at period_seq = -26. The result is NULL
+      when the prior anchor count is 0.
 
   headcount:
     meaning: >
