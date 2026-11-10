@@ -57,6 +57,9 @@ class CheckContext:
     probes: list[Probe] = field(default_factory=list)
     # Values for the template's parameters, so probe queries built from the statement can run.
     params: dict[str, Any] | None = None
+    # Whether probe queries will be run at all (a database and a mode that runs them); when not,
+    # checks need not build them.
+    wants_probes: bool = True
 
     def __post_init__(self) -> None:
         self.cache = ModelCache(self.analysis, self.catalog)

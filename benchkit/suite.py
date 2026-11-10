@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -261,8 +262,8 @@ def sync_suite(source: str | Path, dest: str | Path, *, keep_sqlgami_block: bool
 def check_sync(path: Path) -> None:
     """Refuse a suite copy whose source has moved on since it was synced."""
     record_file = path / SYNC_FILE
-    if not record_file.exists():
-        return
+    if not record_file.exists() or os.environ.get("BENCHKIT_ALLOW_STALE"):
+        return  # BENCHKIT_ALLOW_STALE=1: comparing two commits on one frozen copy, knowingly
     try:
         record = json.loads(record_file.read_text(encoding="utf-8"))
         sources = [(Path(r["source"]), dict(r["files"])) for r in record["sources"]]

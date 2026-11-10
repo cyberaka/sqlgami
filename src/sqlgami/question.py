@@ -297,7 +297,7 @@ def _filters_not_asked_for(asked: _Asked) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[str] = set()
     for model in ctx.cache.models():
-        for node in walk_own(model.select):
+        for node in model.own():
             pairs: list[tuple[exp.Expression, exp.Expression]] = []
             if isinstance(node, exp.EQ):
                 pairs = [(node.this, node.expression), (node.expression, node.this)]
@@ -790,7 +790,7 @@ def _time_period(asked: _Asked) -> list[Finding]:
         return []
     kinds = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between, exp.In, exp.Is, exp.Like)
     for model in asked.ctx.cache.models():
-        for node in walk_own(model.select):
+        for node in model.own():
             if not isinstance(node, kinds):
                 continue
             if any(isinstance(c, exp.Column) and _is_temporal_column(asked, model, c) for c in walk_own(node)):

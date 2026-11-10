@@ -30,7 +30,7 @@ _EQUALITY = (exp.EQ, exp.NEQ)
 
 
 def own_nodes(model: SelectModel, kinds: tuple[type, ...]) -> Iterator[exp.Expression]:
-    for node in walk_own(model.select):
+    for node in model.own():
         if isinstance(node, kinds):
             yield node
 

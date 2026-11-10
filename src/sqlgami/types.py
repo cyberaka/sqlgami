@@ -123,8 +123,10 @@ def family_of_declared(declared: str, dialect: str) -> str:
     return by_name if family in (OTHER, UNKNOWN) and by_name != UNKNOWN else family
 
 
+@lru_cache(maxsize=4096)
 def sqlglot_type_name(declared: str, dialect: str) -> str:
-    """A type string sqlglot's schema will accept, or ``UNKNOWN``."""
+    """A type string sqlglot's schema will accept, or ``UNKNOWN``. Memoised: a catalogue's types
+    are the same on every call."""
     data_type = parse_type(declared, dialect)
     if data_type is None:
         return "UNKNOWN"

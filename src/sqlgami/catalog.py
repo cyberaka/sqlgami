@@ -438,6 +438,36 @@ class Catalog:
                 return column
         return None
 
+    def view_tree(self, table: Table, dialect: str) -> tuple[Any, tuple[str, ...]] | None:
+        """A view's query parsed once per dialect, with its declared column list; callers copy
+        the tree before changing it."""
+        cache = self.__dict__.setdefault("_view_trees", {})
+        key = (id(table), dialect, table.definition)
+        if key not in cache:
+            parsed = view_query_from_sql(table.definition or "", dialect)
+            if parsed is None:
+                cache[key] = None
+            else:
+                query_sql, view_columns = parsed
+                try:
+                    cache[key] = (sqlglot.parse_one(query_sql, dialect=dialect), tuple(view_columns))
+                except Exception:
+                    cache[key] = None
+        return cache[key]
+
+    def sqlglot_columns(self, table: Table, dialect: str) -> dict[str, str]:
+        """``{column key: sqlglot type name}`` for a table, computed once per table and dialect:
+        the same statement-independent mapping is needed on every call."""
+        from .types import sqlglot_type_name
+
+        cache = self.__dict__.setdefault("_sqlglot_columns", {})
+        key = (id(table), dialect, len(table.columns))
+        found = cache.get(key)
+        if found is None:
+            found = {self.column_key(c.name): sqlglot_type_name(c.type, dialect) for c in table.columns}
+            cache[key] = found
+        return found
+
     def column_keys(self, table: Table) -> set[str]:
         return {self.column_key(c.name) for c in table.columns}
 

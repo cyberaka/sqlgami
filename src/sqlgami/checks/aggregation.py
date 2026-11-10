@@ -246,7 +246,7 @@ def avg_of_avg(ctx: CheckContext) -> Iterable[Finding]:
             )
 
         # The same thing written by hand: SUM(per_group_average) / COUNT(*).
-        for node in walk_own(model.select):
+        for node in model.own():
             if not isinstance(node, exp.Div):
                 continue
             if not _has_own_aggregate(node.expression, (exp.Count,)):

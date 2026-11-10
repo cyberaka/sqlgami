@@ -382,7 +382,9 @@ def _run(
     # ------------------------------------------------------------ static
     ctx: CheckContext | None = None
     if schema_passed and catalog is not None:
-        ctx = CheckContext(analysis, catalog, question, params=params)
+        ctx = CheckContext(
+            analysis, catalog, question, params=params, wants_probes=adapter is not None and mode in ("sample", "full")
+        )
         findings, skipped = run_static_checks(ctx)
         report.findings.extend(findings)
         report.checks_not_run.extend(skipped)

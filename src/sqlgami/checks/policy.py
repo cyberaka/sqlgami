@@ -379,7 +379,7 @@ class _Tracer:
             if isinstance(inner, exp.Column) and inner.table in model.sources:
                 seeds.add((inner.table, inner.name))
         if self.mode == MENTIONED:
-            for node in walk_own(model.select):
+            for node in model.own():
                 if isinstance(node, exp.Column) and node.table in model.sources:
                     if not _is_plain_projection(node):
                         seeds.add((node.table, node.name))

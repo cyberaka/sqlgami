@@ -166,6 +166,8 @@ def _uniqueness_probes(
     derived table, CTE or expanded view is asked by running it as a subquery and grouping
     by its join columns.
     """
+    if not ctx.wants_probes:
+        return
     planned: list[Probe] = []
     for alias in aliases:
         repeaters = model.multiplied(alias, per_group=True).culprits or culprits

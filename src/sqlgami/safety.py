@@ -19,7 +19,7 @@ Three outcomes for each function call:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
 
 import re
 
@@ -177,7 +177,9 @@ def _defined_names(tree: exp.Expression) -> set[str]:
     return names
 
 
-def review_text(sql: str, tree: exp.Expression, dialect: str | None, allowed: Iterable[str] = ()) -> FunctionReview:
+def review_text(
+    sql: str, tree: exp.Expression, dialect: str | None, allowed: Iterable[str] = (), tokens: list[Any] | None = None
+) -> FunctionReview:
     """A second net under :func:`review_functions`, working from the text instead of the tree.
 
     No built-in that sqlgami refuses may be written directly before ``(``, wherever
@@ -191,10 +193,11 @@ def review_text(sql: str, tree: exp.Expression, dialect: str | None, allowed: It
     everywhere, tables_only, known_bad = lists
     host = {name.lower() for name in allowed}
     host |= {name.rsplit(".", 1)[-1] for name in host}
-    try:
-        tokens = sqlglot.tokenize(sql, read=dialect)
-    except SqlglotError:
-        return FunctionReview()
+    if tokens is None:
+        try:
+            tokens = sqlglot.tokenize(sql, read=dialect)
+        except SqlglotError:
+            return FunctionReview()
     defined = _defined_names(tree)
     refused: set[str] = set()
     for index in range(len(tokens) - 1):
@@ -266,10 +269,12 @@ def review(
     dialect: str | None,
     allowed: Iterable[str] = (),
     allowed_tables: Iterable[str] = (),
+    tokens: list[Any] | None = None,
 ) -> FunctionReview:
-    """Both nets together: the parsed tree, then the text; and the tables the statement reads."""
+    """Both nets together: the parsed tree, then the text; and the tables the statement reads.
+    ``tokens`` are the statement's tokens when the caller already has them."""
     first = review_functions(tree, dialect, allowed)
-    second = review_text(sql, tree, dialect, allowed)
+    second = review_text(sql, tree, dialect, allowed, tokens)
     refused = sorted(set(first.refused) | set(second.refused) | set(review_tables(tree, dialect, allowed_tables)))
     unlisted = sorted((set(first.unlisted) | set(second.unlisted)) - set(refused))
     # "schema.name" from the tree and bare "name" from the text are one call.

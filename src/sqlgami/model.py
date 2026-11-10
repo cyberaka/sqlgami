@@ -298,8 +298,16 @@ class SelectModel:
         self._parent: dict[ColRef, ColRef] = {}
         self._mult: dict[tuple[str, bool], Multiplication] = {}
         self._key_info: dict[str, KeyInfo] = {}
+        self._own: tuple[exp.Expression, ...] | None = None
         self._build_sources()
         self._build_predicates()
+
+    def own(self) -> tuple[exp.Expression, ...]:
+        """Every node of this SELECT outside nested queries, walked once and kept: the checks ask
+        for it many times over."""
+        if self._own is None:
+            self._own = tuple(walk_own(self.select))
+        return self._own
 
     # ------------------------------------------------------------ sources
 

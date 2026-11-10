@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect
 from sqlglot.errors import OptimizeError, SqlglotError
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.qualify import qualify
@@ -158,8 +159,12 @@ def analyse(
         raise ValueError("a dialect is required")
     analysis = Analysis(sql=sql, dialect=dialect)
 
+    tokens: list[Any] | None = None
     try:
-        statements = [s for s in sqlglot.parse(sql, dialect=dialect) if s is not None]
+        # Tokenise once: the parser and the safety text net both read the same tokens.
+        engine = Dialect.get_or_raise(dialect)
+        tokens = engine.tokenize(sql)
+        statements = [s for s in engine.parser().parse(tokens, sql) if s is not None]
     except SqlglotError as exc:
         analysis.parse_error = _clean_error(exc)
         return analysis
@@ -206,7 +211,7 @@ def analyse(
         analysis.kind = OTHER
         return analysis
     analysis.kind = QUERY
-    review = safety.review(sql, tree, dialect, allowed_functions, allowed_tables)
+    review = safety.review(sql, tree, dialect, allowed_functions, allowed_tables, tokens=tokens)
     analysis.unsafe_functions = review.refused
     analysis.unlisted_functions = review.unlisted
 
@@ -384,11 +389,10 @@ class _Resolver:
                 raise OptimizeError(f"view {qualified} refers to itself")
             if len(stack) >= MAX_VIEW_DEPTH:
                 raise OptimizeError(f"views are nested more than {MAX_VIEW_DEPTH} deep")
-            parsed = view_query_from_sql(table.definition or "", self.dialect)
+            parsed = self.catalog.view_tree(table, self.dialect)
             if parsed is None:
                 raise OptimizeError(f"the definition of view {qualified} could not be parsed")
-            query_sql, view_columns = parsed
-            inner = sqlglot.parse_one(query_sql, dialect=self.dialect)
+            inner, view_columns = parsed[0].copy(), parsed[1]
             self._resolve_tables(inner, table.schema, stack + (qualified,))
             if qualified not in analysis.views_used:
                 analysis.views_used.append(qualified)
@@ -429,11 +433,7 @@ class _Resolver:
         catalog = self.catalog
         mapping: dict[str, dict[str, dict[str, str]]] = {}
         for (schema_key, name_key), table in self.analysis.tables.items():
-            columns = {
-                catalog.column_key(c.name): sqlglot_type_name(c.type, self.dialect)
-                for c in table.columns
-            }
-            mapping.setdefault(schema_key, {})[name_key] = columns
+            mapping.setdefault(schema_key, {})[name_key] = catalog.sqlglot_columns(table, self.dialect)
         return MappingSchema(mapping or None, dialect=self.dialect, normalize=False)
 
     # ---------------------------------------------------------- NATURAL JOIN
