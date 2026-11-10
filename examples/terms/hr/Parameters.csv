@@ -1,0 +1,6 @@
+name,type,example_values
+manager_id,integer,12003;52002
+rate,input,
+current,input,
+prior,input,
+leavers,input,

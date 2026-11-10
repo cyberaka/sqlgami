@@ -194,6 +194,7 @@ def evaluate(
     only_generators: list[str] | None = None,
     role: str = "confirm",
     substitute: bool = False,
+    terms: bool = True,
 ) -> tuple[list[Item], dict[str, Any]]:
     """Score every labelled statement for one engine. Returns the items and their metrics.
 
@@ -210,6 +211,9 @@ def evaluate(
     scorers: dict[bool, Scorer] = {}
     glossary_file = suite.path / "glossary.yaml"
     glossary = glossary_file.read_text(encoding="utf-8") if glossary_file.exists() else None
+    # The suite's term catalogue is passed exactly as a host would pass its own; ``terms=False``
+    # scores without it, so both numbers can be reported.
+    catalogue = suite.terms_source(engine) if terms else None
 
     def scorer_for(question: Question) -> Scorer:
         scoped = question.tenant is not None
@@ -222,6 +226,7 @@ def evaluate(
                 db=conn,
                 glossary=glossary,
                 options=Options(consistency_role=role, consistency_max_alternatives=24),
+                terms=str(catalogue) if catalogue is not None else None,
                 **config,
             )
         return scorers[scoped]

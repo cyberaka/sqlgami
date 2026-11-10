@@ -20,6 +20,7 @@ postgres = [
     "psycopg[binary]>=3.2",
 ]
 bigquery = ["google-cloud-bigquery>=3.25"]
+excel = ["openpyxl>=3.1"]  # reading a term catalogue from .xlsx; CSV needs nothing
 # The Hugging Face generator for the consistency stage uses only the standard library.
 hf = []
 

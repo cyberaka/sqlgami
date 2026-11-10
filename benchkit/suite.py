@@ -167,6 +167,16 @@ class Suite:
     def schema_file(self, engine: str) -> Path:
         return self.path / "schema" / f"{engine}.sql"
 
+    def terms_source(self, engine: str | None = None) -> Path | None:
+        """The suite's term catalogue as a host would supply it: a ``terms/`` folder of CSV sheets
+        (``terms-<engine>/`` when an engine needs different table names), or ``terms.xlsx``."""
+        for name in ((f"terms-{engine}", "terms") if engine else ("terms",)):
+            folder = self.path / name
+            if folder.is_dir() and any(folder.glob("*.csv")):
+                return folder
+        book = self.path / "terms.xlsx"
+        return book if book.exists() else None
+
     def question(self, question_id: str) -> Question | None:
         for question in self.questions:
             if question.id == question_id:

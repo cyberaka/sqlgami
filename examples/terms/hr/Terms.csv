@@ -1,0 +1,10 @@
+term,phrases,kind,table,sql,nulls,description
+not_on_leave,not on leave;currently not on leave,filter,hr.emp_period_snapshot,status_cd IS DISTINCT FROM 'L',include,"A person is not on leave unless status_cd is 'L'; an unknown (NULL) status is not on leave."
+active,active;active headcount,filter,hr.emp_period_snapshot,status_cd = 'A',,"Active associates."
+last_n_pay_periods,last {n} pay periods;past {n} pay periods;trailing {n} pay periods,window,hr.pay_period_dim,period_seq BETWEEN -({n}-1) AND 0,,"A window of N biweekly periods ending at the current one."
+n_pay_periods_ago,{n} pay periods ago;{n} biweekly pay periods ago,window,hr.pay_period_dim,period_seq = -{n},,"The single period N periods before the current one."
+n_to_m_pay_periods_ago,{n} to {m} pay periods ago;{n} to {m} pay-periods-ago window,window,hr.pay_period_dim,period_seq BETWEEN -{m} AND -{n},,"Periods N..M back, inclusive."
+trailing_moving_average,trailing {n} period moving average;{n} period moving average,window,,ROWS BETWEEN {n}-1 PRECEDING AND CURRENT ROW,,"The current row and the N-1 before it."
+hire_date,hire date;date of hire;hired in,source,,hr.employee_dim.hire_dt,,"hire_dt is read from employee_dim; the snapshot's copy may be stale."
+my_organisation,my organisation;my org;under me,chain,hr.emp_period_snapshot,"lvl_2_id, lvl_3_id, lvl_4_id, lvl_5_id, lvl_6_id, lvl_7_id, lvl_2_id_fn, lvl_3_id_fn, lvl_4_id_fn, lvl_5_id_fn, lvl_6_id_fn, lvl_7_id_fn = {manager_id}",,"Every associate whose reporting or functional chain contains the manager."
+headcount,headcount,,,,,"Documentation only: the distinct count of in-scope associates at a period. Give it a sql to have it checked."

@@ -1,0 +1,774 @@
+"""Judge a candidate against the host's term catalogue (see :mod:`sqlgami.terms`).
+
+For every term or KPI whose phrase the question uses, the candidate's SQL is compared with the
+term's declared representation — by structure, never by text:
+
+* ``filter``: a condition on the same column that means the same, NULL behaviour included.
+  ``status_cd != 'L'`` against ``status_cd IS DISTINCT FROM 'L'`` is a contradiction (NULL rows
+  are dropped), not a near miss.
+* ``window``: the range the query puts on the column has the declared size or offset.
+* ``source``: the column is read from the table the catalogue names.
+* ``formula`` / KPI ``format``: the projection named for the term has the declared shape
+  (an integer, floored not rounded, subtracting in the declared direction).
+* a term with no ``sql`` (documentation only): nothing can be checked, and the report says so.
+
+Terms of kind ``chain`` are folded into required-predicate rules by the Scorer and judged there.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from sqlglot import exp
+
+from .checks.base import CheckContext
+from .model import SelectModel, flatten_and, flatten_or, strip, unalias, walk_own
+from .report import Finding, Severity
+from .terms import KPI, Catalogue, Match, Term, bound_number, parse_term_sql
+
+SATISFIED, CONTRADICTED, MISSING, DIFFERS, NOT_READ, UNVERIFIED = (
+    "satisfied",
+    "contradicted",
+    "missing",
+    "differs",
+    "source_not_read",
+    "unverified",
+)
+
+
+@dataclass
+class TermOutcome:
+    term: str
+    kind: str
+    status: str
+    detail: str = ""
+    phrase: str = ""
+    bindings: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"term": self.term, "kind": self.kind, "status": self.status, "detail": self.detail, "phrase": self.phrase, "bindings": self.bindings}
+
+
+def check_terms(
+    ctx: CheckContext, question: str, catalogue: Catalogue, dialect: str, params: dict[str, Any] | None = None
+) -> tuple[list[Finding], dict[str, Any]]:
+    """Findings and the ``signals["terms"]`` entry for one candidate."""
+    matches = catalogue.match(question)
+    outcomes: list[TermOutcome] = []
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    for match in matches:
+        if match.name.lower() in seen:
+            continue
+        seen.add(match.name.lower())
+        term = catalogue.term(match.name)
+        kpi = catalogue.kpi(match.name) if term is None else None
+        if term is not None:
+            outcome, finding = _judge_term(ctx, term, match, dialect, params)
+        elif kpi is not None:
+            outcome, finding = _judge_kpi(ctx, kpi, match, catalogue, dialect)
+        else:
+            continue
+        outcomes.append(outcome)
+        if finding is not None:
+            findings.append(finding)
+    signal = {
+        "catalogue": catalogue.to_dict(),
+        "matched": [m.to_dict() for m in matches],
+        "outcomes": [o.to_dict() for o in outcomes],
+    }
+    return findings, signal
+
+
+# ------------------------------------------------------------------- terms
+
+
+def _judge_term(
+    ctx: CheckContext, term: Term, match: Match, dialect: str, params: dict[str, Any] | None
+) -> tuple[TermOutcome, Finding | None]:
+    outcome = TermOutcome(term.name, term.kind, UNVERIFIED, phrase=match.phrase, bindings=match.bindings)
+    if not term.enforceable:
+        outcome.detail = "the catalogue describes this term but gives no data-level meaning"
+        return outcome, Finding(
+            "undefined_term",
+            Severity.LOW,
+            f'The question uses "{match.phrase}" ({term.name}), which the catalogue describes but does not '
+            "define in data terms, so sqlgami cannot confirm the query reads it correctly.",
+            "question",
+            suggestion=f"Give the term {term.name} its sql in the catalogue (a filter, formula, window or source).",
+            evidence={"term": term.name, "phrase": match.phrase},
+        )
+    if term.table and not _reads(ctx, term.table):
+        outcome.status = NOT_READ
+        outcome.detail = f"the query reads none of {term.table}"
+        return outcome, Finding(
+            "term_source_not_read",
+            Severity.MEDIUM,
+            f'The question asks about "{match.phrase}" ({term.name}), which the catalogue defines on '
+            f"{term.table}, and the query does not read that table.",
+            "question",
+            evidence={"term": term.name, "table": term.table},
+        )
+    try:
+        node = parse_term_sql(_bind(term, match.bindings), dialect)
+    except Exception as exc:  # the catalogue was validated; a dialect override may still be odd
+        outcome.detail = f"the term's sql could not be read: {exc}"
+        return outcome, None
+    if node is None:
+        return outcome, None
+    if term.kind == "filter":
+        return _judge_filter(ctx, term, match, node, outcome)
+    if term.kind == "window":
+        return _judge_window(ctx, term, match, node, outcome)
+    if term.kind == "source":
+        return _judge_source(ctx, term, match, node, outcome)
+    if term.kind == "formula":
+        return _judge_formula(ctx, term, match, node, outcome)
+    return outcome, None  # chain: judged by the required-predicate rule it was folded into
+
+
+def _bind(term: Term, bindings: dict[str, str]) -> Term:
+    """The term with the question's numbers in place of ``{n}`` / ``{m}``."""
+    sql = term.sql
+    dialects = dict(term.dialects)
+    for key, value in bindings.items():
+        number = bound_number(value)
+        if number is None:
+            continue
+        sql = sql.replace("{" + key + "}", str(number))
+        dialects = {d: s.replace("{" + key + "}", str(number)) for d, s in dialects.items()}
+    return Term(term.name, term.phrases, term.kind, term.table, sql, term.nulls, term.description, dialects, term.row)
+
+
+def _reads(ctx: CheckContext, tables: str) -> bool:
+    wanted = {t.strip().lower() for t in tables.split(";") if t.strip()}
+    read: set[str] = set()
+    for table in ctx.analysis.tables.values():
+        read.add(table.qualified_name.lower())
+        read.add(table.name.lower())
+    return any(w in read or w.split(".")[-1] in read for w in wanted)
+
+
+# ------------------------------------------------------------------ filters
+
+
+@dataclass
+class _Cond:
+    """A condition on one column in canonical form."""
+
+    column: str
+    op: str  # eq | ne | in | not_in | is_null | not_null | other
+    values: tuple[Any, ...]
+    nulls_kept: bool | None  # for ne / not_in: whether NULL rows pass
+    text: str
+
+
+def _canonical(node: exp.Expression) -> _Cond | None:
+    node = strip(node)
+    if isinstance(node, exp.Paren):
+        node = strip(node.this)
+    # (col <> v OR col IS NULL)
+    if isinstance(node, exp.Or):
+        branches = [strip(b) for b in flatten_or(node)]
+        nulls = [b for b in branches if isinstance(b, exp.Is) and isinstance(b.expression, exp.Null)]
+        others = [b for b in branches if b not in nulls]
+        if len(nulls) == 1 and len(others) == 1:
+            inner = _canonical(others[0])
+            null_col = strip(nulls[0].this)
+            if inner and isinstance(null_col, exp.Column) and null_col.name.lower() == inner.column and inner.op in ("ne", "not_in"):
+                return _Cond(inner.column, inner.op, inner.values, True, node.sql())
+        return None
+    if isinstance(node, exp.Not):
+        inner = _canonical(node.this)
+        if inner is None:
+            return None
+        flipped = {"eq": "ne", "ne": "eq", "in": "not_in", "not_in": "in", "is_null": "not_null", "not_null": "is_null"}
+        op = flipped.get(inner.op, "other")
+        kept = False if op in ("ne", "not_in") else None
+        return _Cond(inner.column, op, inner.values, kept, node.sql())
+    if isinstance(node, exp.Is):
+        column = _column_of(node.this)
+        if column is None:
+            return None
+        return _Cond(column, "is_null" if isinstance(node.expression, exp.Null) else "other", (), None, node.sql())
+    if isinstance(node, (exp.EQ, exp.NEQ, exp.NullSafeEQ, exp.NullSafeNEQ)):
+        left, right = strip(node.this), strip(node.expression)
+        column, value = _column_of(left), right
+        if column is None:
+            column, value = _column_of(right), left
+        if column is None or not _is_literal(value):
+            return None
+        null_safe = isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ))
+        negative = isinstance(node, (exp.NEQ, exp.NullSafeNEQ))
+        coalesced = isinstance(left, exp.Coalesce) or isinstance(right, exp.Coalesce)
+        op = "ne" if negative else "eq"
+        kept = (null_safe or coalesced) if negative else None
+        return _Cond(column, op, (_value(value),), kept, node.sql())
+    if isinstance(node, exp.In) and not node.args.get("query") and node.expressions:
+        column = _column_of(node.this)
+        if column is None or not all(_is_literal(e) for e in node.expressions):
+            return None
+        coalesced = isinstance(strip(node.this), exp.Coalesce)
+        values = tuple(sorted((_value(e) for e in node.expressions), key=repr))
+        op = "eq" if len(values) == 1 else "in"
+        return _Cond(column, op, values, True if coalesced else None, node.sql())
+    return None
+
+
+def _column_of(node: exp.Expression) -> str | None:
+    node = strip(node)
+    if isinstance(node, exp.Coalesce):
+        node = strip(node.this)
+    if isinstance(node, exp.Cast):
+        node = strip(node.this)
+    if isinstance(node, exp.Column):
+        return node.name.lower()
+    return None
+
+
+def _is_literal(node: exp.Expression) -> bool:
+    node = strip(node)
+    return isinstance(node, (exp.Literal, exp.Null, exp.Boolean, exp.Placeholder, exp.Parameter)) or (
+        isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal)
+    )
+
+
+def _value(node: exp.Expression) -> Any:
+    node = strip(node)
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return node.name
+        try:
+            return float(node.name)
+        except ValueError:
+            return node.name
+    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal):
+        try:
+            return -float(node.this.name)
+        except ValueError:
+            return node.sql()
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Null):
+        return None
+    return node.sql()
+
+
+def _conditions(ctx: CheckContext, column: str) -> list[tuple[_Cond, SelectModel]]:
+    """Every canonical condition on ``column`` in any SELECT of the statement (WHERE and ON)."""
+    found: list[tuple[_Cond, SelectModel]] = []
+    for model in ctx.cache.models():
+        for conjunct in model.conjuncts:
+            for part in flatten_and(conjunct.expr):
+                cond = _canonical(part)
+                if cond is not None and cond.column == column:
+                    found.append((cond, model))
+    return found
+
+
+def _judge_filter(ctx: CheckContext, term: Term, match: Match, node: exp.Expression, outcome: TermOutcome) -> tuple[TermOutcome, Finding | None]:
+    wanted = _canonical(node)
+    if wanted is None:
+        outcome.detail = "the term's condition is not a simple test on one column; not checked"
+        return outcome, None
+    if term.nulls == "include" and wanted.op in ("ne", "not_in"):
+        wanted.nulls_kept = True
+    elif term.nulls == "exclude" and wanted.op in ("ne", "not_in"):
+        wanted.nulls_kept = False
+    found = _conditions(ctx, wanted.column)
+    if not found:
+        inside_or = _tested_inside_or(ctx, wanted.column)
+        outcome.status = MISSING
+        outcome.detail = (
+            f"{wanted.column} is tested only inside an OR branch"
+            if inside_or
+            else f"nothing in the query filters on {wanted.column}"
+        )
+        return outcome, Finding(
+            "term_missing",
+            Severity.HIGH,
+            f'The question asks for "{match.phrase}" ({term.name}), which the catalogue defines as {term.sql}; '
+            + (
+                f"the only test on {wanted.column} sits inside an OR branch ({inside_or}), so it does not apply to every row."
+                if inside_or
+                else f"the query applies no such condition on {wanted.column}."
+            ),
+            "question",
+            snippet=inside_or or None,
+            suggestion=f"Apply {term.sql} to every row (as its own AND condition).",
+            evidence={"term": term.name, "expected": term.sql},
+        )
+    for cond, _ in found:
+        if _same_condition(cond, wanted):
+            outcome.status = SATISFIED
+            outcome.detail = cond.text
+            return outcome, None
+    contradiction = next((c for c, _ in found if _contradicts(c, wanted)), None)
+    if contradiction is not None:
+        outcome.status = CONTRADICTED
+        outcome.detail = contradiction.text
+        why = _why(contradiction, wanted)
+        return outcome, Finding(
+            "term_contradicted",
+            Severity.HIGH,
+            f'The catalogue defines "{match.phrase}" ({term.name}) as {term.sql}; the query has '
+            f"{contradiction.text}, {why}",
+            "question",
+            snippet=contradiction.text,
+            suggestion=f"Write the condition as {term.sql}.",
+            evidence={"term": term.name, "expected": term.sql, "found": contradiction.text},
+        )
+    outcome.status = DIFFERS
+    outcome.detail = found[0][0].text
+    return outcome, Finding(
+        "term_differs",
+        Severity.MEDIUM,
+        f'The catalogue defines "{match.phrase}" ({term.name}) as {term.sql}; the query filters '
+        f"{wanted.column} differently ({found[0][0].text}), which may or may not mean the same.",
+        "question",
+        snippet=found[0][0].text,
+        evidence={"term": term.name, "expected": term.sql, "found": found[0][0].text},
+    )
+
+
+def _tested_inside_or(ctx: CheckContext, column: str) -> str | None:
+    """The text of a test on ``column`` that sits inside an OR, if that is the only place it is tested."""
+    for model in ctx.cache.models():
+        for conjunct in model.conjuncts:
+            for part in flatten_and(conjunct.expr):
+                if isinstance(strip(part), exp.Or):
+                    for branch in flatten_or(strip(part)):
+                        for piece in flatten_and(branch):
+                            cond = _canonical(piece)
+                            if cond is not None and cond.column == column:
+                                return cond.text
+    return None
+
+
+def _same_condition(a: _Cond, b: _Cond) -> bool:
+    if a.column != b.column or a.op != b.op or tuple(a.values) != tuple(b.values):
+        return False
+    if a.op in ("ne", "not_in") and b.nulls_kept is not None:
+        return (a.nulls_kept or False) == b.nulls_kept
+    return True
+
+
+def _contradicts(found: _Cond, wanted: _Cond) -> bool:
+    if found.column != wanted.column:
+        return False
+    if found.op == wanted.op and tuple(found.values) == tuple(wanted.values):
+        return wanted.nulls_kept is not None and (found.nulls_kept or False) != wanted.nulls_kept
+    inverse = {"eq": "ne", "ne": "eq", "in": "not_in", "not_in": "in", "is_null": "not_null", "not_null": "is_null"}
+    return inverse.get(wanted.op) == found.op and tuple(found.values) == tuple(wanted.values)
+
+
+def _why(found: _Cond, wanted: _Cond) -> str:
+    if found.op == wanted.op:
+        if wanted.nulls_kept:
+            return "which drops rows where the column is NULL; the catalogue counts them."
+        return "which keeps rows where the column is NULL; the catalogue excludes them."
+    return "which selects the opposite rows."
+
+
+# ------------------------------------------------------------------ windows
+
+
+@dataclass
+class _Range:
+    column: str
+    lower: float | None
+    upper: float | None
+    point: float | None = None
+    preceding: int | None = None
+    text: str = ""
+
+    @property
+    def size(self) -> float | None:
+        if self.lower is not None and self.upper is not None:
+            return self.upper - self.lower + 1
+        return None
+
+
+def _number(node: exp.Expression) -> float | None:
+    """A numeric constant, with the arithmetic a catalogue writes (``-(26-1)``) folded."""
+    node = strip(node)
+    try:
+        if isinstance(node, exp.Literal) and not node.is_string:
+            return float(node.name)
+        if isinstance(node, exp.Neg):
+            inner = _number(node.this)
+            return None if inner is None else -inner
+        if isinstance(node, exp.Paren):
+            return _number(node.this)
+        if isinstance(node, (exp.Add, exp.Sub, exp.Mul)):
+            left, right = _number(node.this), _number(node.expression)
+            if left is None or right is None:
+                return None
+            return left + right if isinstance(node, exp.Add) else left - right if isinstance(node, exp.Sub) else left * right
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _constant_of(model: SelectModel | None, node: exp.Expression) -> float | None:
+    """A number, or a column that a derived source (``params AS (SELECT -25 AS from_seq ...)``)
+    defines as one."""
+    value = _number(node)
+    if value is not None or model is None:
+        return value
+    node = strip(node)
+    if isinstance(node, exp.Column) and node.table in model.sources:
+        source = model.sources[node.table]
+        if source.kind == "derived" and isinstance(source.node, exp.Select):
+            for projection in source.node.expressions:
+                if projection.alias_or_name == node.name:
+                    return _number(unalias(projection))
+    return None
+
+
+def _range_of(node: exp.Expression, model: SelectModel | None = None) -> _Range | None:
+    node = strip(node)
+    if isinstance(node, exp.Between):
+        column = _column_of(node.this)
+        low, high = _constant_of(model, node.args["low"]), _constant_of(model, node.args["high"])
+        if column and low is not None and high is not None:
+            return _Range(column, low, high, text=node.sql())
+    if isinstance(node, exp.EQ):
+        for side, other in ((node.this, node.expression), (node.expression, node.this)):
+            column = _column_of(side)
+            value = _constant_of(model, other)
+            if column and value is not None:
+                return _Range(column, None, None, point=value, text=node.sql())
+    if isinstance(node, (exp.GTE, exp.GT, exp.LTE, exp.LT)):
+        column = _column_of(node.this)
+        value = _constant_of(model, node.expression)
+        if column and value is not None:
+            if isinstance(node, exp.GTE):
+                return _Range(column, value, None, text=node.sql())
+            if isinstance(node, exp.GT):
+                return _Range(column, value + 1, None, text=node.sql())
+            if isinstance(node, exp.LTE):
+                return _Range(column, None, value, text=node.sql())
+            return _Range(column, None, value - 1, text=node.sql())
+    return None
+
+
+def _frame_preceding(spec: exp.WindowSpec) -> int | None:
+    start = spec.args.get("start")
+    side = str(spec.args.get("start_side") or "").upper()
+    if start is None or side != "PRECEDING":
+        return None
+    value = _number(start) if isinstance(start, exp.Expression) else None
+    return int(value) if value is not None else None
+
+
+def _ranges(ctx: CheckContext, column: str) -> list[_Range]:
+    """Ranges the query puts on ``column``: BETWEEN, pairs of inequalities in one SELECT, points."""
+    found: list[_Range] = []
+    for model in ctx.cache.models():
+        partial: list[_Range] = []
+        for conjunct in model.conjuncts:
+            for part in flatten_and(conjunct.expr):
+                r = _range_of(part, model)
+                if r is None or r.column != column:
+                    continue
+                if r.point is not None or (r.lower is not None and r.upper is not None):
+                    found.append(r)
+                else:
+                    partial.append(r)
+        lows = [p for p in partial if p.lower is not None]
+        highs = [p for p in partial if p.upper is not None]
+        for low in lows:
+            for high in highs:
+                found.append(_Range(column, low.lower, high.upper, text=f"{low.text} AND {high.text}"))
+        if lows and not highs:
+            found.extend(lows)
+        if highs and not lows:
+            found.extend(highs)
+    return found
+
+
+def _judge_window(ctx: CheckContext, term: Term, match: Match, node: exp.Expression, outcome: TermOutcome) -> tuple[TermOutcome, Finding | None]:
+    expected_text = _bind(term, match.bindings).sql
+    if isinstance(node, exp.WindowSpec):
+        preceding = _frame_preceding(node)
+        frames = [w.args.get("spec") for w in ctx.analysis.resolved.find_all(exp.Window) if w.args.get("spec") is not None]
+        found = [(_frame_preceding(s), s.sql()) for s in frames]
+        found = [(p, t) for p, t in found if p is not None]
+        if preceding is None:
+            outcome.detail = "the term's frame is not a plain N PRECEDING; not checked"
+            return outcome, None
+        if not found:
+            outcome.status = MISSING
+            outcome.detail = "no window frame in the query"
+            return outcome, Finding(
+                "term_missing",
+                Severity.MEDIUM,
+                f'The question asks for "{match.phrase}" ({term.name}), defined as {expected_text}, and the query has no such window frame.',
+                "question",
+                evidence={"term": term.name, "expected": expected_text},
+            )
+        if any(p == preceding for p, _ in found):
+            outcome.status = SATISFIED
+            return outcome, None
+        p, t = found[0]
+        outcome.status = CONTRADICTED
+        outcome.detail = t
+        return outcome, Finding(
+            "term_window",
+            Severity.HIGH,
+            f'The catalogue defines "{match.phrase}" ({term.name}) as {expected_text} ({preceding + 1} rows); '
+            f"the query's frame is {t} ({p + 1} rows).",
+            "question",
+            snippet=t,
+            evidence={"term": term.name, "expected": expected_text, "found": t},
+        )
+    wanted = _range_of(node)
+    if wanted is None:
+        outcome.detail = "the term's range is not a plain range on one column; not checked"
+        return outcome, None
+    found = _ranges(ctx, wanted.column)
+    if not found:
+        outcome.status = MISSING
+        outcome.detail = f"no range on {wanted.column}"
+        return outcome, Finding(
+            "term_missing",
+            Severity.MEDIUM,
+            f'The question asks for "{match.phrase}" ({term.name}), defined as {expected_text}, and the query puts no range on {wanted.column}.',
+            "question",
+            evidence={"term": term.name, "expected": expected_text},
+        )
+    for r in found:
+        if _same_range(r, wanted):
+            outcome.status = SATISFIED
+            outcome.detail = r.text
+            return outcome, None
+    same_shape = [r for r in found if (r.point is not None) == (wanted.point is not None)]
+    if not same_shape:
+        outcome.status = DIFFERS
+        outcome.detail = found[0].text
+        return outcome, None  # a range of another shape may belong to another term
+    r = same_shape[0]
+    outcome.status = CONTRADICTED
+    outcome.detail = r.text
+    if wanted.point is not None:
+        description = f"the query uses {r.text}"
+    else:
+        description = f"the query uses {r.text}" + (f" ({int(r.size)} rows of the sequence)" if r.size is not None else "")
+    size_note = f" ({int(wanted.size)} rows of the sequence)" if wanted.size is not None else ""
+    return outcome, Finding(
+        "term_window",
+        Severity.HIGH,
+        f'The catalogue defines "{match.phrase}" ({term.name}) as {expected_text}{size_note}; {description}.',
+        "question",
+        snippet=r.text,
+        suggestion=f"Write the range as {expected_text}.",
+        evidence={"term": term.name, "expected": expected_text, "found": r.text},
+    )
+
+
+def _same_range(a: _Range, b: _Range) -> bool:
+    if a.column != b.column:
+        return False
+    if b.point is not None:
+        return a.point == b.point
+    return a.lower == b.lower and a.upper == b.upper
+
+
+# ------------------------------------------------------------------- source
+
+
+def _judge_source(ctx: CheckContext, term: Term, match: Match, node: exp.Expression, outcome: TermOutcome) -> tuple[TermOutcome, Finding | None]:
+    if not isinstance(node, exp.Column) or not node.table:
+        return outcome, None
+    column, table = node.name.lower(), node.table.lower()
+    elsewhere: list[str] = []
+    for model in ctx.cache.models():
+        for ref in model.select.find_all(exp.Column):
+            if ref.name.lower() != column or ref.table not in model.sources:
+                continue
+            source = model.sources[ref.table]
+            if source.kind != "table" or source.table is None:
+                continue
+            names = {source.table.name.lower(), source.table.qualified_name.lower()}
+            if table not in names and table.split(".")[-1] not in names:
+                elsewhere.append(source.table.qualified_name)
+    if elsewhere:
+        outcome.status = CONTRADICTED
+        outcome.detail = f"{column} read from {sorted(set(elsewhere))[0]}"
+        return outcome, Finding(
+            "term_source",
+            Severity.MEDIUM,
+            f'The catalogue says "{match.phrase}" ({term.name}) comes from {term.sql}; the query reads '
+            f"{column} from {', '.join(sorted(set(elsewhere)))}, which may hold a stale or partial value.",
+            "question",
+            suggestion=f"Read {column} from {term.sql.rsplit('.', 1)[0]}.",
+            evidence={"term": term.name, "expected": term.sql, "found": sorted(set(elsewhere))},
+        )
+    outcome.status = SATISFIED
+    return outcome, None
+
+
+# ------------------------------------------------------------ formulas / KPIs
+
+_PRIOR_WORDS = re.compile(r"(prior|previous|prev|last|before|old|start|begin|py|ly|yoy_base|anchor)", re.I)
+_CURRENT_WORDS = re.compile(r"(current|cur|now|this|new|latest|end|cy|today)", re.I)
+
+
+def _projections_for(ctx: CheckContext, name: str, phrases: tuple[str, ...]) -> list[exp.Expression]:
+    """Root projections whose alias shares a word with the term's name or phrases."""
+    root = ctx.analysis.root_scope
+    if root is None or not isinstance(root.expression, exp.Select):
+        return []
+    words = set(re.split(r"[\s_]+", name.lower())) | {w for p in phrases for w in re.split(r"[\s_]+", p.lower()) if "{" not in w}
+    words = {w for w in words if len(w) >= 2}
+    found = []
+    for projection in root.expression.expressions:
+        alias = (projection.alias_or_name or "").lower()
+        tokens = set(re.split(r"[\s_]+", alias))
+        if alias and tokens & words:
+            found.append(projection)
+    return found
+
+
+def _integer_shaped(node: exp.Expression) -> bool:
+    node = strip(unalias(node))
+    if isinstance(node, exp.Cast):
+        return "INT" in str(node.to).upper()
+    if isinstance(node, (exp.Floor, exp.Ceil)):
+        return True
+    if isinstance(node, exp.Round):
+        decimals = node.args.get("decimals")
+        return decimals is None or _number(decimals) == 0
+    if isinstance(node, exp.Case):
+        branches = [branch.args["true"] for branch in (node.args.get("ifs") or [])]
+        default = node.args.get("default")
+        outputs = [b for b in branches + ([default] if default is not None else []) if not isinstance(strip(b), exp.Null)]
+        return bool(outputs) and all(_integer_shaped(b) for b in outputs)
+    if isinstance(node, exp.Count):
+        return True
+    return False
+
+
+def _has_scaling(node: exp.Expression) -> bool:
+    return any(isinstance(n, (exp.Div, exp.Mul)) for n in walk_own(node))
+
+
+def _judge_formula(ctx: CheckContext, term: Term, match: Match, node: exp.Expression, outcome: TermOutcome) -> tuple[TermOutcome, Finding | None]:
+    return _judge_shape(ctx, term.name, term.phrases, match, node, "integer" if _integer_shaped(node) else "", outcome)
+
+
+def _judge_kpi(ctx: CheckContext, kpi: KPI, match: Match, catalogue: Catalogue, dialect: str) -> tuple[TermOutcome, Finding | None]:
+    outcome = TermOutcome(kpi.name, "kpi", UNVERIFIED, phrase=match.phrase, bindings=match.bindings)
+    if not kpi.enforceable:
+        outcome.detail = "the catalogue describes this KPI but gives no formula or format"
+        return outcome, Finding(
+            "undefined_term",
+            Severity.LOW,
+            f'The question uses "{match.phrase}" ({kpi.name}), which the catalogue lists without a formula or format, '
+            "so sqlgami cannot confirm the query computes it correctly.",
+            "question",
+            evidence={"term": kpi.name, "phrase": match.phrase},
+        )
+    node = None
+    if kpi.formula.strip():
+        try:
+            from .terms import _placeholders_to_columns
+            import sqlglot
+
+            node = sqlglot.parse_one(f"SELECT {_placeholders_to_columns(kpi.formula)} AS v FROM t", read=dialect).expressions[0].this
+        except Exception:
+            node = None
+    fmt = kpi.format.lower()
+    wants_integer = "integer" in fmt or "int" in fmt.split() or "bp" in fmt or "floor" in fmt
+    return _judge_shape(ctx, kpi.name, kpi.phrases, match, node, "integer" if wants_integer else "", outcome, floored="floor" in fmt or (node is not None and any(isinstance(n, exp.Floor) for n in node.walk())))
+
+
+def _judge_shape(
+    ctx: CheckContext,
+    name: str,
+    phrases: tuple[str, ...],
+    match: Match,
+    node: exp.Expression | None,
+    unit: str,
+    outcome: TermOutcome,
+    floored: bool = False,
+) -> tuple[TermOutcome, Finding | None]:
+    projections = _projections_for(ctx, name, phrases)
+    if not projections:
+        outcome.detail = "no output column is named for this term"
+        return outcome, None
+    for projection in projections:
+        value = unalias(projection)
+        if unit == "integer" and _has_scaling(value) and not _integer_shaped(value):
+            outcome.status = CONTRADICTED
+            outcome.detail = projection.sql()
+            return outcome, Finding(
+                "term_format",
+                Severity.MEDIUM,
+                f'The catalogue says "{match.phrase}" ({name}) is an integer{" (floored)" if floored else ""}; '
+                f"the output column {projection.alias_or_name} is computed without casting or flooring to an integer, "
+                "so it will carry decimals.",
+                "question",
+                snippet=ctx.snippet(projection),
+                suggestion="Wrap the value in FLOOR(...) or CAST(... AS BIGINT) as the catalogue defines.",
+                evidence={"term": name, "column": projection.alias_or_name},
+            )
+        if floored and any(isinstance(n, exp.Round) for n in walk_own(value)) and not any(isinstance(n, exp.Floor) for n in walk_own(value)):
+            outcome.status = CONTRADICTED
+            outcome.detail = projection.sql()
+            return outcome, Finding(
+                "term_format",
+                Severity.MEDIUM,
+                f'The catalogue says "{match.phrase}" ({name}) is floored, not rounded; {projection.alias_or_name} uses ROUND.',
+                "question",
+                snippet=ctx.snippet(projection),
+                evidence={"term": name, "column": projection.alias_or_name},
+            )
+        direction = _direction_problem(node, value)
+        if direction is not None:
+            outcome.status = CONTRADICTED
+            outcome.detail = projection.sql()
+            return outcome, Finding(
+                "term_formula",
+                Severity.MEDIUM,
+                f'The catalogue defines "{match.phrase}" ({name}) as {direction[0]}; {projection.alias_or_name} subtracts the other way round ({direction[1]}).',
+                "question",
+                snippet=ctx.snippet(projection),
+                evidence={"term": name, "column": projection.alias_or_name},
+            )
+    outcome.status = SATISFIED
+    outcome.detail = projections[0].alias_or_name or ""
+    return outcome, None
+
+
+def _role(node: exp.Expression) -> str | None:
+    names = " ".join(f"{n.table} {n.name}" for n in node.find_all(exp.Column)) + " " + (node.alias_or_name or "")
+    prior, current = bool(_PRIOR_WORDS.search(names)), bool(_CURRENT_WORDS.search(names))
+    if prior and not current:
+        return "prior"
+    if current and not prior:
+        return "current"
+    return None
+
+
+def _direction_problem(formula: exp.Expression | None, value: exp.Expression) -> tuple[str, str] | None:
+    """The formula subtracts current − prior (by the names of its placeholders) and the value
+    subtracts prior − current (by the names of its operands)."""
+    if formula is None:
+        return None
+    sub = next((n for n in formula.walk() if isinstance(n, exp.Sub)), None)
+    if sub is None:
+        return None
+    left_role, right_role = _role(sub.this), _role(sub.expression)
+    if not left_role or not right_role or left_role == right_role:
+        return None
+    for candidate in walk_own(value):
+        if not isinstance(candidate, exp.Sub):
+            continue
+        l, r = _role(candidate.this), _role(candidate.expression)
+        if l and r and l != r and (l, r) != (left_role, right_role):
+            return (f"{left_role} minus {right_role}", candidate.sql())
+    return None

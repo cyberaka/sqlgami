@@ -93,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     p_cal.add_argument("--engine", action="append")
     p_cal.add_argument("--out", required=True, help="where to write the calibration JSON")
 
+    p_eval.add_argument("--no-terms", action="store_true", help="score without the suite's term catalogue (terms/ folder), to report both numbers")
     p_eval.add_argument("--role", choices=["confirm", "judge"], default="confirm", help="how far the alternatives are trusted")
     p_eval.add_argument("--max-samples", type=int, help="with --consistency: use only samples 0..N-1 of each verifier")
     p_eval.add_argument("--score-only", action="append", help="score only candidates from these generators (repeatable)")
@@ -187,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                     only_generators=args.score_only,
                     role=args.role,
                     substitute=args.substitute,
+                    terms=not args.no_terms,
                 )
                 path = write_run(suite, engine, mode, items, result, run_id)
                 print(f"== {suite.name} / {engine} / {mode}")

@@ -325,6 +325,57 @@ It has no default model, accepts only models from an allowlist of families
 Using it sends your question, a description of your schema and your glossary
 to the provider.
 
+### Business terms: the term catalogue
+
+"Not on leave", "the last 26 pay periods", "turnover in basis points" mean
+whatever your data engineers say they mean. sqlgami ships no vocabulary of its
+own: you declare your terms and KPIs in a spreadsheet (one `.xlsx` with the
+sheets below, or the same sheets as CSV files in a folder — the form that
+diffs in git), and every question phrase that matches a term is checked
+against the term's data-level meaning. A term the catalogue does not define in
+data terms is reported as `undefined_term` and caps confidence at 0.75:
+sqlgami never guesses what a word means.
+
+`Terms.csv` (one row per term; `phrases` separated by `;`, `{n}` a number from
+the question, `{manager_id}` a template parameter):
+
+```csv
+term,phrases,kind,table,sql,nulls,description
+not_on_leave,not on leave,filter,hr.emp_period_snapshot,status_cd IS DISTINCT FROM 'L',include,NULL status is not on leave
+last_n_pay_periods,last {n} pay periods,window,hr.pay_period_dim,period_seq BETWEEN -({n}-1) AND 0,,
+n_pay_periods_ago,{n} pay periods ago,window,hr.pay_period_dim,period_seq = -{n},,
+hire_date,hire date;hired in,source,,hr.employee_dim.hire_dt,,the snapshot's copy may be stale
+my_organisation,my organisation;my org,chain,hr.emp_period_snapshot,"lvl_2_id, lvl_3_id, lvl_2_id_fn, lvl_3_id_fn = {manager_id}",,
+headcount,headcount,,,,,documentation only: matched but not enforced
+```
+
+`KPIs.csv`: `kpi,phrases,formula,format,reference_sql,description`, for example
+`basis_points,basis points;bp,CAST(FLOOR({rate} * 10000) AS BIGINT),integer floor,,`.
+`Parameters.csv` names template parameters and formula inputs
+(`manager_id,integer,12003` / `rate,input,`); `Examples.csv` holds training
+questions with their correct SQL for the offline compile step.
+
+```python
+scorer = Scorer("duckdb", db=conn, terms="metadata/terms/")   # or "metadata/terms.xlsx"
+```
+
+Kinds and what is checked, by structure rather than text: `filter` — an
+equivalent condition on that column is present, NULL behaviour included
+(`status_cd != 'L'` against `IS DISTINCT FROM 'L'` with `nulls: include` is a
+HIGH `term_contradicted`, a missing one `term_missing`, a different filter on
+the column `term_differs`); `window` — the query's range on the column has
+the declared size or offset (`BETWEEN -26 AND 0` for "last 26 periods" is
+`term_window`, frames `ROWS BETWEEN n PRECEDING` too); `source` — the column
+is read from the table named (`term_source`); `chain` — an access OR-chain
+over the listed columns (judged as a required predicate); KPI `format`
+`integer`/`floor` — the output column named for the KPI is cast or floored and
+not rounded (`term_format`), and a formula `({current} - {prior}) ...` is not
+subtracted the other way round (`term_formula`). Every match and outcome is in
+`report.signals["terms"]`. `Catalogue.load(path).validate()` reports problems
+by sheet, row and column; a catalogue with problems is refused. Reading
+`.xlsx` needs `pip install sqlgami[excel]`; CSV needs nothing. The HR example
+lives in `examples/terms/`.
+
 ### Policies
 
 Some filters are rules of your organisation, not properties of the SQL. Tell

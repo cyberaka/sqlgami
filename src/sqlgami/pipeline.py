@@ -175,10 +175,11 @@ def run(
     generator: Any = None,
     probes: Sequence[Any] | None = None,
     prober: Any = None,
+    terms: Any = None,
 ) -> Report:
     options = options or Options()
     report = Report(engine=engine, mode=mode, sql=sql, question=question)
-    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober)
+    _run(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober, terms)
     report.findings = _dedupe(report.findings)
     scored = score_report(report, calibrator)
     report.confidence = scored.confidence
@@ -228,6 +229,7 @@ def _run(
     generator: Any = None,
     probes: Sequence[Any] | None = None,
     prober: Any = None,
+    terms: Any = None,
 ) -> None:
     clock = _Clock()
     bounded: _Bounded | None = _Bounded(adapter, options.budget_s) if adapter is not None else None
@@ -468,7 +470,7 @@ def _run(
         params,
     )
     _reconcile_stage(report, prepared.executable_sql or sql, dialect, mode, catalog, adapter, question, glossary, options, probes, prober, params)
-    _question_stage(report, ctx, adapter, question, glossary, mode, options)
+    _question_stage(report, ctx, adapter, question, glossary, mode, options, terms, params)
     if bounded is not None and bounded.spent:
         report.findings.append(
             Finding(
@@ -638,6 +640,8 @@ def _question_stage(
     glossary: str | None,
     mode: str,
     options: Options,
+    terms: Any = None,
+    params: dict[str, Any] | None = None,
 ) -> None:
     if not question or not question.strip():
         _stage(report, "question", StageStatus.NOT_RUN, "no question was supplied")
@@ -655,6 +659,12 @@ def _question_stage(
         _profile_values(report, ctx, adapter, options)
     adjust_findings(report.findings, question)
     findings = run_question_checks(ctx, question, glossary)
+    if terms is not None and len(terms):
+        from .termcheck import check_terms
+
+        term_findings, signal = check_terms(ctx, question, terms, ctx.dialect, params)
+        report.signals["terms"] = signal
+        findings.extend(term_findings)
     report.findings.extend(findings)
     _stage(report, "question", StageStatus.PASSED, f"{len(findings)} finding(s)", clock.lap())
 

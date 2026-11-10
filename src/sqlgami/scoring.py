@@ -88,6 +88,11 @@ SOFT_CAP_CODES = {
     "execution_timeout": CAP_ENGINE_UNAVAILABLE,
     "execution_unavailable": CAP_ENGINE_UNAVAILABLE,
 }
+# A business term the question uses that the host's catalogue does not define in data terms:
+# sqlgami cannot confirm the query reads it correctly, so confidence stays below this unless
+# reliable independent sources agree with the answer (that is evidence about the answer, not
+# about the words).
+CAP_UNDEFINED_TERM = 0.75
 
 
 class Calibrator(Protocol):
@@ -152,6 +157,18 @@ def _reconciliation_bonus(report: Report) -> float:
     return BONUS_RECONCILED[1] if satisfied >= 2 else BONUS_RECONCILED[0]
 
 
+def _reliable_agreement(report: Report) -> bool:
+    """Independent sources known to be reliable agree with the result (weighted consistency), or
+    two sources agreed on anchors the result satisfies."""
+    signal = report.signals.get("consistency") or {}
+    if signal.get("weighted") and float(signal.get("agreeing_weight") or 0) >= 1.2:
+        rival = signal.get("largest_disagreeing_cluster_sources") or 0
+        if (signal.get("agreeing_sources") or 0) > rival:
+            return True
+    anchors = report.signals.get("reconciliation") or {}
+    return bool(anchors.get("agreed_satisfied")) and not anchors.get("violated")
+
+
 def _consistency_bonus(report: Report) -> float:
     """Support from independently written queries that return the same result."""
     signal = report.signals.get("consistency") or {}
@@ -194,6 +211,9 @@ def score_report(report: Report, calibrator: Calibrator | None = None) -> Scored
         if finding.severity == Severity.HIGH:
             apply_cap(CAP_HARD_FINDING, f"high-severity finding: {finding.code}")
             break
+    if any(f.code == "undefined_term" for f in findings) and not _reliable_agreement(report):
+        names = sorted({str(f.evidence.get("term") or "?") for f in findings if f.code == "undefined_term"})
+        apply_cap(CAP_UNDEFINED_TERM, f"the catalogue does not define: {', '.join(names)}")
 
     if cap is not None and cap <= CAP_CANNOT_RUN:
         value = 0.0 if cap == CAP_INVALID else cap / 2

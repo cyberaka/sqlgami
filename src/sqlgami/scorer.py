@@ -66,6 +66,13 @@ class Scorer:
         stage, measured on a labelled set of your own. Agreement from a source right less than
         half the time earns little; two sources right most of the time that agree with each
         other against the query make a HIGH finding. Names match by substring.
+    terms:
+        The term catalogue: a folder of CSV sheets (``Terms.csv``, ``KPIs.csv``, ...), an
+        ``.xlsx`` workbook with those sheets, or YAML/dict/list rows — how the host's business
+        terms and KPIs are represented in the data (see :mod:`sqlgami.terms`). A question
+        phrase that matches a term is checked against the term's definition; a term the
+        catalogue describes without a data-level definition is reported as `undefined_term`
+        and caps confidence. sqlgami ships no vocabulary of its own.
     allowed_tables:
         System relations a query may read (``"information_schema.*"``,
         ``"pg_catalog.pg_tables"``, ``"pragma_table_info"``). By default a statement that
@@ -102,6 +109,7 @@ class Scorer:
         allowed_tables: Sequence[str] | None = None,
         source_weights: dict[str, float] | None = None,
         prober: Any = None,
+        terms: Any = None,
     ) -> None:
         self.dialect = dialect_for(engine.lower())
         self.engine = "postgres" if self.dialect == "postgres" else engine.lower()
@@ -142,6 +150,16 @@ class Scorer:
                 self.catalog.snapshot_columns.update({k.lower(): v for k, v in snapshot_columns.items()})
             if default_project is not None:
                 self.catalog.default_project = default_project
+
+        # The term catalogue: how the host's business terms are represented in the data. A
+        # glossary written as YAML with a ``terms:`` section carries one too.
+        from .terms import catalogue_from_yaml_glossary, load_terms
+
+        self.terms = load_terms(terms) if terms is not None else None
+        if self.terms is None and isinstance(glossary, str) and "terms:" in glossary:
+            self.terms = catalogue_from_yaml_glossary(glossary)
+        if self.terms is not None and self.catalog is not None:
+            self.catalog.required_predicates.extend(_chain_rules(self.terms))
 
         self.options = options or Options()
         if allowed_functions:
@@ -239,6 +257,7 @@ class Scorer:
             generator=self.generator,
             probes=probes,
             prober=self.prober,
+            terms=self.terms,
         )
 
     def explain(self, sql: str, question: str | None = None, params: dict[str, Any] | None = None) -> Report:
@@ -278,3 +297,17 @@ class Scorer:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+
+def _chain_rules(catalogue: Any) -> list[RequiredPredicate]:
+    """Terms of kind ``chain`` are access-chain rules: ``col1, col2, ... = {param}`` on a table."""
+    rules: list[RequiredPredicate] = []
+    for term in catalogue.terms:
+        if term.kind != "chain" or not term.sql.strip():
+            continue
+        left, _, _ = term.sql.rpartition("=")
+        columns = tuple(c.strip() for c in left.split(",") if c.strip())
+        tables = tuple(t.strip() for t in term.table.split(";") if t.strip())
+        if columns:
+            rules.append(RequiredPredicate(term.name, columns, tables, "or_chain", "high", term.description))
+    return rules
