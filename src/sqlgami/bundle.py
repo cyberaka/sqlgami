@@ -484,11 +484,26 @@ def _run_on(
 # ------------------------------------------------------------------ loading
 
 
+def bundle_hash(folder: str | Path) -> str:
+    """A content hash of everything live scoring reads from the bundle — manifest, references,
+    the catalogue copy and every fixture file — so a frozen bundle can be named by one string and
+    a report says which bundle produced it. Independent of file timestamps and folder location."""
+    root = Path(folder)
+    h = hashlib.sha256()
+    for file in sorted(p for p in root.rglob("*") if p.is_file() and "review" not in p.relative_to(root).parts and p.name != "rejected.jsonl"):
+        h.update(str(file.relative_to(root)).replace("\\", "/").encode("utf-8"))
+        h.update(b"\0")
+        h.update(file.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 class Bundle:
     def __init__(self, path: Path, manifest: dict[str, Any], references: list[Reference]) -> None:
         self.path = path
         self.manifest = manifest
         self.references = references
+        self.hash = ""  # the content hash of the folder as loaded (see bundle_hash); reports carry it
         self._fixtures: dict[str, Fixture] | None = None
         self._connections: dict[str, Any] = {}
         self._by_question = {r.question_key: r for r in references}
@@ -524,7 +539,9 @@ class Bundle:
         if int(manifest.get("bundle_version", 0)) != BUNDLE_VERSION:
             raise ConfigurationError(f"bundle version {manifest.get('bundle_version')} is not {BUNDLE_VERSION}; recompile it")
         references = [Reference.from_dict(r) for r in json.loads((folder / "references.json").read_text(encoding="utf-8"))]
-        return cls(folder, manifest, references)
+        bundle = cls(folder, manifest, references)
+        bundle.hash = bundle_hash(folder)
+        return bundle
 
     @property
     def dialect(self) -> str:

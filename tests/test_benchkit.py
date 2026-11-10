@@ -317,6 +317,14 @@ def test_sync_records_checksums_and_refuses_a_stale_copy(tmp_path):
         load_suite(dest)
     sync_suite(source, dest)
     load_suite(dest)  # resynced
+    # the term catalogue travels with the suite and is guarded sheet by sheet
+    (source / "terms").mkdir()
+    (source / "terms" / "Terms.csv").write_text("term,phrases,kind,table,sql,nulls,description\npaid,paid,filter,orders,status = 'paid',,\n")
+    recorded = sync_suite(source, dest)
+    assert "terms/Terms.csv" in recorded and (dest / "terms" / "Terms.csv").exists()
+    (source / "terms" / "Terms.csv").write_text("term,phrases,kind,table,sql,nulls,description\npaid,paid;settled,filter,orders,status = 'paid',,\n")
+    with pytest.raises(SuiteError, match="terms/Terms.csv changed"):
+        load_suite(dest)
 
 
 def test_sync_keeps_the_scorer_block_the_source_lacks(tmp_path):

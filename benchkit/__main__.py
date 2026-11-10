@@ -167,7 +167,9 @@ def main(argv: list[str] | None = None) -> int:
             if m := bundle.manifest.get("expansion"):
                 print(f"  expansion ({m['model']}): {m['proposals']} proposals, {len(m['phrases'])} wordings accepted for review, {len(m['variants'])} variants compiled, {m['rejected']} rejected" + (" — wordings accepted into the bundle's Terms copy" if bundle.manifest.get("expansion_accepted") else ""))
             m = bundle.manifest
-            print(f"bundle: {bundle.path}  references {m['references']} (rejected {m['rejected']})")
+            from sqlgami.bundle import bundle_hash
+
+            print(f"bundle: {bundle.path}  references {m['references']} (rejected {m['rejected']})  hash {bundle_hash(bundle.path)[:16]}")
             for entry in m["fixtures"]:
                 print(f"  {entry['name']:16} {entry['rows']:6} rows   gold p50 {entry['reference_ms'] or 0:.1f} ms  max {entry['reference_max_ms'] or 0:.1f} ms   bugs diverging {entry.get('discrimination', '-')}/{m.get('bugs_measured', '-')}")
             for key, numbers in (m.get("references_with_free_numbers") or {}).items():

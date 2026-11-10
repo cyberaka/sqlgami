@@ -64,7 +64,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"sqlgami: {exc}", file=sys.stderr)
             return 2
         manifest = bundle.manifest
-        print(f"bundle written to {bundle.path}")
+        from .bundle import bundle_hash
+
+        print(f"bundle written to {bundle.path}  (hash {bundle_hash(bundle.path)[:16]})")
         print(f"  schema {manifest['schema_hash'][:12]}…, {len(manifest['fixtures'])} fixture(s), {manifest['references']} reference(s), {manifest['rejected']} rejected")
         for entry in manifest["fixtures"]:
             print(f"  {entry['name']:16} {entry['rows']:6} rows   reference query p50 {entry['reference_ms'] or 0:.1f} ms, max {entry['reference_max_ms'] or 0:.1f} ms")

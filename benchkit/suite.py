@@ -243,6 +243,11 @@ def sync_suite(source: str | Path, dest: str | Path, *, keep_sqlgami_block: bool
         recorded[name] = _md5(src)
     if (source / "schema").is_dir():
         shutil.copytree(source / "schema", dest / "schema", dirs_exist_ok=True)
+    if (source / "terms").is_dir():
+        # The term catalogue is the bench author's too: copied whole and checksummed per sheet.
+        shutil.copytree(source / "terms", dest / "terms", dirs_exist_ok=True)
+        for sheet in sorted(p for p in (source / "terms").iterdir() if p.is_file()):
+            recorded[f"terms/{sheet.name}"] = _md5(sheet)
     record_file = dest / SYNC_FILE
     sources: list[dict[str, Any]] = []
     if record_file.exists():

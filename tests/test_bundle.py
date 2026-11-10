@@ -97,6 +97,24 @@ def test_reference_by_key_and_parameters_and_no_reference(bundle_dir):
         assert none.verdict.value != "likely_right"
 
 
+def test_bundle_hash_names_the_content_and_reports_carry_it(bundle_dir, tmp_path):
+    from sqlgami.bundle import bundle_hash
+    import shutil
+
+    loaded = Bundle.load(bundle_dir)
+    assert loaded.hash == bundle_hash(bundle_dir) and len(loaded.hash) == 64
+    copy = tmp_path / "elsewhere"
+    shutil.copytree(bundle_dir, copy)
+    assert bundle_hash(copy) == loaded.hash  # location and timestamps do not matter
+    (copy / "review").mkdir(exist_ok=True)
+    (copy / "review" / "Terms.additions.csv").write_text("term,phrase,evidence\n")
+    assert bundle_hash(copy) == loaded.hash  # the review file is not read live
+    (copy / "references.json").write_text((copy / "references.json").read_text().replace("Total order value", "Total order worth"))
+    assert bundle_hash(copy) != loaded.hash
+    with Scorer("duckdb", catalog=SHOP_DDL, bundle=bundle_dir) as scorer:
+        assert scorer.explain(RIGHT, QUESTION).signals["fixtures"]["bundle"] == loaded.hash[:16]
+
+
 def test_bundle_is_tied_to_the_schema_and_the_dialect(bundle_dir):
     with pytest.raises(ConfigurationError, match="different schema"):
         Scorer("duckdb", catalog=SHOP_DDL + "\nCREATE TABLE extra (id INTEGER);", bundle=bundle_dir)

@@ -704,7 +704,7 @@ def _fixture_stage(
             return
 
     clock = _Clock()
-    outcome: dict[str, Any] = {"reference": reference.key, "matched_by": how, "params": live_params, "slots": live_slots, "reference_rerun": not same_values, "fixtures": []}
+    outcome: dict[str, Any] = {"bundle": bundle.hash[:16], "reference": reference.key, "matched_by": how, "params": live_params, "slots": live_slots, "reference_rerun": not same_values, "fixtures": []}
     matched = 0
     mismatch: Finding | None = None
     for entry in bundle.fixture_order():
