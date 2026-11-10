@@ -46,11 +46,35 @@ seeds:
   - {seed: 42, profile: nasty}
   - {seed: 43, profile: nasty}
   - {seed: 44, profile: nasty}
+  - {seed: 45, profile: clean}  # pooled person-id hierarchy; 12003 is a manager employee
+  - {seed: 46, profile: nasty}  # pooled person-id hierarchy; 12003 is a manager employee
+
+seed_45_46_pooling:
+  rule: >
+    On seeds 45 and 46 ONLY, hierarchy node_ids are drawn from a shared pool of person
+    assoc_ids (the same assoc_ids that appear in hr.employee_dim). The reporting and
+    functional chains both draw from this pool, so a single person_id can appear as a
+    node in BOTH chains at potentially different levels. Employees' assoc_ids on these
+    seeds span 12001..12300 (300 employees) instead of the 900001-based range used on
+    other seeds. Seeds 1-3 and 42-44 are unchanged from their byte-identical frozen state.
+  default_manager_scope:
+    manager_id: 12003
+    placement: >
+      On seeds 45/46, 12003 is placed at reporting LVL_3 (big subtree) AND functional
+      LVL_7 (single leaf). Some associates match {manager_id}=12003 only via the _fn
+      chain, exposing the missing-_fn-set trap.
+  mid_year_churn: >
+    On seeds 45/46 under 12003's reporting subtree: 10 "long-term loyal", 10 "recent
+    layoffs" (term ~100-200 days ago), and 10 mid-year hires at 346-355 days ago. The
+    layoffs make year-over-year growth negative on seed 45; the mid-year hires span the
+    350-vs-364-day boundary.
 
 row_budget:
   clean_seed_1: 35149    # 156 + 1112 + 250 + 33606 + 15 + 10 + 5 (ref)
   nasty_seed_42: 35234   # 156 + 1093 + 256 + 33699 + 30 (ref totals)
   nasty_seed_44: 36750   # 156 + 1092 + 264 (250 + 8 early leavers + 6 nasty) + 35205 + 30
+  clean_seed_45: 41389   # 156 + 378 + 300 + 40851 + 30 (ref totals)
+  nasty_seed_46: 39772   # 156 + 373 + 301 + 39112 + 30 (ref totals)
   cap: 50000
 
 session:

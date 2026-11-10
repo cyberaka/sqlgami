@@ -93,6 +93,48 @@ def build_hierarchy(rng, kind: str, has_fn_gaps: bool = False):
     return [(lvl, nid, name, pid, kind) for lvl, nid, name, pid in nodes]
 
 
+# Shrunk hierarchy structure used ONLY for seeds 45/46 (person-id-pooled).
+STRUCTURE_POOLED = (3, 6, 12, 24, 48, 96)  # L2..L7 counts; total 189 nodes per kind
+# 12003 (manager_id in released question params) is embedded at specific positions
+# so that scope via rep and fn both hit it, but at different depths.
+KEY_MGR = 12003
+KEY_POS = {"reporting": 3, "functional": 189 - 1}  # L3[0] rep; L7[-1] fn (leaf)
+
+
+def build_pooled_hierarchy(rng, kind: str, pool: list, has_fn_gaps: bool = False):
+    """Hierarchy where node_ids are drawn from the person-id pool.
+    Ensures KEY_MGR (12003) is placed at KEY_POS[kind] in the traversal order so
+    that seed-45/46 queries with {manager_id}=12003 have deterministic coverage.
+    """
+    rest = [p for p in pool if p != KEY_MGR]
+    rng.shuffle(rest)
+    pos = KEY_POS[kind]
+    nodes_ids = rest[:pos] + [KEY_MGR] + rest[pos:]
+    nodes_ids = nodes_ids[:189]
+
+    idx = 0
+    def take():
+        nonlocal idx; v = nodes_ids[idx]; idx += 1; return v
+
+    nodes = []
+    lvl2 = [(2, take(), f"{kind[:3].upper()}-L2-{j:02}", None) for j in range(STRUCTURE_POOLED[0])]
+    nodes.extend(lvl2)
+    prev = lvl2
+    for lvl, count in zip(range(3, 8), STRUCTURE_POOLED[1:]):
+        branches = max(1, count // len(prev))
+        cur = []
+        for parent in prev:
+            for _ in range(branches):
+                nid = take()
+                cur.append((lvl, nid, f"{kind[:3].upper()}-L{lvl}-{nid}", parent[1]))
+        prev = cur
+        nodes.extend(cur)
+    if has_fn_gaps and kind == "functional":
+        kept = [n for n in nodes if not (n[0] == 6 and rng.random() < 0.1)]
+        nodes = kept
+    return [(lvl, nid, name, pid, kind) for lvl, nid, name, pid in nodes]
+
+
 def chain_for_leaf(leaf_id: int, by_lvl_parent: dict):
     """Given a leaf LVL_7 id, climb to LVL_2 by looking up parents at each level."""
     chain = {7: leaf_id}
@@ -179,27 +221,33 @@ def generate(seed: int, profile: str, out_dir: Path):
         })
 
     has_fn_gaps = (profile != "clean")
-    rep_hier = build_hierarchy(rng, "reporting")
-    fn_hier = build_hierarchy(rng, "functional", has_fn_gaps=has_fn_gaps)
+    # Seeds 45/46 use pooled person-id hierarchy; seeds 1-3/42/43/44 are UNCHANGED.
+    use_pooled = seed in (45, 46)
+    if use_pooled:
+        AID_BASE = 12001
+        N_EMP = 300
+        pool = list(range(AID_BASE, AID_BASE + N_EMP))
+        rep_hier = build_pooled_hierarchy(rng, "reporting", pool)
+        fn_hier = build_pooled_hierarchy(rng, "functional", pool, has_fn_gaps=has_fn_gaps)
+    else:
+        rep_hier = build_hierarchy(rng, "reporting")
+        fn_hier = build_hierarchy(rng, "functional", has_fn_gaps=has_fn_gaps)
     hierarchy = rep_hier + fn_hier
-    # parent lookup: node_id -> parent_node_id (within same kind)
     rep_parent = {nid: pid for (lvl, nid, nm, pid, kind) in rep_hier}
     fn_parent = {nid: pid for (lvl, nid, nm, pid, kind) in fn_hier}
     rep_leaves = [nid for (lvl, nid, nm, pid, kind) in rep_hier if lvl == 7]
     fn_leaves = [nid for (lvl, nid, nm, pid, kind) in fn_hier if lvl == 7]
 
-    # Skewed weights (same rng stream reuse → deterministic)
     rep_weights = skewed_leaf_weights(rng, rep_leaves)
     fn_weights = skewed_leaf_weights(rng, fn_leaves)
 
-    n_emp = 250 if profile == "clean" else 255
+    n_emp = 300 if use_pooled else (250 if profile == "clean" else 255)
+    aid_base = 12001 if use_pooled else 900001
     employees = []
     assoc_assignments = {}
-    # Seed 44 injects early-leaver-rich hires so termed_90_n is not always 0.
-    # This runs ONLY on seed 44; seeds 1-3/42/43 stream the RNG identically to before.
     inject_early_leavers_seed44 = (seed == 44 and profile == "nasty")
     for i in range(n_emp):
-        aid = 900001 + i
+        aid = aid_base + i
         given = GIVEN_NAMES[rng.randint(0, len(GIVEN_NAMES) - 1)]
         family = FAMILY_NAMES[rng.randint(0, len(FAMILY_NAMES) - 1)]
         # Hire anywhere from 30 days to 8 years before as_of
@@ -229,6 +277,69 @@ def generate(seed: int, profile: str, out_dir: Path):
             "rep_chain": chain_for_leaf(rep_leaf, rep_parent),
             "fn_chain": chain_for_leaf(fn_leaf, fn_parent),
         }
+
+    # Seeds 45/46 churn: force some employees to be under 12003's reporting subtree with
+    # specific hire/term dates that make q006 (YoY growth) negative AND expose the
+    # 350-vs-364-day trap. Does NOT run on seeds 1-3/42/43/44.
+    if use_pooled:
+        # find leaves under 12003 in reporting chain
+        def descends_through(leaf_id, parent_map, target):
+            cur = leaf_id
+            while cur is not None:
+                if cur == target: return True
+                cur = parent_map.get(cur)
+            return False
+        rep_under_12003 = [l for l in rep_leaves if descends_through(l, rep_parent, KEY_MGR)]
+        fn_leaf_12003 = KEY_MGR if KEY_MGR in fn_leaves else None  # 12003 is placed at fn LVL_7[-1]
+
+        if rep_under_12003:
+            # Pick 20 employees and force their rep_chain to a leaf under 12003
+            picks = rng.sample(sorted(assoc_assignments.keys()), min(20, len(assoc_assignments)))
+            # 10 are "long-term loyal under 12003" — hire 2+ years ago, no term
+            # 10 are "recent layoff under 12003" — hire 2+ years ago, term 100-200 days ago
+            for k, aid in enumerate(picks):
+                leaf = rep_under_12003[k % len(rep_under_12003)]
+                new_rep_chain = chain_for_leaf(leaf, rep_parent)
+                if k < 10:
+                    hd = AS_OF - timedelta(days=365 * 2 + rng.randint(0, 200))
+                    td = None
+                else:
+                    hd = AS_OF - timedelta(days=365 * 2 + rng.randint(0, 200))
+                    td = AS_OF - timedelta(days=rng.randint(100, 200))
+                assoc_assignments[aid]["hire_dt_d"] = hd
+                assoc_assignments[aid]["term_dt_d"] = td
+                assoc_assignments[aid]["rep_chain"] = new_rep_chain
+                # update employee_dim row to match
+                for e in employees:
+                    if e["assoc_id"] == aid:
+                        e["hire_dt"] = hd.isoformat()
+                        e["term_dt"] = td.isoformat() if td else None
+                        break
+            # 10 mid-year hires under 12003 (hire 335-360 days ago) — exposes 350-vs-364 trap
+            mid_year_aids = rng.sample(
+                [a for a in assoc_assignments.keys() if a not in picks],
+                min(10, len(assoc_assignments) - len(picks))
+            )
+            for k, aid in enumerate(mid_year_aids):
+                leaf = rep_under_12003[k % len(rep_under_12003)]
+                hd = AS_OF - timedelta(days=355 - k)  # 355, 354, 353 ... 346 days ago
+                assoc_assignments[aid]["hire_dt_d"] = hd
+                assoc_assignments[aid]["term_dt_d"] = None
+                assoc_assignments[aid]["rep_chain"] = chain_for_leaf(leaf, rep_parent)
+                for e in employees:
+                    if e["assoc_id"] == aid:
+                        e["hire_dt"] = hd.isoformat()
+                        e["term_dt"] = None
+                        break
+        # 8 employees get fn_leaf = 12003 (match via _fn only if NOT in rep subtree)
+        if fn_leaf_12003 is not None:
+            non_rep_ids = [a for a in assoc_assignments.keys()
+                           if assoc_assignments[a]["rep_chain"].get("lvl_3_id") != KEY_MGR
+                           and assoc_assignments[a]["rep_chain"].get("lvl_4_id") != KEY_MGR]
+            fn_only = rng.sample(non_rep_ids, min(8, len(non_rep_ids)))
+            fn_chain_12003 = chain_for_leaf(fn_leaf_12003, fn_parent)
+            for aid in fn_only:
+                assoc_assignments[aid]["fn_chain"] = fn_chain_12003
 
     if inject_early_leavers_seed44:
         # Pick a leaf whose chain climbs to LVL_2 = 12003 (the big reporting org under {manager_id}=12003).

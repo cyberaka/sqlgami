@@ -15,6 +15,8 @@ import datetime as dt
 import json
 import math
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Sequence
@@ -32,8 +34,13 @@ class Outcome:
     error: str | None = None
 
 
-def run_sql(conn: Any, sql: str, max_rows: int = 100_000) -> Outcome:
-    """Execute a statement on a read-only bench connection."""
+TIMEOUT_S = 60.0  # a statement that runs longer than this is reported as a timeout, not as wrong
+TIMED_OUT = "timed out"
+
+
+def run_sql(conn: Any, sql: str, max_rows: int = 100_000, timeout_s: float = TIMEOUT_S) -> Outcome:
+    """Execute a statement on a read-only bench connection, within a time limit."""
+    stop = _deadline(conn, timeout_s)
     try:
         cursor = conn.execute(sql)
         columns = [d[0] for d in cursor.description or []]
@@ -42,7 +49,60 @@ def run_sql(conn: Any, sql: str, max_rows: int = 100_000) -> Outcome:
             cursor.close()
         return Outcome(True, rows, columns)
     except Exception as exc:  # any engine error is a result here, not a crash
-        return Outcome(False, error=" ".join(str(exc).split())[:300])
+        text = " ".join(str(exc).split())
+        if stop.expired or "interrupt" in text.lower() or "statement timeout" in text.lower() or "canceling statement" in text.lower():
+            return Outcome(False, error=f"{TIMED_OUT} after {timeout_s:g}s")
+        return Outcome(False, error=text[:300])
+    finally:
+        stop.cancel()
+
+
+class _Deadline:
+    def __init__(self) -> None:
+        self.expired = False
+        self._timer: threading.Timer | None = None
+        self._restore: Any = None
+
+    def cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        if self._restore is not None:
+            self._restore()
+
+
+def _deadline(conn: Any, timeout_s: float) -> _Deadline:
+    """Arrange for ``conn`` to give up after ``timeout_s`` seconds, whatever engine it is."""
+    stop = _Deadline()
+    module = type(conn).__module__ or ""
+    if module.startswith("sqlite3"):
+        started = time.monotonic()
+
+        def handler() -> int:
+            if time.monotonic() - started > timeout_s:
+                stop.expired = True
+                return 1
+            return 0
+
+        conn.set_progress_handler(handler, 10_000)
+        stop._restore = lambda: conn.set_progress_handler(None, 0)
+    elif "duckdb" in module:
+
+        def interrupt() -> None:
+            stop.expired = True
+            try:
+                conn.interrupt()
+            except Exception:
+                pass
+
+        stop._timer = threading.Timer(timeout_s, interrupt)
+        stop._timer.daemon = True
+        stop._timer.start()
+    elif module.startswith("psycopg"):
+        try:
+            conn.execute(f"SET statement_timeout = {int(timeout_s * 1000)}")
+        except Exception:
+            pass
+    return stop
 
 
 def _timestamp_text(value: dt.datetime) -> str:

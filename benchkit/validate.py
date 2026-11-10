@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import build
-from .compare import Outcome, run_sql, same_outcome, same_rows
+from .compare import TIMED_OUT, Outcome, run_sql, same_outcome, same_rows
 from .suite import Question, Seed, Suite, Variant
 
 BUG_CLASSES = {
@@ -93,6 +93,8 @@ class Runner:
         self.engines = engines
         self._conns: dict[tuple[str, str], Any] = {}
         self._gold: dict[tuple[str, str, str], Outcome] = {}
+        self._matched: dict[tuple[str, str, str], str | None] = {}
+        self._runs: dict[tuple[str, str, str], Outcome] = {}
 
     def conn(self, engine: str, seed: Seed) -> Any:
         key = (engine, seed.label)
@@ -101,7 +103,10 @@ class Runner:
         return self._conns[key]
 
     def run(self, engine: str, seed: Seed, sql: str) -> Outcome:
-        return run_sql(self.conn(engine, seed), sql)
+        key = (engine, seed.label, sql)
+        if key not in self._runs:
+            self._runs[key] = run_sql(self.conn(engine, seed), sql)
+        return self._runs[key]
 
     def gold(self, question: Question, engine: str, seed: Seed) -> Outcome | None:
         sql = question.gold(engine)
@@ -131,9 +136,21 @@ class Runner:
         return matched != ""
 
     def matched_answer(self, question: Question, engine: str, sql: str) -> str | None:
-        """Which accepted answer ``sql`` matches on every seed: its label, "" for none, None if unlabelled."""
+        """Which accepted answer ``sql`` matches on every seed: its label, "" for none, None if unlabelled.
+
+        A statement that times out on any seed is unlabelled: too slow is not the same as wrong.
+        """
+        memo = (question.id, engine, sql)
+        if memo in self._matched:
+            return self._matched[memo]
+        self._matched[memo] = answer = self._matched_answer(question, engine, sql)
+        return answer
+
+    def _matched_answer(self, question: Question, engine: str, sql: str) -> str | None:
         results = self.matches_gold(question, engine, sql)
         if not results:
+            return None
+        if any(TIMED_OUT in why for _, why in results.values()):
             return None
         if all(equal for equal, _ in results.values()):
             return "gold"

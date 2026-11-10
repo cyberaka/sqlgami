@@ -358,7 +358,7 @@ def label_run(suite: Suite, run: Path) -> Path:
                 matches = runner.matches_gold(question, engine, row["sql"])
                 entry["per_seed"] = {label: equal for label, (equal, _) in matches.items()}
                 matched = runner.matched_answer(question, engine, row["sql"])
-                entry["correct"] = bool(matched)
+                entry["correct"] = None if matched is None else bool(matched)  # None: timed out, unlabelled
                 entry["matched"] = matched or None  # "gold", or which accepted alternative
                 entry["runs"] = all(runner.run(engine, seed, question.render(row["sql"])).ok for seed in suite.seeds)
                 reasons = [f"{label}: {why}" for label, (equal, why) in matches.items() if not equal]

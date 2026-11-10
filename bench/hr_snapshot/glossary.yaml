@@ -58,7 +58,9 @@ definitions:
     meaning: >
       For a window of the last 26 pay periods, the number of distinct associates with a
       turnover row (turn_filt_ind = 1) on the authoritative snapshot, divided by the active
-      headcount at the start of the window. Reported in basis points.
+      headcount at the start of the window. Reported in basis points. An overall rate
+      across groups is total leavers over total headcount, not an average of the groups'
+      rates.
 
   voluntary_vs_involuntary_split:
     meaning: >
@@ -82,9 +84,9 @@ definitions:
   year_over_year_growth:
     meaning: >
       Year-over-year change in a count, expressed as basis points of the anchor value:
-      (current - prior) × 10000 / prior, truncated to an integer. "A year ago" is the pay
-      period 26 biweekly periods before the current one. The result is NULL when the prior
-      anchor count is 0.
+      (current - prior) × 10000 / prior, floored (rounded down, toward negative infinity)
+      to an integer. "A year ago" is the pay period 26 biweekly periods before the current
+      one. The result is NULL when the prior anchor count is 0.
 
   headcount:
     meaning: >
@@ -93,7 +95,8 @@ definitions:
   basis_points:
     meaning: >
       A rate expressed as an integer in ten-thousandths. 1.25% = 125 basis points; 50% = 5000.
-      Basis points are truncated (floored) to an integer, not rounded.
+      Basis points are floored (rounded down, toward negative infinity) to an integer, not
+      rounded. For negative values, -0.5% is -51 basis points, not -50.
 
   deleted_at_defaults:
     meaning: >
