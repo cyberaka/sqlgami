@@ -17,8 +17,10 @@ to show anything, is up to your application.
 ## Status
 
 Early and private. Working today: the core, the static and question checks,
-and adapters for SQLite, DuckDB and Postgres. BigQuery SQL can be analysed
-statically; its adapter comes next, then Cosmos DB. The confidence number is a **provisional heuristic** until a
+adapters for SQLite, DuckDB and Postgres, and BigQuery through the fixture
+path (static checks, terms, and fixtures reached through a verified
+translation — the BigQuery service is never called live; see below). Cosmos DB
+comes later. The confidence number is a **provisional heuristic** until a
 calibrator fitted on labelled data is loaded; reports say so with
 `"calibrated": false`. The calibration mechanism exists; a fitted calibration
 does not ship yet.
@@ -29,6 +31,7 @@ does not ship yet.
 pip install sqlgami              # core: SQLite and static analysis
 pip install "sqlgami[duckdb]"    # adds the DuckDB driver
 pip install "sqlgami[postgres]"  # adds psycopg 3 for Postgres
+pip install "sqlgami[bigquery]"  # offline only: dry runs and native reference runs in the sandbox
 ```
 
 The core depends on one package, [sqlglot](https://github.com/tobymao/sqlglot).
@@ -460,6 +463,30 @@ whose text states such a number ("if four nodes tie…"), so the host can
 reword them or write the number as a slot. Fixtures can also be
 cut from a real database (`sqlgami.fixtures.from_connection`); that is an
 explicit choice, since those rows then live in the bundle.
+
+#### BigQuery
+
+A BigQuery statement is scored the same way, with no call to the service:
+the static and term checks run on the bigquery dialect, and the fixture stage
+runs the statement on the DuckDB fixtures through a **verified translation**
+(`sqlgami.translate`). Verified means: every function, clause, type and date
+part the statement uses is on an allow-list whose entries each have a test
+proving the translated result equals BigQuery's on fixture data
+(`tests/test_bigquery_translation.py`; the same cases are re-run against the
+real service in the sandbox with `SQLGAMI_BQ_LIVE=1`). A construct that is not
+on the list leaves the fixture stage `not_run` with `untranslatable:
+func:JSON_EXTRACT_SCALAR`, never a verdict. Your `` `project.dataset.table` ``
+names map to the fixture tables through `tables:` in the compile config
+(every three-part name in your own DDL is mapped automatically), and the
+live catalogue resolves them the same way. Fixture connections run in UTC, as
+BigQuery does. Translations the proof forced: `COUNTIF` becomes
+`COALESCE(COUNT_IF(…), 0)` (DuckDB gives NULL for an all-NULL group).
+
+`sqlgami.contrib.bigquery` (`pip install "sqlgami[bigquery]"`) is an
+**offline** adapter for dry runs and native reference runs; it refuses any
+project other than the sqlgami sandbox before a client is built, uses
+application-default credentials only, and records every dataset it creates.
+`score()` never uses it.
 
 ### Policies
 

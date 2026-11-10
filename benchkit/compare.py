@@ -53,6 +53,8 @@ def run_sql(conn: Any, sql: str, max_rows: int = 100_000, timeout_s: float = TIM
     statement runs on a worker thread and is asked again every quarter second for GRACE_S;
     if it still runs, :class:`Abandoned` is raised and the caller must drop the connection.
     """
+    if hasattr(conn, "native_run"):
+        return conn.native_run(sql)  # a BigQuery seed in the sandbox
     module = type(conn).__module__ or ""
     if "duckdb" in module:
         return _run_duckdb(conn, sql, max_rows, timeout_s)

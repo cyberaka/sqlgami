@@ -78,8 +78,12 @@ def compile_suite(
                 continue
             question = suite.question(ref["key"])
             params = dict(ref["params"])
-            kept.append({"key": ref["key"], "question": row["question"], "sql": row["sql"], "params": params, "n_default": row.get("n_default"), "slots": row.get("slots")})
-        references = kept + [{"key": k, **{kk: vv for kk, vv in v.items() if kk != "id"}} for k, v in override.items()]
+            sql = row.get(f"sql_{engine}") or row["sql"]  # the engine's own version when the file carries one
+            kept.append({"key": ref["key"], "question": row["question"], "sql": sql, "params": params, "n_default": row.get("n_default"), "slots": row.get("slots")})
+        references = kept + [
+            {"key": k, **{kk: vv for kk, vv in v.items() if kk != "id" and not kk.startswith("sql_")}, "sql": v.get(f"sql_{engine}") or v["sql"]}
+            for k, v in override.items()
+        ]
     config: dict[str, Any] = {
         "dialect": engine,
         "snapshot_columns": config_block.get("snapshot_columns"),

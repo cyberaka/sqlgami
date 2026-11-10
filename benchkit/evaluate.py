@@ -43,6 +43,8 @@ class Item:
     agreeing: int | None = None  # consistency stage: alternatives that returned the same result
     comparable: int | None = None
     reconciliation: dict | None = None  # reconciliation stage counts, when the stage ran
+    fixture_verdict: str = ""  # match | mismatch | unverified | "" when the stage did not run
+    fixture_reason: str = ""  # why not (untranslatable: ..., no reference, deadline)
 
 
 def auroc(scores: list[float], labels: list[bool]) -> float | None:
@@ -145,8 +147,26 @@ def metrics(items: list[Item]) -> dict[str, Any]:
     for entry in by_generator.values():
         entry["accuracy"] = round(entry["correct"] / entry["n"], 3)
 
+    # Fixture verdicts against the labels (which, for BigQuery, come from the native service):
+    # how often a fixture verdict was given, and how often it agreed with the label.
+    candidates = [i for i in scored if i.kind == "candidate"]
+    judged = [i for i in candidates if i.fixture_verdict in ("match", "mismatch")]
+    agree = [i for i in judged if (i.fixture_verdict == "match") == i.correct]
+    untranslatable = [i for i in candidates if "untranslatable" in (i.fixture_reason or "")]
+    fixtures_vs_labels = {
+        "candidates": len(candidates),
+        "with_verdict": len(judged),
+        "agree": len(agree),
+        "agreement_rate": share(agree, judged),
+        "match_but_wrong": sum(1 for i in judged if i.fixture_verdict == "match" and not i.correct),
+        "mismatch_but_correct": sum(1 for i in judged if i.fixture_verdict == "mismatch" and i.correct),
+        "untranslatable": len(untranslatable),
+        "untranslatable_constructs": sorted({(i.fixture_reason or "").split("untranslatable: ")[-1].split(":")[0].strip() for i in untranslatable}),
+    }
+
     latencies = [i.latency_ms for i in scored]
     return {
+        "fixtures_vs_labels": fixtures_vs_labels,
         "precision_at_0.8": share([i for i in at_80 if i.correct], at_80),
         "count_at_0.8": len(at_80),
         "by_difficulty": dict(sorted(by_difficulty.items())),
@@ -210,6 +230,12 @@ def evaluate(
         seed = (suite.nasty_seeds() or suite.seeds)[-1]
     runner = Runner(suite, [engine])
     conn = build.connect(suite, engine, seed)
+    # BigQuery is never a live database for sqlgami: the bench scores statically (catalogue
+    # from the BigQuery DDL, fixtures through the verified translation) and labels natively.
+    live_db = None if engine == "bigquery" else conn
+    ddl_text = suite.schema_file(engine).read_text(encoding="utf-8") if engine == "bigquery" else None
+    if engine == "bigquery" and mode != "static":
+        raise SuiteError("BigQuery is scored in static mode only (fixtures through the translation); the service is never a live database")
     scorers: dict[bool, Scorer] = {}
     glossary_file = suite.path / "glossary.yaml"
     glossary = glossary_file.read_text(encoding="utf-8") if glossary_file.exists() else None
@@ -234,7 +260,8 @@ def evaluate(
                 config.pop("tenant_column", None)
             scorers[scoped] = Scorer(
                 engine,
-                db=conn,
+                db=live_db,
+                catalog=ddl_text,
                 glossary=glossary,
                 options=Options(consistency_role=role, consistency_max_alternatives=24, deadline_ms=None),  # batch: no deadline
                 terms=str(catalogue) if catalogue is not None else None,
@@ -292,6 +319,10 @@ def evaluate(
         signal = report.signals.get("consistency") or {}
         item.agreeing = signal.get("agreeing_sources")
         item.comparable = signal.get("sources")
+        fixtures = report.signals.get("fixtures") or {}
+        item.fixture_verdict = fixtures.get("verdict") or ""
+        stage = report.stage("fixtures")
+        item.fixture_reason = (stage.detail or "") if stage is not None and stage.status.value in ("not_run", "skipped") else ""
         items.append(item)
 
     try:
@@ -463,6 +494,11 @@ def format_metrics(result: dict[str, Any]) -> str:
         f"precision at score >= 0.9: {pct(result['precision_at_0.9'])} of {result['count_at_0.9']}",
         f"precision at score >= 0.7: {pct(result['precision_at_0.7'])} of {result['count_at_0.7']}",
         f"runs-but-wrong flagged (score <= 0.4): {pct(result['silent_wrong_flagged_share'])} of {result['silent_wrong']}",
+        (
+            f"fixture verdicts vs labels: {result['fixtures_vs_labels']['with_verdict']} of {result['fixtures_vs_labels']['candidates']} candidates judged, "
+            f"agreement {pct(result['fixtures_vs_labels']['agreement_rate'])} (match-but-wrong {result['fixtures_vs_labels']['match_but_wrong']}, "
+            f"mismatch-but-correct {result['fixtures_vs_labels']['mismatch_but_correct']}); untranslatable {result['fixtures_vs_labels']['untranslatable']} {result['fixtures_vs_labels']['untranslatable_constructs']}"
+        ) if result.get("fixtures_vs_labels") else "",
         f"runs-but-wrong below 0.5: {pct(result['silent_wrong_below_half_share'])}",
         f"correct SQL wrongly flagged (score <= 0.4): {pct(result['correct_flagged_share'])}",
         f"mean score: correct {num(result['mean_score_correct'], 2)}, wrong {num(result['mean_score_wrong'], 2)}",

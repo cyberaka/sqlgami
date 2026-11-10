@@ -414,7 +414,15 @@ def _load_file(conn: Any, engine: str, path: Path) -> None:
 
 
 def connect(suite: Suite, engine: str, seed: Seed) -> Any:
-    """A read-only connection to a built database, with the session pinned to UTC."""
+    """A read-only connection to a built database, with the session pinned to UTC. For BigQuery
+    the "database" is the seed loaded into the sandbox (offline bench use only)."""
+    if engine == "bigquery":
+        from sqlgami.contrib.bigquery import BigQuerySandbox
+
+        from .bqnative import SeedConnection
+
+        build(suite, "duckdb", seed)  # the seed must exist locally to be loaded
+        return SeedConnection(BigQuerySandbox(), suite, seed)
     path = build(suite, engine, seed)
     if engine == "postgres":
         return _pg_connect(str(path), read_only=True)

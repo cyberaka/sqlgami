@@ -64,10 +64,10 @@ class Report:
     datasets: list[str] = field(default_factory=list)
     comparisons: list[Comparison] = field(default_factory=list)
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, seed: str | None = None) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for kind in ("gold", "gold_script", "bug"):
-            rows = [c for c in self.comparisons if c.kind == kind]
+            rows = [c for c in self.comparisons if c.kind == kind and (seed is None or c.seed == seed)]
             if not rows:
                 continue
             out[kind] = {
@@ -260,4 +260,30 @@ def _origins(suite: Suite) -> dict[tuple[str, str], str]:
 
 def write_report(report: Report, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"summary": report.summary(), **asdict(report)}, indent=1, default=str), encoding="utf-8")
+    path.write_text(
+        json.dumps({"summary": report.summary(), "per_seed": {s: report.summary(s) for s in report.seeds}, **asdict(report)}, indent=1, default=str),
+        encoding="utf-8",
+    )
+
+
+class SeedConnection:
+    """What ``build.connect(suite, "bigquery", seed)`` returns: the sandbox datasets holding one
+    seed, with a ``native_run`` the bench runner uses in place of a cursor. Results are cached
+    per statement, so labelling a candidate on a seed costs one query."""
+
+    def __init__(self, sandbox: Any, suite: Suite, seed: Seed) -> None:
+        self.sandbox, self.suite, self.seed = sandbox, suite, seed
+        self._cache: dict[str, Outcome] = {}
+        loaded = {t.table_id for t in sandbox.client.list_tables(f"{sandbox.project}.{_dataset(suite, seed, 'hr')}")} if _dataset(suite, seed, "hr") in sandbox.list_bench_datasets() else set()
+        if not loaded:
+            load_seed(sandbox, suite, seed)
+
+    def native_run(self, sql: str) -> Outcome:
+        if sql not in self._cache:
+            is_script = sql.lstrip().upper().startswith("DECLARE")
+            native_sql = _rewrite_script(sql, self.sandbox.project, self.suite, self.seed) if is_script else _rewrite(sql, self.sandbox.project, self.suite, self.seed)
+            self._cache[sql] = _native_outcome(self.sandbox.run(native_sql))
+        return self._cache[sql]
+
+    def close(self) -> None:
+        pass
