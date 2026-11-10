@@ -105,7 +105,9 @@ def _derived_duplicates_query(ctx: CheckContext, source, columns: list[str]) -> 
     return query
 
 
-def _join_grain_query(ctx: CheckContext, model: SelectModel, alias: str) -> tuple[exp.Expression, Any] | None:
+def _join_grain_query(
+    ctx: CheckContext, model: SelectModel, alias: str, *, filtered: bool = True
+) -> tuple[exp.Expression, Any] | None:
     """A query that returns a row if, in this SELECT's own FROM and WHERE, two joined rows share
     one row of ``alias`` (by its key). No row means the join never repeats ``alias``: every filter
     counts, including those on the other tables, which static reasoning cannot weigh."""
@@ -124,7 +126,7 @@ def _join_grain_query(ctx: CheckContext, model: SelectModel, alias: str) -> tupl
         return None
     keys = [exp.column(exp.to_identifier(c, quoted=True), table=exp.to_identifier(alias, quoted=True)) for c in sorted(key)]
     query = exp.Select(expressions=[exp.Literal.number(1)])
-    for arg in ("from_", "from", "joins", "where"):
+    for arg in ("from_", "from", "joins") + (("where",) if filtered else ()):
         if select.args.get(arg) is not None:
             query.set(arg, select.args[arg].copy())
     query = query.group_by(*keys).having("COUNT(*) > 1").limit(1)
@@ -194,6 +196,15 @@ def _uniqueness_probes(
             query, table = grain
             key = sorted(min((k for k in model.key_info(alias).keys if k), key=len))
             planned.append(Probe(PROBE_UNIQUE, table, tuple(key), finding, query=query, snippet=f"join:{alias}", group=f"{alias}:join"))
+            if model.select.args.get("where") is not None:
+                # The same join without the query's WHERE: if that one repeats rows and the
+                # filtered one does not, the filters are what pin the grain. If neither repeats,
+                # the data is merely sparse and proves nothing about the schema.
+                unfiltered = _join_grain_query(ctx, model, alias, filtered=False)
+                if unfiltered is not None:
+                    planned.append(
+                        Probe(PROBE_UNIQUE, table, tuple(key), finding, query=unfiltered[0], snippet=f"join-unfiltered:{alias}", group=f"{alias}:join:unfiltered")
+                    )
     ctx.probes.extend(planned)
 
 
@@ -220,10 +231,11 @@ def _repeated_inside(model: SelectModel, column: exp.Column, depth: int = 0):
         return None
     if len(inner.sources) >= 2:
         repeated = inner.multiplied(defining.table)
-        # If the subquery returns a key of the rows it is really about (one row per
-        # subscription, each carrying its plan's price), repeating the looked-up value is
-        # the point. Only a subquery whose rows have no identity of their own is suspect.
-        if repeated.state == YES and not inner.output_keys().keys:
+        # Projecting the child's key says what grain the rows have, not where the summed value
+        # comes from: a parent's total carried down to child rows is a fan-out all the same.
+        # The one exemption is a genuine per-row value (a plan's price on each subscription):
+        # a rate-like column, or any column of a leaf lookup table, on rows keyed by the child.
+        if repeated.state == YES:
             looked_up = inner.sources[defining.table]
             leaf = looked_up.kind == "table" and looked_up.table is not None and not looked_up.table.foreign_keys
             per_row_value = leaf or bool(_RATE_LIKE.search(defining.name))

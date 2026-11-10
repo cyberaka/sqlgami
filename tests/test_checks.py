@@ -519,7 +519,10 @@ def test_fan_out_inside_a_subquery_depends_on_whether_its_rows_have_an_identity(
         "JOIN orders o ON o.id = i.order_id) x GROUP BY x.status"
     )
     assert not lookup.has("fan_out"), lookup.summary()
+    # One row per item too, but the summed value is the parent order's total carried down to each
+    # item: projecting the item's key says what the rows are, not where the total comes from, and
+    # SUM(x.total) counts each order once per item (365.5 against 265.5 on the shop data).
     carried = scorer.explain(
         "SELECT SUM(x.total) FROM (SELECT i.id, o.total FROM items i JOIN orders o ON o.id = i.order_id) x"
     )
-    assert not carried.has("fan_out"), carried.summary()
+    assert carried.has("fan_out"), carried.summary()

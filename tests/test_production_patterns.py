@@ -452,10 +452,17 @@ def test_soft_delete_policy_levels(engine, db):
             "SELECT o.id, o.total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.total > 0 ORDER BY o.id"
         )
         assert next(f for f in bridge.findings if f.code == "soft_deleted_rows").severity == Severity.LOW
+        # A parent whose rows come out as result rows (grouped by its key) is listed, deleted ones
+        # included: that is the rule's concern, however many orders hang off each.
         parent = required.sample(
             "SELECT c.id, COUNT(o.id) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id ORDER BY c.id"
         )
-        assert next(f for f in parent.findings if f.code == "soft_deleted_rows").severity == Severity.LOW
+        assert next(f for f in parent.findings if f.code == "soft_deleted_rows").severity == Severity.HIGH
+        # A parent that only filters, with nothing of its own in the output, stays a lesser matter.
+        unlisted = required.sample(
+            "SELECT COUNT(o.id) FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.name <> ''"
+        )
+        assert next(f for f in unlisted.findings if f.code == "soft_deleted_rows").severity == Severity.LOW
         named = required.sample(
             "SELECT c.id, COUNT(o.id) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id ORDER BY c.id",
             "For each non-deleted customer, how many orders do they have?",

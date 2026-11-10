@@ -142,7 +142,9 @@ class _Tracer:
                         indirect=self._loosely_linked(model, alias, anchored),
                         bridge=self._is_bridge(model, alias),
                         in_view=inside_view(source.node),
-                        counted=len(model.sources) == 1 or model.multiplied(alias).state == NO,
+                        counted=len(model.sources) == 1
+                        or model.multiplied(alias).state == NO
+                        or self._lists_rows(model, alias),
                         lookup=lookup and (len(model.sources) == 1 or model.multiplied(alias).state == NO),
                     ),
                 )
@@ -419,6 +421,27 @@ class _Tracer:
                 return True
             if b[0] == alias and a[0] in anchored:
                 return True
+        return False
+
+    def _lists_rows(self, model: SelectModel, alias: str) -> bool:
+        """The table's own columns come out as result rows (selected outside any aggregate, or
+        grouped by), so a deleted row of it is literally a row of the answer."""
+        nodes: list[exp.Expression] = list(model.select.expressions)
+        if model.group is not None:
+            nodes.extend(model.group.expressions)
+        for node in nodes:
+            for column in walk_own(node):
+                if not (isinstance(column, exp.Column) and column.table == alias):
+                    continue
+                parent = column.parent
+                inside_aggregate = False
+                while parent is not None and parent is not node.parent:
+                    if isinstance(parent, exp.AggFunc):
+                        inside_aggregate = True
+                        break
+                    parent = parent.parent
+                if not inside_aggregate:
+                    return True
         return False
 
     def _is_bridge(self, model: SelectModel, alias: str) -> bool:

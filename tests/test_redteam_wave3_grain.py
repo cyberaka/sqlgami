@@ -45,12 +45,6 @@ def test_static_fan_out_on_declared_fk_is_high():
     assert sev == ["high"], report.summary()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="on a sample where every order happens to have one item, the probe drops the declared-FK "
-    "fan-out from HIGH to MEDIUM, although the schema permits many items per order and the query "
-    "inflates on realistic data",
-)
 def test_sparse_sample_does_not_downgrade_a_declared_fk_fanout():
     sparse = _db(FK_DDL, "INSERT INTO orders VALUES (1,100),(2,200),(3,300);"
                          "INSERT INTO items VALUES (10,1,1),(11,2,1),(12,3,1);")

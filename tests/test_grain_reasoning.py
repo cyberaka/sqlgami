@@ -231,7 +231,7 @@ def test_join_grain_probe_sees_filters_on_other_tables():
         assert next(f for f in static.findings if f.code == "fan_out").severity == Severity.HIGH
         one = scorer.sample(sql, "total salary of current people")
         finding = next(f for f in one.findings if f.code == "fan_out")
-        assert finding.severity == Severity.LOW and finding.evidence["data_check"] == "unique_observed"
+        assert finding.severity == Severity.LOW and finding.evidence["data_check"] == "pinned_by_filters"
         conn.execute("UPDATE periods SET is_current = TRUE WHERE ppe_dt = DATE '2024-01-01'")
         two = scorer.sample(sql, "total salary of current people")
         finding = next(f for f in two.findings if f.code == "fan_out")

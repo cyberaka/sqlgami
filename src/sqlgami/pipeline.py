@@ -918,55 +918,103 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
         )
 
     for finding_id, groups in unique_results.items():
-        finding = unique_findings[finding_id]
-        # A probe over the whole join (group "alias:join") saw the join itself: whether it ever
-        # repeats a row of that table, every filter included. Where it ran, it decides; the
-        # per-table probes are the fallback.
-        decisive = {g: o for g, o in groups.items() if g is not None and g.endswith(":join") and o and all(x is not None for x in o)}
-        also_holding = [outcomes for outcomes in groups.values() if outcomes and all(o is not None and o[0] for o in outcomes)]
-        if decisive:
-            groups = decisive
-        holding = [outcomes for outcomes in groups.values() if outcomes and all(o is not None and o[0] for o in outcomes)]
-        if holding and decisive:
-            # The row count reported is the tables' own where a table-level probe also held (200
-            # lookup rows say more than the 5 join rows that used them); the join's otherwise.
-            table_level = [o for o in also_holding if o not in holding]
-            if table_level:
-                holding = table_level
-        broken = [
-            bool(outcomes) and any(o is not None and not o[0] for o in outcomes)
-            for outcomes in groups.values()
-        ]
-        if holding:
-            # No duplicates in the data. That is evidence, not a guarantee: no key enforces it, or
-            # the probe would not have been needed. How much it is worth depends on how many rows
-            # were looked at.
-            counts = [o[1] for outcomes in holding for o in outcomes if o is not None]
-            rows = min(counts) if counts and all(c is not None for c in counts) else None
-            finding.evidence["data_check"] = "unique_observed"
-            finding.evidence["rows_probed"] = rows
-            if rows is not None and rows < SMALL_TABLE_ROWS:
-                finding.evidence["certainty"] = "maybe"
-                if finding.severity == Severity.HIGH:
-                    finding.severity = Severity.MEDIUM
-                finding.message += (
-                    f" Checked against the data: no repeated values, but only {rows} rows were there to "
-                    "check, which is too few to tell, and no key enforces it."
-                )
-            else:
-                finding.severity = Severity.LOW
-                finding.evidence["certainty"] = "observed"
-                finding.message += (
-                    " Checked against the data: the join columns hold no repeated values"
-                    + (f" among {rows} rows" if rows is not None else "")
-                    + ", so nothing is double-counted today. No key guarantees it stays that way."
-                )
-        elif groups and all(broken):
-            finding.evidence["data_check"] = "duplicates"
-            if finding.evidence.get("certainty") == "maybe":
-                finding.evidence["certainty"] = "yes"
-                finding.severity = Severity.HIGH
-            finding.message += " Checked against the data: the join columns do hold repeated values."
+        _settle_uniqueness(unique_findings[finding_id], groups)
+
+
+def _outcome(outcomes: list[tuple[bool, int | None] | None] | None) -> bool | None:
+    """One answer for a group of probes: True when every probe found no repeats, False when any
+    did, None when a probe could not run."""
+    if not outcomes or any(o is None for o in outcomes):
+        return None
+    return all(o[0] for o in outcomes)  # type: ignore[index]
+
+
+def _settle_uniqueness(finding: Finding, groups: dict[str | None, list]) -> None:
+    """Weigh the uniqueness probes of one finding against each other.
+
+    Groups named ``alias:join`` ran the query's own join with its WHERE and asked whether a row of
+    that table came back twice; ``alias:join:unfiltered`` asked the same without the WHERE. The
+    other groups asked each repeating table on its own.
+
+    - Repeats in the filtered join, or in every table-level group: duplicates, confirmed.
+    - No repeats in the filtered join while the unfiltered join does repeat: the query's own
+      filters pin the grain. Downgrade, whatever the schema allows in general.
+    - No repeats anywhere, and the schema says repeats are possible (certainty "yes"): the sample
+      is merely sparse. The static severity stands, with a note.
+    - No repeats anywhere, and no key says either way: observed uniqueness, LOW (MEDIUM when too
+      few rows were there to tell).
+    """
+    joins = {g: _outcome(o) for g, o in groups.items() if g is not None and g.endswith(":join")}
+    unfiltered = {g[: -len(":unfiltered")]: _outcome(o) for g, o in groups.items() if g is not None and g.endswith(":join:unfiltered")}
+    tables = {g: o for g, o in groups.items() if g is None or not (g.endswith(":join") or g.endswith(":join:unfiltered"))}
+    table_outcomes = {g: _outcome(o) for g, o in tables.items()}
+
+    def rows_in(outcomes: list) -> int | None:
+        counts = [o[1] for o in outcomes if o is not None]
+        return min(counts) if counts and all(c is not None for c in counts) else None
+
+    declared = finding.evidence.get("certainty") == "yes"
+    pinned_by_filters = any(ok and unfiltered.get(g) is False for g, ok in joins.items())
+    join_unique = any(ok for ok in joins.values())
+    join_repeats = joins and all(ok is False for ok in joins.values() if ok is not None) and any(ok is False for ok in joins.values())
+    tables_unique = [g for g, ok in table_outcomes.items() if ok]
+    tables_repeat = tables and all(ok is False for ok in table_outcomes.values())
+
+    if join_repeats or (not joins and tables_repeat):
+        finding.evidence["data_check"] = "duplicates"
+        if finding.evidence.get("certainty") == "maybe":
+            finding.evidence["certainty"] = "yes"
+            finding.severity = Severity.HIGH
+        finding.message += " Checked against the data: the join does repeat rows of the table being aggregated."
+        return
+    if not join_unique and not tables_unique:
+        return  # nothing conclusive could be run
+
+    if pinned_by_filters:
+        rows = min((r for r in (rows_in(groups[g]) for g, ok in joins.items() if ok) if r is not None), default=None)
+        finding.severity = Severity.LOW
+        finding.evidence["data_check"] = "pinned_by_filters"
+        finding.evidence["certainty"] = "observed"
+        finding.evidence["rows_probed"] = rows
+        finding.message += (
+            " Checked against the data: the join as written would repeat rows, but with this query's "
+            "own filters each row comes through once"
+            + (f" ({rows} rows)" if rows is not None else "")
+            + ", so nothing is double-counted today."
+        )
+        return
+
+    # No repeats anywhere that was looked at.
+    counted = [rows_in(groups[g]) for g in tables_unique] or [rows_in(groups[g]) for g, ok in joins.items() if ok]
+    rows = min((r for r in counted if r is not None), default=None)
+    finding.evidence["rows_probed"] = rows
+    if declared:
+        # The schema permits repeats (a declared many-to-one); a sample without any proves only
+        # that this sample is sparse.
+        finding.evidence["data_check"] = "not_observed"
+        finding.message += (
+            " Not observed in the sample"
+            + (f" ({rows} rows)" if rows is not None else "")
+            + ", but the schema allows repeats, so the risk stands."
+        )
+        return
+    finding.evidence["data_check"] = "unique_observed"
+    if rows is not None and rows < SMALL_TABLE_ROWS:
+        finding.evidence["certainty"] = "maybe"
+        if finding.severity == Severity.HIGH:
+            finding.severity = Severity.MEDIUM
+        finding.message += (
+            f" Checked against the data: no repeated values, but only {rows} rows were there to "
+            "check, which is too few to tell, and no key enforces it."
+        )
+    else:
+        finding.severity = Severity.LOW
+        finding.evidence["certainty"] = "observed"
+        finding.message += (
+            " Checked against the data: the join columns hold no repeated values"
+            + (f" among {rows} rows" if rows is not None else "")
+            + ", so nothing is double-counted today. No key guarantees it stays that way."
+        )
 
 
 def _fill_parameters(query: exp.Expression, params: dict[str, Any] | None) -> exp.Expression:

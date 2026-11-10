@@ -67,7 +67,6 @@ FANOUT_FALSE_NEGATIVES = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="parent total carried to child-row grain in a key-projecting subquery is summed once per child and not flagged (365.5 vs true 265.5 on the shop data)")
 @pytest.mark.parametrize("dialect", DIALECTS)
 @pytest.mark.parametrize("name,sql", FANOUT_FALSE_NEGATIVES, ids=[c[0] for c in FANOUT_FALSE_NEGATIVES])
 def test_fan_out_misses_parent_total_at_child_grain(name, sql, dialect):
@@ -129,7 +128,6 @@ SOFT_DELETE_UNDERSEVERITY = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="the soft-deletable table's key/attributes are in the output, so its deleted rows appear in the result, yet it is reported only LOW as an uncounted parent")
 @pytest.mark.parametrize("dialect", DIALECTS)
 @pytest.mark.parametrize("name,sql", SOFT_DELETE_UNDERSEVERITY, ids=[c[0] for c in SOFT_DELETE_UNDERSEVERITY])
 def test_soft_delete_underseverity_when_key_is_in_output(name, sql, dialect):
