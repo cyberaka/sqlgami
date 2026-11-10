@@ -81,3 +81,28 @@ def test_fixture_round_trips_through_csv_and_refuses_an_edited_copy(tmp_path):
 def test_unknown_profile_is_refused():
     with pytest.raises(ConfigurationError, match="profile"):
         fixtures.build(_catalog(), {"profiles": ["chaos"]})
+
+
+# The digests below are pinned: a fixture must be a function of the committed code and the
+# rules alone, on every machine. A change in generation is a deliberate, visible change here.
+PINNED_RULES = {
+    "seed": 7,
+    "profiles": ["clean", "nulls"],
+    "rows": {"customers": 5, "orders": 8, "items": 12, "payments": 6, "profiles": 5},
+    "values": {"orders.status": ["paid", "open"]},
+    "params": {"customer": [2]},
+    "param_columns": {"customer": ["orders.customer_id"]},
+    "critical_rows": {"customers": [{"id": 99, "name": "Zed", "tenant_id": 1}]},
+}
+PINNED_DIGESTS = {
+    "clean": "5bf48a4d77f798d1110aa073928ec051a70a664492f8223174e15b8f6875e150",
+    "nulls": "ed6bcd365faff9e1144bbd3675b839910773503ba80dcef4d024d917730e1fe3",
+}
+
+
+@pytest.mark.parametrize("profile", sorted(PINNED_DIGESTS))
+def test_fixture_digest_is_pinned(profile):
+    fixture = fixtures.build(_catalog(), PINNED_RULES, profiles=[profile])[0]
+    assert fixture.digest() == PINNED_DIGESTS[profile], (
+        f"{profile} fixture changed: {fixture.digest()}; if the generator changed on purpose, update the pin"
+    )
