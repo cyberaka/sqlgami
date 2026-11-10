@@ -163,9 +163,21 @@ what the prose already says; the auditor checks the two agree. Terms with no rep
   `undefined_term`, Scorer/suite plumbing, migration of the three bench glossaries, tests on
   dev only; wave 4 measures it.
 
-## Open questions for the owner
+## Resolved by review (pending the owner's OK)
 
-1. Should an **undefined term** cap confidence (say at 0.7) or only add the LOW note?
-2. When a term's phrase appears in the question but the catalogue scopes it to tables the
-   query does not read, is that a contradiction (HIGH), absence (MEDIUM) or nothing?
-3. Is per-dialect override enough, or do some hosts need per-schema (multi-tenant) catalogues?
+1. **Undefined term**: the LOW note AND a confidence cap of 0.75. Only agreement from reliable
+   sources (consistency or reconciliation with weighted sources) can lift a score past that
+   cap, because that is independent evidence about the answer rather than about the words.
+2. **Term scoped to tables the query does not read**: when the question asks for the term and
+   the query reads none of its `applies_to` tables (after expanding views and CTEs), that is
+   absence — MEDIUM `term_source_not_read`. Otherwise nothing.
+3. **Per-dialect overrides are enough for v1.** A multi-tenant host builds one Scorer per
+   catalogue.
+
+## Measurement rules
+
+1. Every bench report gives scores **with and without** the catalogue. Many hosts will have
+   no metadata, and sqlgami must not get worse without it.
+2. For held-out waves the suite's author writes the bench `terms:` sections from the frozen
+   prose **before** the wave is scored, the auditor checks them against the prose, and nobody
+   edits them after scoring.
