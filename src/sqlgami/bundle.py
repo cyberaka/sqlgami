@@ -316,13 +316,16 @@ def free_numbers(question: str, slots: dict[str, Any], params: dict[str, Any]) -
     sorted tuple (with repeats): two questions compare under a reference only when these agree."""
     import re
 
-    from .terms import normalise
+    from .terms import _NUMBER_WORDS, normalise
 
     text = normalise(question)
     found: list[float] = []
-    for token in text.split():  # digits only: "one customer" is prose, "top 5" is a quantity
+    for token in text.split():
+        # digits, and number words from two up ("top five", "last eight"); "one" is prose ("one customer")
         if re.fullmatch(r"\d+(?:\.\d+)?", token):
             found.append(float(token))
+        elif token in _NUMBER_WORDS and _NUMBER_WORDS[token] != "1":
+            found.append(float(_NUMBER_WORDS[token]))
     accounted: list[float] = []
     for value in list(slots.values()) + list(params.values()):
         values = value if isinstance(value, (list, tuple)) else [value]
