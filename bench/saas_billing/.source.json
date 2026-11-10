@@ -8,7 +8,11 @@
     "equivalents.jsonl": "36d233e9b1cd3d1ece2d38892df44d3d",
     "suite.yaml": "f8c6bf567e40ce635293074d3f8cd5cd",
     "glossary.yaml": "71c80981a0e5f6f721e5f857f7e2160b",
-    "generate.py": "d7145bef6330322067f4f92b7bc99e16"
+    "generate.py": "d7145bef6330322067f4f92b7bc99e16",
+    "terms/Examples.csv": "6836c0c13c9a861b0147ee2efe5a19b6",
+    "terms/KPIs.csv": "9ecda4980653a8a7056975482cecbb65",
+    "terms/Parameters.csv": "188e2e7aa4acaecd5cfea18050578242",
+    "terms/Terms.csv": "264e369b33d40a41bc30c66d272be410"
    }
   }
  ]

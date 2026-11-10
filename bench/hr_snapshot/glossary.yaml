@@ -124,6 +124,16 @@ definitions:
     meaning: >
       The distinct count of in-scope active associates at a pay period.
 
+  top_dense_ranks:
+    meaning: >
+      "The top N ranks" of an ordered measure uses dense ranking — ties at a
+      rank are kept together and no rank is skipped when a tie extends across
+      several rows. A question asking for "the top N ranks" returns every row
+      whose dense rank is N or better, including every row that ties at those
+      ranks and the rows those ties carry into when they span across a rank
+      boundary. Equivalent SQL: DENSE_RANK() over the ordering, filtered to
+      rank <= N.
+
   basis_points:
     meaning: >
       A rate expressed as an integer in ten-thousandths. 1.25% = 125 basis points; 50% = 5000.

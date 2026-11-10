@@ -21,5 +21,6 @@ not_contractor,not a contractor;non-contractor;not contractors;NOT contractors,f
 employment_type,employment type,source,,hr.emp_period_snapshot.assoc_type,,"The associate's employment type is stored in the snapshot's assoc_type column. Values: 'FTE', 'Contractor', 'Intern' or NULL for unknown."
 trailing_moving_average,trailing {n}-period moving average;{n}-period moving average,window,,ROWS BETWEEN ({n}-1) PRECEDING AND CURRENT ROW,,"The current row and the N-1 before it, as a window frame on an already-ordered series."
 turnover_row,turnover row;leaver;leavers;left the organisation,filter,hr.emp_period_snapshot,turn_filt_ind = 1,,"A snapshot row that marks an exit event (turn_filt_ind = 1)."
+top_dense_ranks,top {n} ranks;top {n} dense-ranks;top {n} dense ranks,rank,,DENSE_RANK() <= {n},,"The top N dense ranks: ties kept, no rank skipped."
 no_deleted_at,soft-delete;deleted_at,,,,,"Documentation only: this suite has no deleted_at column. A terminated associate (status_cd = 'T') is NOT a soft-delete and still appears on authoritative snapshots."
 person_period,active person-periods;person-period;person periods,,,,,"Documentation only: an authoritative-snap associate row across periods. Give it a sql to have it checked."

@@ -4,8 +4,12 @@
    "source": "/Users/cyberaka/shared/sqlgami-bench/hr_snapshot",
    "files": {
     "suite.yaml": "96142a9d4cc1963584ccc72414c5ff96",
-    "glossary.yaml": "a15f57884af3c31f053d182b1633ebef",
-    "generate.py": "903dbec6abe28ebc1df7057b300bd785"
+    "glossary.yaml": "2563b87dd0b9429c47c575e8861c7f8a",
+    "generate.py": "903dbec6abe28ebc1df7057b300bd785",
+    "terms/Examples.csv": "1fce79f4154c83d50d419733ad74eb38",
+    "terms/KPIs.csv": "05645c9ea0b9540e07512b420d0ca6c1",
+    "terms/Parameters.csv": "fe45a23afa3557cdd9f8c675bd54254c",
+    "terms/Terms.csv": "92eacbf869d3459bf199db9a85688298"
    }
   }
  ]
