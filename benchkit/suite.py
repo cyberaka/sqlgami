@@ -337,8 +337,13 @@ def load_suite(name_or_path: str | Path) -> Suite:
             try:
                 # A row carries its engine's SQL in "sql" and, optionally, the same variant for
                 # other engines in sql_<engine> ("sql_bigquery"): one Variant per engine.
-                versions = [(row["engine"], row["sql"])] + [
-                    (key[4:], value) for key, value in row.items() if key.startswith("sql_") and isinstance(value, str) and value.strip() and key[4:] != row["engine"]
+                # A BigQuery-only row may carry only sql_bigquery / sql_bigquery_script: the engine's
+                # own version then stands for "sql" (a script variant is the engine's too).
+                own = row.get("sql") or row.get(f"sql_{row['engine']}") or row.get(f"sql_{row['engine']}_script")
+                if not own:
+                    raise KeyError("'sql'")
+                versions = [(row["engine"], own)] + [
+                    (key[4:], value) for key, value in row.items() if key.startswith("sql_") and isinstance(value, str) and value.strip() and key[4:] != row["engine"] and key != f"sql_{row['engine']}_script"
                 ]
                 for engine, sql in versions:
                     target.append(
