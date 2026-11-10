@@ -366,7 +366,7 @@ def _run(
     # ------------------------------------------------------------ static
     ctx: CheckContext | None = None
     if schema_passed and catalog is not None:
-        ctx = CheckContext(analysis, catalog, question)
+        ctx = CheckContext(analysis, catalog, question, params=params)
         findings, skipped = run_static_checks(ctx)
         report.findings.extend(findings)
         report.checks_not_run.extend(skipped)
@@ -889,7 +889,7 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
         budget -= 1
         try:
             if probe.kind == PROBE_UNIQUE:
-                note_unique(probe, _probe_unique(adapter, probe, options))
+                note_unique(probe, _probe_unique(adapter, probe, options, ctx))
             elif probe.kind == PROBE_HAS_NULL:
                 _probe_has_null(adapter, probe, options)
             elif probe.kind == PROBE_VALUE:
@@ -897,7 +897,7 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
             elif probe.kind == PROBE_TIMESTAMP_FORMAT:
                 _probe_timestamp_format(report, adapter, probe, options)
             elif probe.kind == PROBE_QUERY:
-                _probe_query(adapter, probe, options)
+                _probe_query(adapter, probe, options, ctx)
         except AdapterError as exc:
             logger.debug("probe failed: %s", exc)
             report.checks_not_run.append(SkippedCheck(f"probe:{probe.kind}", str(exc)))
@@ -911,7 +911,20 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
 
     for finding_id, groups in unique_results.items():
         finding = unique_findings[finding_id]
+        # A probe over the whole join (group "alias:join") saw the join itself: whether it ever
+        # repeats a row of that table, every filter included. Where it ran, it decides; the
+        # per-table probes are the fallback.
+        decisive = {g: o for g, o in groups.items() if g is not None and g.endswith(":join") and o and all(x is not None for x in o)}
+        also_holding = [outcomes for outcomes in groups.values() if outcomes and all(o is not None and o[0] for o in outcomes)]
+        if decisive:
+            groups = decisive
         holding = [outcomes for outcomes in groups.values() if outcomes and all(o is not None and o[0] for o in outcomes)]
+        if holding and decisive:
+            # The row count reported is the tables' own where a table-level probe also held (200
+            # lookup rows say more than the 5 join rows that used them); the join's otherwise.
+            table_level = [o for o in also_holding if o not in holding]
+            if table_level:
+                holding = table_level
         broken = [
             bool(outcomes) and any(o is not None and not o[0] for o in outcomes)
             for outcomes in groups.values()
@@ -948,17 +961,40 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
             finding.message += " Checked against the data: the join columns do hold repeated values."
 
 
-def _probe_unique(adapter: Adapter, probe: Probe, options: Options) -> tuple[bool, int | None]:
+def _fill_parameters(query: exp.Expression, params: dict[str, Any] | None) -> exp.Expression:
+    """A probe built from a templated statement carries its parameters; give them their values."""
+    markers = list(query.find_all(exp.Placeholder, exp.Parameter))
+    if not markers:
+        return query
+    query = query.copy()
+    for marker in query.find_all(exp.Placeholder, exp.Parameter):
+        name = marker.name if isinstance(marker.this, str) else getattr(marker.this, "name", None)
+        if not name or params is None or name not in params:
+            raise AdapterError(f"the probe needs a value for parameter {name or '?'}")
+        marker.replace(template.literal_node(params[name]))
+    return query
+
+
+def _probe_unique(adapter: Adapter, probe: Probe, options: Options, ctx: CheckContext) -> tuple[bool, int | None]:
     """``(no repeated non-NULL combination, rows looked at)``."""
     if probe.query is not None:  # a derived table, run as written and grouped by its join columns
-        unique = not adapter.query(probe.query, max_rows=1, timeout_s=options.probe_timeout_s)
+        query = _fill_parameters(probe.query, ctx.params)
+        unique = not adapter.query(query, max_rows=1, timeout_s=options.probe_timeout_s)
         rows = None
         if unique:
-            inner = probe.query.args.get("from_") or probe.query.args.get("from")
+            inner = query.args.get("from_") or query.args.get("from")
             source = inner.this if inner is not None else None
             if source is not None:
-                count = exp.select(exp.Count(this=exp.Star())).from_(source.copy())
-                with_ = probe.query.args.get("with_") or probe.query.args.get("with")
+                # How many rows were looked at: the derived table's rows, or, for a probe over a
+                # whole join, the join's rows up to a bound.
+                rows_seen = exp.Select(expressions=[exp.Literal.number(1)])
+                for arg in ("from_", "from", "joins", "where"):
+                    if query.args.get(arg) is not None:
+                        rows_seen.set(arg, query.args[arg].copy())
+                count = exp.select(exp.Count(this=exp.Star())).from_(
+                    exp.Subquery(this=rows_seen.limit(SMALL_TABLE_ROWS * 20), alias=exp.TableAlias(this=exp.to_identifier("sqlgami_n")))
+                )
+                with_ = query.args.get("with_") or query.args.get("with")
                 if with_ is not None:
                     count.set("with_", with_.copy())
                 try:
@@ -1019,11 +1055,11 @@ def _probe_has_null(adapter: Adapter, probe: Probe, options: Options) -> None:
         finding.message += " Checked against the data: the column holds no NULLs at present."
 
 
-def _probe_query(adapter: Adapter, probe: Probe, options: Options) -> None:
+def _probe_query(adapter: Adapter, probe: Probe, options: Options, ctx: CheckContext) -> None:
     """Run a query a check prepared, and adjust its finding by whether a row comes back."""
     if probe.query is None or probe.finding is None:
         return
-    rows = adapter.query(probe.query, max_rows=probe.min_rows, timeout_s=options.probe_timeout_s)
+    rows = adapter.query(_fill_parameters(probe.query, ctx.params), max_rows=probe.min_rows, timeout_s=options.probe_timeout_s)
     outcome = probe.on_rows if len(rows) >= probe.min_rows else probe.on_empty
     if outcome is None:
         return

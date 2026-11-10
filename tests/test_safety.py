@@ -297,3 +297,16 @@ def test_nondeterministic_calls_are_named():
     assert safety.nondeterministic(sqlglot.parse_one("SELECT gen_random_uuid()", dialect="postgres"))
     assert safety.nondeterministic(sqlglot.parse_one("SELECT * FROM customers TABLESAMPLE BERNOULLI (10)", dialect="postgres"))
     assert not safety.nondeterministic(sqlglot.parse_one("SELECT name, now() FROM customers", dialect="postgres"))
+
+
+def test_an_allowed_function_this_build_lacks_is_caught_by_the_dry_run():
+    """The allow-list says what is safe to send, not what exists: SQLite built without the math
+    functions rejects FLOOR at prepare time, and that is a dry_run_error, never a pass."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (x REAL)")
+    with Scorer("sqlite", db=conn, allowed_functions=["fakefloor"]) as scorer:  # vouched for, but absent
+        report = scorer.dry_run("SELECT CAST(fakefloor(x) AS INTEGER) FROM t", "x rounded down")
+    assert report.has("dry_run_error") and "no such function" in report.summary().lower() or report.score <= 0.1
+    assert report.stage("dry_run").status.value == "failed"

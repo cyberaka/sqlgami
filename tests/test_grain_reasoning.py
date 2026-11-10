@@ -207,3 +207,52 @@ def test_lookup_the_question_asks_to_filter_is_at_least_medium(dialect):
 def test_plain_unfiltered_table_at_the_grain_is_still_high(dialect):
     report = _policy_scorer(dialect).explain("SELECT c.id, c.name FROM customers c")
     assert _finding(report, "soft_deleted_rows").severity == Severity.HIGH
+
+
+def test_join_grain_probe_sees_filters_on_other_tables():
+    """Whether a join repeats a person depends on how many periods are current: a filter on
+    another table, which static reasoning cannot weigh. The probe runs the query's own FROM and
+    WHERE and asks whether any person row comes back twice; its answer decides either way."""
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute("CREATE TABLE people (assoc_id INTEGER PRIMARY KEY, salary INTEGER)")
+    conn.execute("CREATE TABLE snap (assoc_id INTEGER, period_end_dt DATE, PRIMARY KEY (assoc_id, period_end_dt))")
+    conn.execute("CREATE TABLE periods (ppe_dt DATE PRIMARY KEY, is_current BOOLEAN)")
+    conn.execute("INSERT INTO people SELECT i, 100 + i FROM range(30) r(i)")
+    conn.execute("INSERT INTO snap SELECT i % 30, DATE '2024-01-01' + INTERVAL (14 * (i // 30)) DAY FROM range(300) r(i)")
+    conn.execute("INSERT INTO periods SELECT DATE '2024-01-01' + INTERVAL (14 * i) DAY, i = 9 FROM range(10) r(i)")
+    sql = (
+        "SELECT SUM(p.salary) FROM people p JOIN snap s ON s.assoc_id = p.assoc_id "
+        "JOIN periods pp ON pp.ppe_dt = s.period_end_dt WHERE pp.is_current"
+    )
+    with Scorer("duckdb", db=conn) as scorer:
+        static = scorer.explain(sql, "total salary of current people")
+        assert next(f for f in static.findings if f.code == "fan_out").severity == Severity.HIGH
+        one = scorer.sample(sql, "total salary of current people")
+        finding = next(f for f in one.findings if f.code == "fan_out")
+        assert finding.severity == Severity.LOW and finding.evidence["data_check"] == "unique_observed"
+        conn.execute("UPDATE periods SET is_current = TRUE WHERE ppe_dt = DATE '2024-01-01'")
+        two = scorer.sample(sql, "total salary of current people")
+        finding = next(f for f in two.findings if f.code == "fan_out")
+        assert finding.severity == Severity.HIGH and finding.evidence["data_check"] == "duplicates"
+
+
+def test_probe_queries_carry_the_template_parameters():
+    """A derived table filtered by {manager_id} is probed with the value filled in, not refused."""
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute("CREATE TABLE snap (assoc_id INTEGER, period_end_dt DATE, lvl_2_id INTEGER, PRIMARY KEY (assoc_id, period_end_dt))")
+    conn.execute("CREATE TABLE people (assoc_id INTEGER PRIMARY KEY, salary INTEGER)")
+    conn.execute("INSERT INTO people SELECT i, 100 FROM range(20) r(i)")
+    conn.execute("INSERT INTO snap SELECT i % 20, DATE '2024-01-01' + INTERVAL (14 * (i // 20)) DAY, 7 FROM range(100) r(i)")
+    sql = (
+        "WITH org AS (SELECT DISTINCT assoc_id FROM snap WHERE lvl_2_id = {manager_id}) "
+        "SELECT SUM(p.salary) FROM people p JOIN org o ON o.assoc_id = p.assoc_id"
+    )
+    with Scorer("duckdb", db=conn) as scorer:
+        report = scorer.sample(sql, "salary of my organisation", params={"manager_id": 7})
+    fan = [f for f in report.findings if f.code == "fan_out"]
+    assert not fan or fan[0].severity == Severity.LOW, report.summary()
+    assert not [c for c in report.checks_not_run if "parameter" in c.reason], report.checks_not_run

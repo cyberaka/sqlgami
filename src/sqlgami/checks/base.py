@@ -55,6 +55,8 @@ class CheckContext:
     question: str | None = None
     cache: ModelCache = field(init=False)
     probes: list[Probe] = field(default_factory=list)
+    # Values for the template's parameters, so probe queries built from the statement can run.
+    params: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.cache = ModelCache(self.analysis, self.catalog)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 from sqlglot import exp
 
@@ -105,6 +105,36 @@ def _derived_duplicates_query(ctx: CheckContext, source, columns: list[str]) -> 
     return query
 
 
+def _join_grain_query(ctx: CheckContext, model: SelectModel, alias: str) -> tuple[exp.Expression, Any] | None:
+    """A query that returns a row if, in this SELECT's own FROM and WHERE, two joined rows share
+    one row of ``alias`` (by its key). No row means the join never repeats ``alias``: every filter
+    counts, including those on the other tables, which static reasoning cannot weigh."""
+    select = model.select
+    if select.args.get("from_") is None and select.args.get("from") is None:
+        return None
+    if getattr(model.scope, "external_columns", None):
+        return None  # correlated with an outer query: cannot run on its own
+    info = model.key_info(alias)
+    key = min((k for k in info.keys if k), key=len, default=None) if info.certain else None
+    if key is None:
+        return None
+    source = model.sources[alias]
+    table = source.table if source.kind == "table" else _a_base_table(model, source)
+    if table is None:
+        return None
+    keys = [exp.column(exp.to_identifier(c, quoted=True), table=exp.to_identifier(alias, quoted=True)) for c in sorted(key)]
+    query = exp.Select(expressions=[exp.Literal.number(1)])
+    for arg in ("from_", "from", "joins", "where"):
+        if select.args.get(arg) is not None:
+            query.set(arg, select.args[arg].copy())
+    query = query.group_by(*keys).having("COUNT(*) > 1").limit(1)
+    root = ctx.analysis.resolved
+    with_ = (root.args.get("with_") or root.args.get("with")) if root is not None else None
+    if with_ is not None:
+        query.set("with_", with_.copy())
+    return query, table
+
+
 def _a_base_table(model: SelectModel, source):
     """Some base table a derived source reads, for the probe's size check."""
     if source.scope is None:
@@ -157,6 +187,13 @@ def _uniqueness_probes(
             else:
                 return  # cannot probe this kind of source; leave the finding as it is
         planned.extend(group)
+        # Independently of the culprits: does the whole join, with all its filters, ever repeat a
+        # row of this table? A separate group, so either answer can clear the finding.
+        grain = _join_grain_query(ctx, model, alias)
+        if grain is not None:
+            query, table = grain
+            key = sorted(min((k for k in model.key_info(alias).keys if k), key=len))
+            planned.append(Probe(PROBE_UNIQUE, table, tuple(key), finding, query=query, snippet=f"join:{alias}", group=f"{alias}:join"))
     ctx.probes.extend(planned)
 
 

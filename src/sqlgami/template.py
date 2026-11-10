@@ -127,6 +127,21 @@ def _render(value: Any) -> str:
     return str(value)
 
 
+def literal_node(value: Any) -> Any:
+    """``value`` as a sqlglot literal expression (a list becomes a tuple of literals)."""
+    from sqlglot import exp
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return exp.Tuple(expressions=[literal_node(v) for v in value])
+    if value is None:
+        return exp.Null()
+    if isinstance(value, bool):
+        return exp.Boolean(this=value)
+    if isinstance(value, (int, float)):
+        return exp.Literal.number(value)
+    return exp.Literal.string(str(value))
+
+
 def _literal(value: Any) -> str:
     if value is None:
         return "NULL"
