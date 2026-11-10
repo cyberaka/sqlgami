@@ -482,7 +482,7 @@ def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str,
         tree = statements[0]
     else:
         return translate(text, dialect, tables, functions=functions, column_types=column_types).sql
-    return translate(tree, dialect, tables, functions=functions, column_types=column_types).sql
+    return translate(tree, dialect, tables, functions=functions, column_types=column_types, source_text=text).sql
 
 
 def _run_on(

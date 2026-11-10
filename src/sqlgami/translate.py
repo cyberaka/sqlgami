@@ -120,6 +120,10 @@ def constructs_of(tree: exp.Expression) -> set[str]:
             found.add("op:[]")
         if isinstance(node, exp.TableSample):
             found.add("clause:tablesample")  # a random sample: never equal twice
+        if isinstance(node, exp.Limit) and isinstance(node.parent, exp.AggFunc):
+            found.add("clause:agg_limit")  # ARRAY_AGG(x ORDER BY x LIMIT n): DuckDB has no such clause
+        if isinstance(node, exp.HavingMax):
+            found.add("clause:agg_having_max")
         if isinstance(node, exp.Qualify):
             found.add("clause:qualify")
         if isinstance(node, exp.Unnest):
@@ -162,6 +166,31 @@ def column_types_of(catalog: Any) -> dict[str, str]:
     except Exception:
         pass
     return out
+
+
+_NULLS_MODIFIER = re.compile(r"\b(IGNORE|RESPECT)\s+NULLS\b", re.I)
+
+
+def unverified_in_text(sql: str) -> set[str]:
+    """Constructs sqlglot drops while parsing BigQuery, so only the text shows them: ``IGNORE NULLS``
+    / ``RESPECT NULLS`` inside an aggregate that is not a window function (DuckDB keeps NULLs; a
+    window function's modifier survives the parse and translates)."""
+    found: set[str] = set()
+    for match in _NULLS_MODIFIER.finditer(sql):
+        depth, index = 0, match.end()
+        while index < len(sql):  # to the close of the call the modifier sits in
+            char = sql[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            index += 1
+        rest = sql[index + 1:index + 40].lstrip().upper()
+        if not rest.startswith("OVER"):
+            found.add(f"clause:agg_{match.group(1).lower()}_nulls")
+    return found
 
 
 def _table_key(table: exp.Table) -> str:
@@ -239,16 +268,20 @@ def inline_functions(tree: exp.Expression, functions: Mapping[str, Mapping[str, 
     return tree
 
 
-def translate(sql: str | exp.Expression, dialect: str, tables: Mapping[str, str] | None = None, target: str = "duckdb", functions: Mapping[str, Mapping[str, Any]] | None = None, column_types: Mapping[str, str] | None = None) -> Translation:
+def translate(sql: str | exp.Expression, dialect: str, tables: Mapping[str, str] | None = None, target: str = "duckdb", functions: Mapping[str, Mapping[str, Any]] | None = None, column_types: Mapping[str, str] | None = None, source_text: str | None = None) -> Translation:
     """``sql`` (text, or a parsed tree) in ``dialect`` as DuckDB SQL, or :class:`Untranslatable`.
     ``column_types`` (lower-cased column name → type as the schema spells it) lets the rewrites tell
     a DATE column from a TIMESTAMP one and a NUMERIC column from a FLOAT64 one; without it they
-    assume BigQuery's common case (DATE_ADD over a DATE, ``/`` over FLOAT64)."""
+    assume BigQuery's common case (DATE_ADD over a DATE, ``/`` over FLOAT64). ``source_text`` is
+    the statement's text when ``sql`` is a tree, for the constructs the parser drops."""
     if dialect == target:
         return Translation(sql if isinstance(sql, str) else sql.sql(dialect=target))
     tree = sqlglot.parse_one(sql, read=dialect) if isinstance(sql, str) else sql.copy()
     tree = inline_functions(tree, functions or {}, dialect)
     used = constructs_of(tree)
+    text = sql if isinstance(sql, str) else source_text
+    if text and dialect == "bigquery":
+        used |= unverified_in_text(text)  # what the parser dropped
     allowed = VERIFIED.get(dialect, CORE)
     unverified = sorted(c for c in used if c not in allowed)
     if unverified:

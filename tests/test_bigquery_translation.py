@@ -105,6 +105,25 @@ def test_translated_result_equals_bigquery_semantics(conn, sql, expected, verifi
     assert verifies <= translation.constructs, (verifies - translation.constructs, translation.constructs)
 
 
+@pytest.mark.parametrize("sql,construct", [
+    ("SELECT ARRAY_AGG(DISTINCT x IGNORE NULLS ORDER BY x) FROM t", "clause:agg_ignore_nulls"),  # sqlglot drops the modifier while parsing; DuckDB would keep the NULLs
+    ("SELECT ARRAY_AGG(x RESPECT NULLS) FROM t", "clause:agg_respect_nulls"),
+    ("SELECT ARRAY_AGG(x ORDER BY x LIMIT 2) FROM t", "clause:agg_limit"),  # DuckDB has no LIMIT inside an aggregate
+    ("SELECT ANY_VALUE(x HAVING MAX y) FROM t", "clause:agg_having_max"),
+    ("SELECT APPROX_COUNT_DISTINCT(x) FROM t", "func:APPROX_DISTINCT"),  # the sketches differ between engines
+    ("SELECT COUNT(*) FROM t TABLESAMPLE SYSTEM (10 PERCENT)", "clause:tablesample"),
+    ("SELECT RAND() FROM t", "func:RAND"),  # not on the list; and safety.nondeterministic would refuse it anyway
+    ("SELECT FORMAT_DATE('%e', d) FROM t", "fmt:%-d"),  # space-padded only in BigQuery
+    ("SELECT DATE '2024-03-01' - DATE '2024-02-01'", "op:DATE - DATE (an INTERVAL in BigQuery; use DATE_DIFF)"),
+])
+def test_constructs_the_translation_must_not_vouch_for_are_not_run(sql, construct):
+    with pytest.raises(Untranslatable) as caught:
+        translate(sql, "bigquery")
+    assert construct in str(caught.value)
+    # a window function's modifier survives the parse and is fine
+    assert "IGNORE NULLS" in translate("SELECT LAG(x IGNORE NULLS) OVER (ORDER BY x) FROM t", "bigquery").sql
+
+
 def test_every_allow_listed_construct_has_a_case():
     covered = set().union(*(c[2] for c in CASES))
     assert covered >= CORE, sorted(CORE - covered)

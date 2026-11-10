@@ -342,7 +342,7 @@ def _view_ddl(catalog: Catalog) -> list[str]:
                 own = {q.strip("`").lower(): logical_name(q) for q in catalog.table_names() if q.count(".") >= 2}
                 functions = {k: {"parameters": [list(p) for p in f.parameters], "body": f.body, "language": f.language} for k, f in getattr(catalog, "scalar_functions", {}).items()}
                 try:
-                    query = translate(tree, catalog.dialect, own or None, functions=functions or None, column_types=column_types_of(catalog) or None).sql
+                    query = translate(tree, catalog.dialect, own or None, functions=functions or None, column_types=column_types_of(catalog) or None, source_text=query).sql
                 except Untranslatable as exc:
                     UNTRANSLATABLE_VIEWS[qualified] = exc.construct
                     continue
