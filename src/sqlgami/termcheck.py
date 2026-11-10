@@ -756,8 +756,17 @@ def _judge_window(ctx: CheckContext, term: Term, match: Match, node: exp.Express
             return outcome, None
     same_shape = [r for r in found if (r.point is not None) == (wanted.point is not None)]
     if not same_shape:
+        points = {r.point for r in found if r.point is not None}
+        if wanted.point is None and wanted.lower in points and wanted.upper in points:
+            # The window's two ends are anchored as points — the BigQuery idiom of a start and an
+            # end period looked up in scalar subqueries (period_seq = -(n-1), period_seq = 0) with
+            # the rows then taken between their dates: the extent the term defines, by its bounds.
+            outcome.status = SATISFIED
+            outcome.detail = f"anchored at {wanted.column} = {int(wanted.lower)} and {int(wanted.upper)}"
+            return outcome, None
         outcome.status = DIFFERS
-        outcome.detail = found[0].text
+        anchor = f"only an anchor at {found[0].text}" if wanted.point is None and points else found[0].text
+        outcome.detail = f"{anchor}; the window's extent is not written on {wanted.column}"
         return outcome, None  # a range of another shape may belong to another term
     r = same_shape[0]
     outcome.status = CONTRADICTED
@@ -856,11 +865,26 @@ def _judge_rank(
     return outcome, None
 
 
+def _feeds_output(scope: Any) -> bool:
+    """Whether a SELECT's rows become the query's rows (the root, a CTE, a derived table) rather
+    than a value — a scalar, IN or EXISTS subquery, whose own LIMIT cuts nothing of the output."""
+    current = scope
+    while current is not None:
+        if getattr(current, "is_subquery", False):
+            return False
+        current = getattr(current, "parent", None)
+    return True
+
+
 def _cuts(ctx: CheckContext, params: dict[str, Any] | None) -> list[_Cut]:
-    """Every way the query cuts its rows: LIMIT / FETCH clauses and comparisons that bound a
-    ranking function (directly, or through a column a derived source defines as one)."""
+    """Every way the query cuts its output rows: LIMIT / FETCH clauses and comparisons that bound
+    a ranking function (directly, or through a column a derived source defines as one), in the
+    scopes that produce the output — a LIMIT 1 inside a current-period scalar subquery is not a
+    cut of the result."""
     found: list[_Cut] = []
     for model in ctx.cache.models():
+        if not _feeds_output(model.scope):
+            continue
         select = model.select
         for key in ("limit", "fetch"):
             clause = select.args.get(key)

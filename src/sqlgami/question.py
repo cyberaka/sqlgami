@@ -56,6 +56,9 @@ _TOP_N = re.compile(
     re.IGNORECASE,
 )
 _SUPERLATIVE = re.compile(rf"\b({_DESC_WORDS}|{_ASC_WORDS})\b", re.IGNORECASE)
+# "last 13 pay periods", "most recent 8 months", "first 2 quarters": a window of time, not a top-N
+_WINDOW_WORDS = {"last", "first", "latest", "newest", "most recent", "earliest", "oldest"}
+_TIME_UNIT_AFTER = re.compile(r"^\s*(?:(?:biweekly|weekly|monthly|calendar|fiscal|pay|full|complete|whole)[- ]+)*(?:days?|weeks?|months?|quarters?|years?|periods?|pay[- ]periods?|hours?|minutes?|snapshots?|cycles?)\b", re.IGNORECASE)
 _STRONG_DIRECTION = {
     "top", "largest", "highest", "biggest", "most", "greatest", "maximum", "max",
     "bottom", "smallest", "lowest", "least", "fewest", "minimum", "min",
@@ -166,6 +169,9 @@ class _Asked:
                 # "at least one", "at most 5": a bound, not a ranking. "the first 5" stays a ranking.
                 if before.endswith("at "):
                     continue
+            word = (candidate.group("w1") or candidate.group("w2") or "").lower()
+            if word in _WINDOW_WORDS and _TIME_UNIT_AFTER.match(text[candidate.end():]):
+                continue  # "last 13 pay periods", "most recent 8 months": a window of time, not a ranking
             top = candidate
             break
         self.top_word: str | None = None

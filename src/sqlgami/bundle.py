@@ -69,6 +69,10 @@ class Reference:
     slots: dict[str, Any] = field(default_factory=dict)  # numbers the question bound into those terms ({n: 26})
     results: dict[str, dict[str, Any]] = field(default_factory=dict)  # fixture name -> stored result
     variant_of: str = ""  # a paraphrase of another reference (same SQL, its own question and slots)
+    # term slot name -> the reference's own placeholder for it: the question "last {n_months}
+    # calendar months" matched the term phrase "last {n_months_back} calendar months", so a
+    # candidate's n_months_back is this reference's n_months
+    slot_aliases: dict[str, str] = field(default_factory=dict)
 
     @property
     def question_key(self) -> str:
@@ -76,15 +80,21 @@ class Reference:
 
     @property
     def slot_names_in_sql(self) -> set[str]:
-        """Slots the reference SQL is written over (``{n}``), so it can be re-run for other values."""
+        """Placeholders the reference SQL is written over (``{n}``, ``{n_months_back}``), so it can
+        be re-run for other values."""
         import re
 
-        return set(re.findall(r"\{(n|m)\}", self.sql))
+        return set(re.findall(r"\{(\w+)\}", self.sql))
+
+    def own_slots(self, slots: Mapping[str, Any]) -> dict[str, Any]:
+        """A question's slot bindings in this reference's names (through ``slot_aliases``)."""
+        return {self.slot_aliases.get(k, k): v for k, v in slots.items()}
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "key": self.key, "question": self.question, "sql": self.sql, "params": self.params,
             "terms": list(self.terms), "slots": self.slots, "results": self.results, "variant_of": self.variant_of,
+            "slot_aliases": self.slot_aliases,
         }
 
     @classmethod
@@ -92,7 +102,7 @@ class Reference:
         return cls(
             str(data["key"]), str(data["question"]), str(data["sql"]), dict(data.get("params") or {}),
             tuple(data.get("terms") or ()), dict(data.get("slots") or {}), dict(data.get("results") or {}),
-            str(data.get("variant_of") or ""),
+            str(data.get("variant_of") or ""), dict(data.get("slot_aliases") or {}),
         )
 
 
@@ -400,6 +410,13 @@ def _references(config: dict[str, Any], catalogue: Catalogue | None) -> list[Ref
             matches = catalogue.match(reference.question)
             reference.terms = catalogue.pattern(reference.question)
             reference.slots = {**reference.slots, **slot_values(matches)}
+            # a templated question binds a term slot to its own placeholder: "{n_months}" in
+            # "last {n_months} calendar months" is what the term calls {n_months_back}
+            for match in matches:
+                for slot, text in (match.bindings or {}).items():
+                    own = text.strip()
+                    if own.startswith("{") and own.endswith("}") and own[1:-1] != slot:
+                        reference.slot_aliases[slot] = own[1:-1]
         unique.append(reference)
     return unique
 

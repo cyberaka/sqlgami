@@ -11,3 +11,10 @@ termed_90,input,
 termed_180,input,
 leavers,input,
 headcount_start,input,
+n_months_back,integer,24;12
+n_months,integer,6;12
+tolerance_pp,number,2;5
+top_n,integer,5;3
+cap_n,integer,50;10
+n_recent_periods,integer,8;4
+n_periods,integer,13;26

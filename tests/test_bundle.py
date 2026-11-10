@@ -241,3 +241,40 @@ def test_a_paraphrase_naming_other_columns_is_not_routed_to_a_smaller_pattern(tm
         assert not report.has("fixture_mismatch")
         bare = scorer.explain("SELECT COUNT(*) FROM orders WHERE status = 'paid'", "Count the paid orders")
         assert bare.signals["fixtures"]["verdict"] == "match" and bare.signals["fixtures"]["matched_by"] == "pattern"
+
+
+def test_a_reference_names_its_own_slot_and_a_question_bound_through_the_term_still_serves_it(tmp_path):
+    """Two references write the same notion under different placeholder names ({n_months} and
+    {n_months_back}); the term phrase binds one name. A reference's templated question records the
+    alias, so a candidate's number reaches the reference under the reference's own name — and a
+    number the question states for a template parameter the caller did not pass is that
+    parameter's value, never the reference's default."""
+    (tmp_path / "schema.sql").write_text(SHOP_DDL)
+    terms = tmp_path / "terms"
+    terms.mkdir()
+    (terms / "Terms.csv").write_text(
+        "term,phrases,kind,table,sql,nulls,description\n"
+        "paid,paid,filter,orders,status = 'paid',,\n"
+        "top_n,top {top_n};largest {top_n},,,,,documentation: the n largest\n"
+        "spend,spend;order value,,,,,documentation\n"
+    )
+    (terms / "Parameters.csv").write_text("name,type,example_values\ntop_n,integer,3\n")
+    by_limit = "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.name ORDER BY spend DESC LIMIT {how_many}"
+    (terms / "Examples.csv").write_text(
+        "id,question,params,correct_sql,expected_result,dataset\n"
+        f'topk,"The top {{how_many}} customers by paid spend",how_many=3,"{by_limit}",,\n'
+    )
+    (tmp_path / "sqlgami.yaml").write_text("dialect: duckdb\nschema: schema.sql\nterms: terms\nfixtures: {seed: 2, profiles: [clean, ties], values: {orders.status: [paid, open]}}\n")
+    compile_bundle(tmp_path / "sqlgami.yaml", tmp_path / "bundle")
+    bundle = Bundle.load(tmp_path / "bundle")
+    ref = bundle.reference_for(None, "topk")[0]
+    assert ref.slot_aliases == {"top_n": "how_many"} and ref.params == {"how_many": 3} and "how_many" in ref.slot_names_in_sql
+    assert ref.own_slots({"top_n": 5}) == {"how_many": 5}
+    with Scorer("duckdb", catalog=SHOP_DDL, bundle=tmp_path / "bundle") as scorer:
+        right = "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.name ORDER BY spend DESC LIMIT 5"
+        report = scorer.explain(right, "Which are the largest 5 customers by paid order value?")
+        signal = report.signals["fixtures"]
+        assert signal["verdict"] == "match" and signal["params"] == {"how_many": 5} and signal["reference_rerun"] is True, signal
+        # the same statement for a question saying 3 — compared at 3, where LIMIT 5 is wrong
+        report = scorer.explain(right, "Which are the largest 3 customers by paid order value?")
+        assert report.signals["fixtures"]["verdict"] == "mismatch"

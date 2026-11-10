@@ -549,3 +549,59 @@ def test_a_one_true_fact_makes_the_current_period_subquery_single_row(tmp_path):
     # a serialised catalogue keeps the fact
     again = Catalog.from_dict(cat.to_dict(), "duckdb")
     assert "scalar_subquery_rows" not in {f.code for f in Scorer("duckdb", catalog=again).score(sql).findings}
+
+
+def test_a_window_anchored_by_two_period_lookups_satisfies_the_window_term():
+    """The BigQuery idiom: the window's start and end periods are looked up as points
+    (period_seq = -(n-1), period_seq = 0) and the rows taken between their dates. That is the
+    term's extent, by its bounds — not "differs". An anchor alone (period_seq = 0) is reported as
+    the anchor it is, with the extent not written on the column."""
+    anchored = (
+        "SELECT COUNT(DISTINCT s.assoc_id) FROM hr_emp_period_snapshot s WHERE s.snap_dt = s.period_end_dt AND s.status_cd = 'A' "
+        "AND s.period_end_dt BETWEEN (SELECT ppe_dt FROM hr_pay_period_dim WHERE freq_cd = 'B' AND period_seq = -7) "
+        "AND (SELECT ppe_dt FROM hr_pay_period_dim WHERE freq_cd = 'B' AND period_seq = 0) AND (" + CHAIN + ")"
+    )
+    report = scorer().score(anchored, "Active headcount in my organisation over the last 8 pay periods", params={"manager_id": 12003})
+    outcome = next(o for o in report.signals["terms"]["outcomes"] if o["term"] == "last_n_pay_periods")
+    assert outcome["status"] == "satisfied" and "anchored" in outcome["detail"], outcome
+    assert "term_window" not in {f.code for f in report.findings}
+    anchor_only = anchored.replace("period_seq = -7", "period_seq = 0")
+    report = scorer().score(anchor_only, "Active headcount in my organisation over the last 8 pay periods", params={"manager_id": 12003})
+    outcome = next(o for o in report.signals["terms"]["outcomes"] if o["term"] == "last_n_pay_periods")
+    assert outcome["status"] == "differs" and "anchor" in outcome["detail"], outcome
+
+
+def test_a_literal_word_in_a_phrase_matches_only_questions_that_say_it_there_and_qualifiers_let_it_vary():
+    """"last {n_periods} biweekly pay periods" matches only a question with "biweekly" between the
+    number and "pay periods"; it does not capture every question that says "biweekly". The
+    `qualifiers` column is how a term lets a question put such a word inside its wording."""
+    terms = """term,phrases,kind,table,sql,nulls,description,qualifiers
+last_periods_literal,last {n_periods} biweekly pay periods,window,hr_pay_period_dim,period_seq BETWEEN -({n_periods}-1) AND 0,,,
+last_periods,last {n} pay periods,window,hr_pay_period_dim,period_seq BETWEEN -({n}-1) AND 0,,,biweekly;authoritative
+"""
+    params = "name,type,example_values\nn_periods,integer,13\n"
+    book = Catalogue.from_sheets({"terms": terms, "kpis": "kpi,phrases,formula,format,reference_sql,description\n", "parameters": params})
+    names = lambda q: {m.name: m.bindings for m in book.match(q)}
+    assert names("headcount over the last 13 biweekly pay periods") == {"last_periods_literal": {"n_periods": "13"}}  # the longer phrase takes the span
+    assert names("the biweekly headcount over the last 13 pay periods") == {"last_periods": {"n": "13"}}  # "biweekly" elsewhere: not the literal phrase
+    assert names("new hires in the biweekly cycle") == {}
+    assert names("the last 8 authoritative pay periods") == {"last_periods": {"n": "8"}}
+
+
+def test_the_access_chain_is_recognised_in_its_equivalent_spellings():
+    """The or-chain policy holds for every way of comparing all chain columns with the manager:
+    the literal OR chain, `IN (lookup subquery)`, `IN (one value)`, and the UNNEST pivot — of
+    STRUCT fields or of the plain columns. A pivot that leaves columns out is still incomplete."""
+    from sqlgami.catalog import RequiredPredicate
+
+    levels = [f"lvl_{i}_id" for i in range(2, 8)] + [f"lvl_{i}_id_fn" for i in range(2, 8)]
+    rule = RequiredPredicate.coerce({"name": "scope", "tables": ["hr_emp_period_snapshot"], "match": "or_chain", "columns": levels, "severity": "high", "description": "scoped to a manager"})
+    def codes(sql):
+        return {f.code for f in Scorer("duckdb", catalog=HR_DDL, required_predicates=[rule]).score(sql, params={"manager_id": 12003}).findings}
+    head = "SELECT COUNT(DISTINCT s.assoc_id) FROM hr_emp_period_snapshot s"
+    assert "required_predicate" not in codes(head + " WHERE " + " OR ".join(f"s.{c} = {{manager_id}}" for c in levels))
+    assert "required_predicate" not in codes(head + " WHERE " + " OR ".join(f"s.{c} IN (SELECT assoc_id FROM hr_employee_dim WHERE assoc_id = {{manager_id}})" for c in levels))
+    assert "required_predicate" not in codes(head + " WHERE " + " OR ".join(f"s.{c} IN ({{manager_id}})" for c in levels))
+    assert "required_predicate" not in codes(head + ", UNNEST([" + ", ".join(f"STRUCT(s.{c} AS node_id)" for c in levels) + "]) AS x WHERE x.node_id = {manager_id}")
+    assert "required_predicate" not in codes(head + ", UNNEST([" + ", ".join(f"s.{c}" for c in levels) + "]) AS lv WHERE lv = {manager_id}")
+    assert "required_predicate" in codes(head + ", UNNEST([" + ", ".join(f"STRUCT(s.{c} AS node_id)" for c in levels[:6]) + "]) AS x WHERE x.node_id = {manager_id}")

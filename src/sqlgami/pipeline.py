@@ -705,6 +705,13 @@ def _fixture_stage(
     live_params = dict(reference.params)
     if params:
         live_params.update({k: v for k, v in params.items() if k in reference.params or not reference.params})
+    # The question's slots in the reference's own names ({n_months_back} the term binds is this
+    # reference's {n_months}); a number the question states for a template parameter the caller
+    # did not pass is that parameter's value, never the reference's default.
+    slots = reference.own_slots(slots)
+    for k, v in slots.items():
+        if k in reference.params and not (params and k in params):
+            live_params[k] = v
     # Every slot the reference binds must be bound by the question too; a question that does not
     # say its N is not compared under the reference's N.
     unbound = sorted(k for k in reference.slots if k not in slots)

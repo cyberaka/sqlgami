@@ -563,6 +563,17 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
                         nodes.setdefault(base[0].qualified_name, node)
         for name, columns in per_table.items():
             chains.setdefault(name, []).append((columns, nodes[name]))
+        # UNNEST([STRUCT(eps.lvl_2_id AS node_id), ...]) x WHERE x.node_id = 12003 (or UNNEST([eps.lvl_2_id,
+        # ...]) AS lv WHERE lv = 12003): the columns exploded to one value and that value pinned is
+        # the same chain, written as a pivot.
+        for alias, pivoted, node in _unnest_pivots(model):
+            pinned: dict[str, set[str]] = {}
+            for member in pivoted:
+                base = _base_of(model, member)
+                if base is not None:
+                    pinned.setdefault(base[0].qualified_name, set()).add(catalog.column_key(base[1]))
+            for name, columns in pinned.items():
+                chains.setdefault(name, []).append((columns, node))
     for table in ctx.analysis.tables.values():
         if not rule.applies_to(table):
             continue
@@ -631,6 +642,49 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
                 table=table.qualified_name,
                 missing=missing,
             )
+
+
+def _unnest_pivots(model: SelectModel) -> list[tuple[str, list[tuple[str, str]], exp.Expression]]:
+    """``(alias, [column refs exploded], the pinning condition)`` for every UNNEST source over an
+    array of this SELECT's columns (plain, or as one field of STRUCTs) whose exploded value the
+    SELECT holds at one constant (``x.node_id = 12003``, ``lv = 12003``)."""
+    from ..model import flatten_and
+
+    found: list[tuple[str, list[tuple[str, str]], exp.Expression]] = []
+    for alias, source in model.sources.items():
+        node = source.node
+        if not isinstance(node, exp.Unnest) or len(node.expressions) != 1 or not isinstance(node.expressions[0], exp.Array):
+            continue
+        fields: dict[str, list[tuple[str, str]]] = {}  # exploded field name ("" for a plain value) -> column refs
+        for element in node.expressions[0].expressions:
+            element = element.this if isinstance(element, exp.Paren) else element
+            if isinstance(element, exp.Struct):
+                for item in element.expressions:
+                    column = item.expression if isinstance(item, exp.PropertyEQ) else item.this if isinstance(item, exp.Alias) else None
+                    field = item.this.name if isinstance(item, exp.PropertyEQ) else item.alias if isinstance(item, exp.Alias) else None
+                    if isinstance(column, exp.Column) and column.table in model.sources and field:
+                        fields.setdefault(field.lower(), []).append((column.table, column.name))
+            elif isinstance(element, exp.Column) and element.table in model.sources:
+                fields.setdefault("", []).append((element.table, element.name))
+        if not fields:
+            continue
+        for conjunct in model.conjuncts:
+            for part in flatten_and(conjunct.expr):
+                part = strip(part)
+                if not isinstance(part, exp.EQ):
+                    continue
+                for side, other in ((strip(part.this), strip(part.expression)), (strip(part.expression), strip(part.this))):
+                    field, base = "", side
+                    if isinstance(side, exp.Dot) and isinstance(side.this, exp.Column):
+                        field, base = side.expression.name.lower(), side.this
+                    if not isinstance(base, exp.Column) or not (base.table == alias or (not base.table and base.name == alias and not field)):
+                        continue  # the exploded value: x.node_id, or the bare lv of UNNEST(...) AS lv
+                    if model._constant_or_pinned(other) is None:
+                        continue
+                    refs = fields.get(field) if field else fields.get("") or (next(iter(fields.values())) if len(fields) == 1 else None)
+                    if refs:
+                        found.append((alias, refs, part))
+    return found
 
 
 def _listed(names: Iterable[str], limit: int = 4) -> str:

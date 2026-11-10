@@ -461,7 +461,9 @@ def _phrase_pattern(phrase: str, qualifiers: Sequence[str] = (), numeric: Sequen
         if marker:
             name = marker.group(1)
             if name in ("n", "m") or name in numeric:
-                parts.append(rf"(?P<{name}>\d+(?:\.\d+)?|{'|'.join(_NUMBER_WORDS)})")
+                # a number, a number word, or — in a reference's templated question — the
+                # reference's own placeholder ("last {n_months} calendar months")
+                parts.append(rf"(?P<{name}>\d+(?:\.\d+)?|\{{\w+\}}|{'|'.join(_NUMBER_WORDS)})")
             else:
                 # a parameter slot takes a value, not a word: a number, an identifier with digits
                 # or underscores, or a quoted/placeholder form — never plain prose

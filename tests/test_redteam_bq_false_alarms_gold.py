@@ -58,10 +58,6 @@ def _unnest_pivot_scope_sql() -> str:
             f"WHERE eps.status_cd = 'A' AND x.node_id = 12003")
 
 
-@pytest.mark.xfail(strict=True, reason="HIGH false alarm (gold q031): an UNNEST-pivot hierarchy scope "
-                                       "(explode the 12 level columns to one node_id, filter node_id = "
-                                       "manager) is not recognized by the or_chain required-predicate "
-                                       "matcher, so a correct gold is flagged HIGH (~0.10).")
 def test_required_predicate_accepts_unnest_pivot_scope(scorer):
     report = scorer.score(_unnest_pivot_scope_sql(), None, mode="static")
     assert "required_predicate" not in _high(report)
@@ -95,10 +91,6 @@ def test_term_rank_control_dense_rank_without_incidental_limit(scorer):
     assert "term_rank" not in _high(report)
 
 
-@pytest.mark.xfail(strict=True, reason="HIGH false alarm (gold q025): a correct top-N using QUALIFY "
-                                       "DENSE_RANK() <= 3 is flagged term_rank ('uses a plain row limit') "
-                                       "solely because of an unrelated LIMIT 1 in a current-period scalar "
-                                       "subquery.")
 def test_term_rank_not_misled_by_limit_in_scalar_subquery(scorer):
     report = scorer.score(_dense_rank_topn(True), _TOPN_QUESTION, mode="static", params={"manager_id": 12003})
     assert "term_rank" not in _high(report)
