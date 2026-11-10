@@ -27,7 +27,7 @@ from .evaluate import (
     write_run,
 )
 from .audit import DEFAULT_STRONG, audit
-from .suite import SuiteError, load_suite
+from .suite import SuiteError, load_suite, RUNS_DIR
 from .validate import validate
 
 
@@ -38,6 +38,13 @@ def main(argv: list[str] | None = None) -> int:
     p_sync = sub.add_parser("sync", help="copy a suite from its shared or held-out source and record the checksums")
     p_sync.add_argument("source")
     p_sync.add_argument("dest")
+
+    p_lat = sub.add_parser("latency", help="p50/p90/p99 of score() per mode on the suite's gold statements")
+    p_lat.add_argument("suite")
+    p_lat.add_argument("--engine", default="duckdb")
+    p_lat.add_argument("--mode", action="append", help="static, dry or sample; repeatable; default static and sample")
+    p_lat.add_argument("--repeat", type=int, default=3)
+    p_lat.add_argument("--stretch", help="pad statements to this line range, e.g. 40-80")
 
     p_build = sub.add_parser("build", help="generate data and build the databases")
     p_build.add_argument("suite")
@@ -132,6 +139,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{digest}  {name}")
             return 0
         suite = load_suite(args.suite)
+        if args.command == "latency":
+            from .latency import format_result, measure, write_result
+
+            lines = None
+            if args.stretch:
+                low, _, high = args.stretch.partition("-")
+                lines = (int(low), int(high or low))
+            result = measure(suite, args.engine, args.mode or ["static", "sample"], repeat=args.repeat, lines=lines)
+            print(format_result(result))
+            write_result(result, RUNS_DIR / "latency.json")
+            return 0
         if args.command == "label":
             target = label_run(suite, Path(args.run))
             labels = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]

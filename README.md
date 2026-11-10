@@ -545,6 +545,15 @@ SQLGAMI_TEST_PG_DSN=postgresql://USER:PASSWORD@127.0.0.1:5440/DBNAME uv run pyte
 
 The tests create and drop their own schemas in that database.
 
+### Latency
+
+`score()` is meant to run inside agent loops: the static path (parse, gate,
+catalogue, checks, terms) is measured by `python -m benchkit latency <suite>
+--mode static --mode sample --stretch 40-80`, which pads the suite's gold
+statements to production size and prints p50/p90/p99 per mode;
+`tests/test_latency.py` guards the static p90 in CI. On a developer machine
+the static path runs in about 10-20 ms for 40-80-line statements.
+
 ### Bench
 
 `bench/` holds test suites: realistic schemas, deterministic data generators,
