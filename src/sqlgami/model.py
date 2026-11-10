@@ -762,7 +762,11 @@ class SelectModel:
                 continue
             result.culprits.append(other)
             info = self.key_info(other)
-            if info.certain and source.kind != "function":
+            # A base table with declared keys, or a derived table with a definite key (a GROUP BY),
+            # that the join does not cover: repeats are allowed by the shape, a certainty. A
+            # derived table with no key at all (a filtered projection) may be unique in the
+            # data — one current period, one row per code — so only a possibility.
+            if info.certain and (source.kind == "table" or info.keys):
                 result.state = YES
             elif result.state != YES:
                 result.state = MAYBE
