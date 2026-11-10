@@ -37,11 +37,19 @@ _LISTS: dict[str, tuple[frozenset[str], frozenset[str], frozenset[str]]] = {
     "sqlite": (F.SQLITE_ALLOWED, F.SQLITE_TABLE_FUNCTIONS, F.SQLITE_REFUSED),
     "duckdb": (F.DUCKDB_ALLOWED, F.DUCKDB_TABLE_FUNCTIONS, F.DUCKDB_REFUSED),
     "postgres": (F.POSTGRES_ALLOWED, frozenset(), F.POSTGRES_REFUSED),
+    "bigquery": (F.BIGQUERY_ALLOWED, frozenset(), F.BIGQUERY_REFUSED),
 }
 # On these engines only a table function may stand where a table is expected.
 _TABLE_POSITION_IS_SEPARATE = {"sqlite", "duckdb"}
 # Schemas whose functions are the engine's own.
-_SYSTEM_SCHEMAS = {"postgres": {"pg_catalog"}, "duckdb": {"main", "system", "pg_catalog"}, "sqlite": {"main"}}
+_SYSTEM_SCHEMAS = {"postgres": {"pg_catalog"}, "duckdb": {"main", "system", "pg_catalog"}, "sqlite": {"main"},
+                   "bigquery": {"net", "hll_count", "kll_quantiles", "safe"}}
+# Namespaces whose every function reaches a model, an object table or a remote service.
+_REFUSED_NAMESPACES = {"bigquery": {"ml", "ai", "obj"}}
+# Constructs that widen what a statement reads beyond the tables it names; the host opts in by
+# naming them in ``allowed_functions`` (``session_user``, ``system_time_as_of``) or, for a wildcard
+# table, in ``allowed_tables`` (``p.d.events_*`` or ``p.d.*``).
+POLICY_OPT_INS = frozenset({"session_user", "system_time_as_of"})
 
 # Refused on every dialect, listed or not.
 REFUSED_EVERYWHERE = frozenset(
@@ -54,6 +62,7 @@ REFUSED_EVERYWHERE = frozenset(
         "dblink", "dblink_exec", "pg_sleep", "pg_sleep_for", "pg_sleep_until", "pg_terminate_backend",
         "pg_cancel_backend", "pg_reload_conf", "set_config", "current_setting", "nextval", "setval",
         "pg_advisory_lock", "load_extension", "readfile", "writefile", "edit", "fts3_tokenizer",
+        "external_query", "external_object_transform",
     }
 )
 
@@ -120,11 +129,19 @@ def review_functions(tree: exp.Expression, dialect: str | None, allowed: Iterabl
             if name in REFUSED_EVERYWHERE:
                 refused.add(name)
                 continue
+            if qualifier is not None and qualifier in _REFUSED_NAMESPACES.get(dialect or "", set()):
+                refused.add(f"{qualifier}.{name}")
+                continue
             if lists is None:
                 continue
             everywhere, tables_only, known_bad = lists
             if qualifier is not None and qualifier not in _SYSTEM_SCHEMAS.get(dialect or "", set()):
                 unlisted.add(f"{qualifier}.{name}")  # somebody's own function, whatever it is called
+                continue
+            if "." in name:
+                # BigQuery's `proj.dataset.f`(...): a path in one identifier, somebody's own function
+                head = name.split(".")[0]
+                (refused if head in _REFUSED_NAMESPACES.get(dialect or "", set()) else unlisted).add(name)
                 continue
             if _in_table_position(node) and dialect in _TABLE_POSITION_IS_SEPARATE:
                 good = name in tables_only
@@ -136,7 +153,12 @@ def review_functions(tree: exp.Expression, dialect: str | None, allowed: Iterabl
             continue
         cls = type(node).__name__
         if cls in F.REFUSED_TYPED or cls in tainted:
-            refused.add(node.sql_name().lower())
+            label = node.sql_name().lower()
+            if isinstance(node.parent, exp.Table) and node.parent.db:
+                label = f"{node.parent.db.lower()}.{label}"  # ML.PREDICT(...)
+            if label in host:
+                continue  # vouched for, or an opt-in policy name such as session_user
+            refused.add(label)
         elif lists is not None and cls not in F.SAFE_TYPED:
             unlisted.add(node.sql_name().lower())
         elif dialect in _TABLE_POSITION_IS_SEPARATE and _in_table_position(node) and cls not in _TABLE_TYPED:
@@ -163,6 +185,30 @@ def review_functions(tree: exp.Expression, dialect: str | None, allowed: Iterabl
             if "/" in text or "\\" in text or text.endswith(_FILE_SUFFIXES) or "://" in text:
                 refused.add(f"file {ident.name!r}")
     return FunctionReview(sorted(refused), sorted(unlisted))
+
+
+def is_refused(name: str, dialect: str | None, allowed: Iterable[str] = ()) -> bool:
+    """Whether a function written as ``name`` (``f``, ``ns.f`` or BigQuery's ```proj.ds.f```) is one
+    sqlgami refuses on ``dialect`` — the same judgement :func:`review_functions` makes of a call."""
+    key = name.strip("`").lower()
+    host = {n.lower() for n in allowed}
+    if key in host:
+        return False
+    head, _, tail = key.rpartition(".")
+    namespace = head.split(".")[0] if head else None
+    if namespace and namespace in _REFUSED_NAMESPACES.get(dialect or "", set()):
+        return True
+    lists = _LISTS.get(dialect or "")
+    return tail in REFUSED_EVERYWHERE or (lists is not None and tail in lists[2])
+
+
+def review_body(tree: exp.Expression, dialect: str | None, allowed: Iterable[str] = (), allowed_tables: Iterable[str] = ()) -> FunctionReview:
+    """The tree net over a view's or table function's body, reached through a statement that
+    reads it: the body is sent along with the statement, so it goes through the same gate."""
+    first = review_functions(tree, dialect, allowed)
+    opt_ins = {name for name in allowed if name.lower() in POLICY_OPT_INS}
+    refused = sorted(set(first.refused) | set(review_tables(tree, dialect, set(allowed_tables) | opt_ins)))
+    return FunctionReview(refused, sorted(set(first.unlisted) - set(refused)))
 
 
 def _defined_names(tree: exp.Expression) -> set[str]:
@@ -256,10 +302,21 @@ def review_tables(tree: exp.Expression, dialect: str | None, allowed: Iterable[s
         if not schema and name in ctes:
             continue
         full = f"{schema}.{name}" if schema else name
-        if full in host or name in host or (schema and f"{schema}.*" in host):
+        project = (node.catalog or "").lower()
+        path = f"{project}.{full}" if project else full
+        if full in host or name in host or path in host or (schema and f"{schema}.*" in host) or (project and f"{project}.{schema}.*" in host):
             continue
-        if (schema and schemas and schema in schemas) or name.startswith(prefixes) or name.upper() == "INFORMATION_SCHEMA" or schema.upper() == "INFORMATION_SCHEMA":
-            refused.add(f"table {full}")
+        # BigQuery folds INFORMATION_SCHEMA.X into one identifier, and a region qualifier
+        # (`region-us`.INFORMATION_SCHEMA.JOBS) reads every job's text in the project.
+        segments = {part for part in path.split(".")}
+        if (schema and schemas and schema in schemas) or name.startswith(prefixes) or "information_schema" in segments or any(part.startswith("region-") for part in segments):
+            refused.add(f"table {path}")
+            continue
+        if dialect == "bigquery":
+            if "*" in name:
+                refused.add(f"table {path} (a wildcard reads every table the pattern matches; allow it under allowed_tables)")
+            if node.args.get("version") is not None and "system_time_as_of" not in host:
+                refused.add(f"table {path} FOR SYSTEM_TIME AS OF (time travel; allow system_time_as_of under allowed_functions)")
     return sorted(refused)
 
 
@@ -275,7 +332,7 @@ def review(
     ``tokens`` are the statement's tokens when the caller already has them."""
     first = review_functions(tree, dialect, allowed)
     second = review_text(sql, tree, dialect, allowed, tokens)
-    refused = sorted(set(first.refused) | set(second.refused) | set(review_tables(tree, dialect, allowed_tables)))
+    refused = sorted(set(first.refused) | set(second.refused) | set(review_tables(tree, dialect, set(allowed_tables) | ({name for name in allowed if name.lower() in POLICY_OPT_INS}))))
     unlisted = sorted((set(first.unlisted) | set(second.unlisted)) - set(refused))
     # "schema.name" from the tree and bare "name" from the text are one call.
     qualified = {name.rsplit(".", 1)[-1] for name in unlisted if "." in name}

@@ -26,8 +26,8 @@ def dialect(request) -> str:
     return request.param
 
 
-def review(sql: str, dialect: str, allowed=()):
-    return safety.review(sql, sqlglot.parse_one(sql, dialect=dialect), dialect, allowed)
+def review(sql: str, dialect: str, allowed=(), allowed_tables=()):
+    return safety.review(sql, sqlglot.parse_one(sql, dialect=dialect), dialect, allowed, allowed_tables)
 
 
 # ----------------------------------------------------------------- ordinary SQL goes through
@@ -149,9 +149,25 @@ def test_function_in_somebody_elses_schema_is_unlisted():
 
 
 def test_dialect_without_a_list_keeps_the_refuse_list():
-    assert not safety.has_allow_list("bigquery")
-    assert review("SELECT my_udf(x), SAFE_DIVIDE(a, b) FROM t", "bigquery").ok
-    assert review("SELECT * FROM read_csv('x')", "bigquery").refused
+    assert not safety.has_allow_list("snowflake")
+    assert review("SELECT my_udf(x), IFF(a > b, a, b) FROM t", "snowflake").ok
+    assert review("SELECT * FROM read_csv('x')", "snowflake").refused
+
+
+def test_bigquery_has_its_own_list_and_gate():
+    assert safety.has_allow_list("bigquery")
+    assert review("SELECT SAFE_DIVIDE(a, b), COUNTIF(x > 1), DATE_TRUNC(d, WEEK(MONDAY)) FROM `p.d.t`", "bigquery").ok
+    found = review("SELECT my_udf(x), ds.f(y), `p.ds.g`(z) FROM t", "bigquery")
+    assert found.unlisted == ["`p.ds.g`", "ds.f", "my_udf"] or set(found.unlisted) == {"p.ds.g", "ds.f", "my_udf"}
+    assert "ml.predict" in review("SELECT * FROM ML.PREDICT(MODEL `p.d.m`, (SELECT * FROM `p.d.t`))", "bigquery").refused
+    assert "external_query" in review("SELECT * FROM EXTERNAL_QUERY('c', 'SELECT 1')", "bigquery").refused
+    assert any("information_schema" in r for r in review("SELECT * FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT", "bigquery").refused)
+    assert any("wildcard" in r for r in review("SELECT * FROM `p.d.events_*`", "bigquery").refused)
+    assert review("SELECT * FROM `p.d.events_*`", "bigquery", allowed_tables=["p.d.*"]).ok
+    assert "session_user" in review("SELECT SESSION_USER()", "bigquery").refused
+    assert review("SELECT SESSION_USER()", "bigquery", allowed=["session_user"]).ok
+    assert any("SYSTEM_TIME" in r for r in review("SELECT * FROM `p.d.t` FOR SYSTEM_TIME AS OF CURRENT_TIMESTAMP()", "bigquery").refused)
+    assert review("SELECT * FROM `p.d.t` FOR SYSTEM_TIME AS OF CURRENT_TIMESTAMP()", "bigquery", allowed=["system_time_as_of"]).ok
 
 
 def test_a_call_the_parser_reads_as_a_table_is_still_caught():

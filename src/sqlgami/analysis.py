@@ -223,7 +223,7 @@ def analyse(
     analysis.unlisted_functions = review.unlisted
 
     if catalog is not None:
-        _Resolver(analysis, catalog).run()
+        _Resolver(analysis, catalog, allowed_functions, allowed_tables).run()
     return analysis
 
 
@@ -380,10 +380,22 @@ def _mutation_kinds(tree: exp.Expression) -> list[str]:
 
 
 class _Resolver:
-    def __init__(self, analysis: Analysis, catalog: Catalog) -> None:
+    def __init__(self, analysis: Analysis, catalog: Catalog, allowed_functions: Iterable[str] = (), allowed_tables: Iterable[str] = ()) -> None:
         self.analysis = analysis
         self.catalog = catalog
         self.dialect = analysis.dialect
+        self.allowed_functions = list(allowed_functions)
+        self.allowed_tables = list(allowed_tables)
+
+    def _review_body(self, body: exp.Expression) -> None:
+        """A view or table-function body goes through the safety gate like the statement that
+        reads it: what it calls and reads is sent too."""
+        analysis = self.analysis
+        review = safety.review_body(body, self.dialect, self.allowed_functions, self.allowed_tables)
+        if review.refused:
+            analysis.unsafe_functions = sorted(set(analysis.unsafe_functions) | set(review.refused))
+        if review.unlisted:
+            analysis.unlisted_functions = sorted((set(analysis.unlisted_functions) | set(review.unlisted)) - set(analysis.unsafe_functions))
 
     def run(self) -> None:
         analysis = self.analysis
@@ -569,6 +581,13 @@ class _Resolver:
             except Exception:
                 table = None
         if table is None or not table.is_table_function:
+            if isinstance(call, exp.Anonymous) and safety.is_refused(name_text, self.dialect, self.allowed_functions):
+                # a refused built-in where a table belongs (EXTERNAL_QUERY(...)): the gate's finding,
+                # already made for the statement itself and made here for a body reached through a view
+                if name_text.lower() not in analysis.unsafe_functions:
+                    analysis.unsafe_functions = sorted(set(analysis.unsafe_functions) | {name_text.lower()})
+                analysis.table_functions.append(node.sql(dialect=self.dialect))
+                return
             if self.dialect != "bigquery" and (len(parts) == 1 and parts[0].lower() in _BUILTIN_TABLE_FUNCTIONS or not isinstance(call, exp.Anonymous)):
                 analysis.table_functions.append(node.sql(dialect=self.dialect))  # the engine's own table function, as before
                 return
@@ -597,6 +616,7 @@ class _Resolver:
         inner, view_columns = parsed[0].copy(), parsed[1]
         if bindings:
             inner = _substitute_variables(inner, bindings)
+        self._review_body(inner)
         self._resolve_tables(inner, table.schema, stack + (qualified,))
         if qualified not in analysis.views_used:
             analysis.views_used.append(qualified)

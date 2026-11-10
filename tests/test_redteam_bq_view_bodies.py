@@ -68,7 +68,7 @@ def test_view_body_unknown_udf_reaches_the_resolved_tree():
     assert "MY_UDF" in _resolved_sql("SELECT * FROM bad_udf").upper()
 
 
-# --- the gate must refuse a candidate that reads a view with a blocked body (xfail) ------------
+# --- the gate must refuse a candidate that reads a view with a blocked body ------------------
 BAD_VIEW_READS = [
     ("read_view_with_external_query", "SELECT * FROM bad_ext"),
     ("read_view_with_information_schema", "SELECT job_id, query FROM bad_info"),
@@ -79,9 +79,6 @@ BAD_VIEW_READS = [
 
 
 @pytest.mark.parametrize("label,sql", BAD_VIEW_READS, ids=[c[0] for c in BAD_VIEW_READS])
-@pytest.mark.xfail(strict=True, reason="HIGH: safety.review runs on the pre-expansion tree, so a view "
-                                       "body containing EXTERNAL_QUERY / INFORMATION_SCHEMA / an unknown "
-                                       "function is not refused when a candidate reads the view (B4)")
 def test_reading_a_view_with_a_blocked_body_is_not_sent(label, sql):
     assert not _sent(sql)
 
@@ -128,8 +125,6 @@ TVF_READS = [
 
 
 @pytest.mark.skipif(not _TVF_READY, reason="catalogue does not hold CREATE TABLE FUNCTION bodies yet (B4 pending)")
-@pytest.mark.xfail(strict=True, reason="HIGH: a TVF body containing a blocked construct must be refused "
-                                       "when a candidate calls it, including a view over the TVF")
 @pytest.mark.parametrize("label,sql", TVF_READS, ids=[c[0] for c in TVF_READS])
 def test_calling_a_tvf_with_a_blocked_body_is_not_sent(label, sql):
     cat = Catalog.from_ddl(TVF_DDL, dialect=DIALECT)

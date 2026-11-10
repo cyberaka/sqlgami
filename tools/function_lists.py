@@ -180,6 +180,72 @@ def postgres_lists(dsn: str) -> tuple[set[str], set[str]]:
 # ------------------------------------------------------------------------------- the check
 
 
+# ---------------------------------------------------------------------------------- BigQuery
+#
+# BigQuery has no catalogue of its built-ins to ask, so the list is the function reference
+# (cloud.google.com/bigquery/docs/reference/standard-sql/functions-all, read 2026-11-10), minus
+# everything that reaches outside the tables the statement names: federation (EXTERNAL_QUERY),
+# object tables and signed URLs (OBJ.*, EXTERNAL_OBJECT_TRANSFORM), models (ML.*, AI.*), the
+# caller's identity (SESSION_USER — a policy finding the host may allow), table history
+# (APPENDS, CHANGES — time travel, likewise), and raster/remote reads (ST_REGIONSTATS).
+# Namespaced built-ins (NET.*, HLL_COUNT.*, KLL_QUANTILES.*, SAFE.*) are allowed by namespace.
+BIGQUERY_ALLOWED = set(
+    """
+    any_value array_agg array_concat_agg avg bit_and bit_or bit_xor count countif grouping logical_and
+    logical_or max max_by min min_by string_agg sum corr covar_pop covar_samp stddev stddev_pop stddev_samp
+    var_pop var_samp variance approx_count_distinct approx_quantiles approx_top_count approx_top_sum
+    first_value last_value nth_value lead lag percentile_cont percentile_disc
+    rank dense_rank percent_rank cume_dist ntile row_number
+    array array_concat array_length array_to_string generate_array generate_date_array
+    generate_timestamp_array generate_range_array array_reverse array_first array_last array_slice array_zip
+    offset ordinal safe_offset safe_ordinal unnest
+    bit_count cast safe_cast parse_bignumeric parse_numeric
+    current_date date date_add date_sub date_diff date_trunc date_from_unix_date extract format_date last_day
+    parse_date unix_date date_bucket
+    current_datetime datetime datetime_add datetime_sub datetime_diff datetime_trunc format_datetime
+    parse_datetime datetime_bucket
+    current_time time time_add time_sub time_diff time_trunc format_time parse_time
+    current_timestamp timestamp timestamp_add timestamp_sub timestamp_diff timestamp_trunc format_timestamp
+    parse_timestamp timestamp_seconds timestamp_millis timestamp_micros unix_seconds unix_millis unix_micros
+    timestamp_bucket
+    make_interval justify_days justify_hours justify_interval
+    farm_fingerprint md5 sha1 sha256 sha512
+    json_extract json_extract_scalar json_extract_array json_extract_string_array json_query json_value
+    json_query_array json_value_array json_array json_array_append json_array_insert json_object json_remove
+    json_set json_strip_nulls json_keys json_type parse_json to_json to_json_string bool int64 float64 string
+    lax_bool lax_int64 lax_float64 lax_string
+    abs sign is_inf is_nan ieee_divide rand sqrt cbrt pow power exp ln log log10 greatest least div
+    safe_divide safe_multiply safe_negate safe_add safe_subtract mod round trunc ceil ceiling floor cos cosh
+    acos acosh sin sinh asin asinh tan tanh atan atanh atan2 cot coth csc csch sec sech range_bucket pi
+    pi_numeric pi_bignumeric euclidean_distance cosine_distance dot_product manhattan_distance l1_norm l2_norm
+    ascii byte_length char_length character_length chr code_points_to_bytes code_points_to_string collate
+    concat contains_substr edit_distance ends_with format from_base32 from_base64 from_hex initcap instr left
+    length lower lpad ltrim normalize normalize_and_casefold octet_length regexp_contains regexp_extract
+    regexp_extract_all regexp_instr regexp_replace regexp_substr repeat replace reverse right rpad rtrim
+    safe_convert_bytes_to_string soundex split starts_with strpos substr substring to_base32 to_base64
+    to_code_points to_hex translate trim unicode upper
+    range range_start range_end range_overlaps range_contains range_intersect range_sessionize
+    coalesce if ifnull nullif nullifzero zeroifnull error generate_uuid gap_fill
+    bag_of_words text_analyze tf_idf
+    st_geogpoint st_distance st_area st_contains st_intersects st_within st_dwithin st_geogfromtext st_astext
+    st_x st_y st_length st_buffer st_centroid st_union st_union_agg st_makeline st_makepolygon st_geohash
+    st_geogpointfromgeohash st_boundingbox st_covers st_coveredby st_disjoint st_equals st_touches st_simplify
+    st_snaptogrid st_npoints st_numpoints st_dimension st_isempty st_iscollection st_geogfromgeojson
+    st_asgeojson st_asbinary st_geogfromwkb st_perimeter st_maxdistance st_closestpoint st_clusterdbscan
+    st_convexhull st_difference st_intersection st_extent st_angle st_azimuth st_startpoint st_endpoint
+    st_pointn st_dump st_exteriorring st_interiorrings st_linelocatepoint st_lineinterpolatepoint
+    st_linesubstring st_hausdorffdistance st_hausdorffdwithin st_geogfrom st_bufferwithtolerance st_isring
+    st_isclosed st_centroid_agg
+    """.split()
+)
+BIGQUERY_REFUSED = {
+    "external_query", "external_object_transform", "appends", "changes", "session_user", "st_regionstats",
+}
+# Typed sqlglot nodes a BigQuery statement parses into that stand for a refused call.
+BIGQUERY_TAINTED = {"Predict", "MLForecast", "MLTranslate", "GenerateEmbedding", "FeaturesAtTime", "AIAgg",
+                    "AIClassify", "AISummarizeAgg", "SessionUser"}
+
+
 def typed_hits(names: set[str], dialect: str) -> dict[str, set[str]]:
     """Which refused names sqlglot turns into a typed node (so the name is lost): class -> names."""
     hits: dict[str, set[str]] = {}
@@ -232,6 +298,7 @@ def main() -> int:
             print(f"{dialect}: refused {sorted(names)} parse as {cls}" + (f"  (also from allowed {sorted(shared)[:6]})" if shared else ""))
             if cls not in TYPED_REFUSED:
                 tainted.setdefault(dialect, set()).add(cls)
+    tainted["bigquery"] = set(BIGQUERY_TAINTED)
 
     conn = sqlite3.connect(":memory:")
     pg_version = "?"
@@ -246,7 +313,7 @@ def main() -> int:
         '"""Which SQL functions a statement may call and still be sent to a database.\n\n'
         "Generated by tools/function_lists.py; do not edit by hand.\n"
         f"Built from SQLite {conn.execute('select sqlite_version()').fetchone()[0]}, DuckDB {duckdb.__version__}, "
-        f"Postgres {pg_version} and sqlglot {sqlglot.__version__}.\n"
+        f"Postgres {pg_version} and sqlglot {sqlglot.__version__}; BigQuery from its function reference (2026-11-10).\n"
         '"""\n\nfrom __future__ import annotations\n\n'
     )
     parts = [
@@ -261,10 +328,12 @@ def main() -> int:
         block("DUCKDB_ALLOWED", duck_ok),
         block("DUCKDB_TABLE_FUNCTIONS", duck_table),
         block("POSTGRES_ALLOWED", pg_ok),
+        block("BIGQUERY_ALLOWED", BIGQUERY_ALLOWED),
         "\n# Built-in functions that are known and refused, by engine.\n",
         block("SQLITE_REFUSED", sqlite_no),
         block("DUCKDB_REFUSED", duck_no),
         block("POSTGRES_REFUSED", pg_no),
+        block("BIGQUERY_REFUSED", BIGQUERY_REFUSED),
         "\n# sqlglot nodes that, on one engine, stand for a refused function.\n",
         "TAINTED_TYPED: dict[str, frozenset[str]] = {\n"
         + "".join(f"    {d!r}: frozenset({sorted(c)!r}),\n" for d, c in sorted(tainted.items()))
@@ -272,7 +341,7 @@ def main() -> int:
     ]
     OUT.write_text("".join(parts), encoding="utf-8")
     print(f"sqlite {len(sqlite_ok)} allowed, {len(sqlite_no)} refused; duckdb {len(duck_ok)} / {len(duck_no)}; "
-          f"postgres {len(pg_ok)} / {len(pg_no)}; typed {len(typed - TYPED_REFUSED)}")
+          f"postgres {len(pg_ok)} / {len(pg_no)}; bigquery {len(BIGQUERY_ALLOWED)} / {len(BIGQUERY_REFUSED)}; typed {len(typed - TYPED_REFUSED)}")
     print(OUT)
     return 0
 

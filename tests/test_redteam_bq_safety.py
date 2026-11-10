@@ -20,8 +20,9 @@ INFORMATION_SCHEMA disclosure is real and not theoretical.
 Legend:
 * CONTAINED  — dangerous, correctly not sent (by the dialect-independent *kind* gate). Guards.
 * SAFE       — legitimate reads that must still be sent (no over-blocking). Guards.
-* BYPASS_*   — confirmed holes: dangerous, yet sent. Marked ``xfail(strict=True)`` so the suite
-               is green now and turns red the moment the builder closes the hole (remove marker).
+* BYPASS_*   — holes the checker found, closed since (BigQuery function allow-list, INFORMATION_SCHEMA
+               on folded and region-qualified names, ML/AI/OBJ namespaces, EXTERNAL_QUERY everywhere,
+               wildcard/time-travel/SESSION_USER policy findings, unknown TVF/UDF unlisted); plain tests.
 """
 
 from __future__ import annotations
@@ -130,8 +131,6 @@ BYPASS_FEDERATION = [
 
 
 @pytest.mark.parametrize("label,sql", BYPASS_FEDERATION, ids=[c[0] for c in BYPASS_FEDERATION])
-@pytest.mark.xfail(strict=True, reason="HIGH: EXTERNAL_QUERY (external federation) is sent for bigquery; "
-                                       "no allow-list and not on REFUSED_EVERYWHERE, unlike postgres_query/dblink")
 def test_federation_function_is_not_sent(label, sql):
     assert not _sent(sql)
 
@@ -154,8 +153,6 @@ BYPASS_CATALOG = [
 
 
 @pytest.mark.parametrize("label,sql", BYPASS_CATALOG, ids=[c[0] for c in BYPASS_CATALOG])
-@pytest.mark.xfail(strict=True, reason="HIGH: INFORMATION_SCHEMA is sent for bigquery; sqlglot folds "
-                                       "INFORMATION_SCHEMA.X into one identifier so review_tables never matches")
 def test_information_schema_is_not_sent(label, sql):
     assert not _sent(sql)
 
@@ -171,8 +168,6 @@ BYPASS_ML = [
 
 
 @pytest.mark.parametrize("label,sql", BYPASS_ML, ids=[c[0] for c in BYPASS_ML])
-@pytest.mark.xfail(strict=True, reason="MEDIUM-HIGH: ML.PREDICT is sent for bigquery; typed Predict node, "
-                                       "no bigquery allow-list to refuse it")
 def test_ml_table_function_is_not_sent(label, sql):
     assert not _sent(sql)
 
@@ -192,8 +187,6 @@ BYPASS_SCOPE = [
 
 
 @pytest.mark.parametrize("label,sql", BYPASS_SCOPE, ids=[c[0] for c in BYPASS_SCOPE])
-@pytest.mark.xfail(strict=True, reason="MEDIUM/LOW: wildcard _TABLE_SUFFIX / FOR SYSTEM_TIME AS OF / "
-                                       "SESSION_USER are sent for bigquery with no scope bound")
 def test_scope_widening_construct_is_not_sent(label, sql):
     assert not _sent(sql)
 
@@ -216,8 +209,6 @@ BYPASS_UDF = [
 
 
 @pytest.mark.parametrize("label,sql", BYPASS_UDF, ids=[c[0] for c in BYPASS_UDF])
-@pytest.mark.xfail(strict=True, reason="HIGH: unknown bigquery TVF/UDF is sent; no bigquery allow-list "
-                                       "so review_functions never marks it unlisted (unlike other dialects)")
 def test_unknown_tvf_or_udf_is_not_sent(label, sql):
     assert not _sent(sql)
 
