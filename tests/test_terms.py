@@ -605,3 +605,25 @@ def test_the_access_chain_is_recognised_in_its_equivalent_spellings():
     assert "required_predicate" not in codes(head + ", UNNEST([" + ", ".join(f"STRUCT(s.{c} AS node_id)" for c in levels) + "]) AS x WHERE x.node_id = {manager_id}")
     assert "required_predicate" not in codes(head + ", UNNEST([" + ", ".join(f"s.{c}" for c in levels) + "]) AS lv WHERE lv = {manager_id}")
     assert "required_predicate" in codes(head + ", UNNEST([" + ", ".join(f"STRUCT(s.{c} AS node_id)" for c in levels[:6]) + "]) AS x WHERE x.node_id = {manager_id}")
+
+
+def test_an_access_chain_scoped_to_another_manager_than_the_callers_is_high():
+    """The silent wrong argument: the chain is complete but compares with a hard-coded 12028 (or a
+    table function is called with the wrong value or the wrong position) while the caller's
+    manager_id is 12003. The placeholder, or the caller's own value, is fine."""
+    from sqlgami.catalog import RequiredPredicate
+
+    levels = [f"lvl_{i}_id" for i in range(2, 8)] + [f"lvl_{i}_id_fn" for i in range(2, 8)]
+    rule = RequiredPredicate.coerce({"name": "scope", "tables": ["hr_emp_period_snapshot"], "match": "or_chain", "columns": levels, "severity": "high", "description": "scoped to a manager"})
+    ddl = HR_DDL + "\nCREATE TABLE FUNCTION org_roster(mgr INTEGER, since DATE) AS SELECT s.assoc_id, s.status_cd FROM hr_emp_period_snapshot s WHERE s.period_end_dt >= since AND (" + " OR ".join(f"s.{c} = mgr" for c in levels) + ");\n"
+    def codes(sql, params):
+        return {f.code for f in Scorer("duckdb", catalog=ddl, required_predicates=[rule]).score(sql, params=params).findings}
+    head = "SELECT COUNT(DISTINCT s.assoc_id) FROM hr_emp_period_snapshot s WHERE "
+    chain = lambda v: " OR ".join(f"s.{c} = {v}" for c in levels)
+    assert "access_filter_value" not in codes(head + chain("{manager_id}"), {"manager_id": 12003})
+    assert "access_filter_value" not in codes(head + chain("12003"), {"manager_id": 12003})
+    assert "access_filter_value" in codes(head + chain("12028"), {"manager_id": 12003})
+    assert "access_filter_value" not in codes(head + chain("12028"), None)  # nothing to compare with
+    # through a table function: the argument is the chain's value
+    assert "access_filter_value" not in codes("SELECT COUNT(*) FROM org_roster({manager_id}, DATE '2024-01-01')", {"manager_id": 12003})
+    assert "access_filter_value" in codes("SELECT COUNT(*) FROM org_roster(12028, DATE '2024-01-01')", {"manager_id": 12003})

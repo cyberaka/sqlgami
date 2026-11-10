@@ -110,9 +110,16 @@ def _rewrite(sql: str, project: str, suite: Suite, seed: Seed) -> str:
 
 
 def _rewrite_script(sql: str, project: str, suite: Suite, seed: Seed) -> str:
-    """A DECLARE/SET script: rewrite every statement, keep the script shape."""
+    """A DECLARE/SET script: rewrite every statement, keep the script shape. A script sqlglot
+    cannot parse (a syntax error in a candidate) is rewritten textually so the service judges it."""
+    import re
+
     parts = []
-    for statement in sqlglot.parse(sql, read="bigquery"):
+    try:
+        statements = sqlglot.parse(sql, read="bigquery")
+    except sqlglot.errors.ParseError:
+        return re.sub(r"`([\w-]+)\.(\w+)\.(\w+)`", lambda m: f"`{project}.{_dataset(suite, seed, m.group(2).lower())}.{m.group(3)}`", sql)
+    for statement in statements:
         if statement is None:
             continue
         for table in statement.find_all(exp.Table):
@@ -169,6 +176,10 @@ def _store(value: Any) -> Any:
         return {"$d": value.isoformat()}
     if isinstance(value, (bytes, bytearray)):
         return {"$b": bytes(value).hex()}
+    if isinstance(value, (list, tuple)):  # an ARRAY, possibly of STRUCTs holding dates
+        return [_store(v) for v in value]
+    if isinstance(value, dict):  # a STRUCT
+        return {"$s": {k: _store(v) for k, v in value.items()}}
     return value
 
 
@@ -180,6 +191,10 @@ def _revive(value: Any) -> Any:
             return dt.date.fromisoformat(value["$d"])
         if "$b" in value:
             return bytes.fromhex(value["$b"])
+        if "$s" in value:
+            return {k: _revive(v) for k, v in value["$s"].items()}
+    if isinstance(value, list):
+        return [_revive(v) for v in value]
     return value
 
 
@@ -196,6 +211,10 @@ def _plain(value: Any) -> Any:
         return float(value)
     if isinstance(value, dt.datetime) and value.tzinfo is not None:
         return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    if isinstance(value, (list, tuple)):
+        return tuple(_plain(v) for v in value)
+    if isinstance(value, dict):
+        return tuple(sorted((k, _plain(v)) for k, v in value.items()))  # a STRUCT, comparable by its fields
     return value
 
 

@@ -484,6 +484,10 @@ class SelectModel:
         values: list[exp.Expression] = []
         for branch in flatten_or(expr):
             part = self._column_choices(branch)
+            if part is None and isinstance(strip(branch), exp.And):
+                # (x.lvl = 2 AND eps.lvl_2_id = v) OR (x.lvl = 3 AND eps.lvl_3_id = v): the chain
+                # comparison sits inside each branch's conjunction
+                part = next((c for c in (self._column_choices(p) for p in flatten_and(strip(branch))) if c is not None), None)
             if part is None:
                 refs = []
                 break

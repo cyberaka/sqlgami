@@ -411,6 +411,10 @@ CREATE TABLE FUNCTION `proj-x.shop.region_orders`(which STRING, since DATE) AS
   WHERE c.region = which AND o.created_at >= since;
 CREATE TABLE FUNCTION `proj-x.shop.tagged`(tags ARRAY<STRING>) AS
   SELECT c.id, t FROM `proj-x.shop.customers` AS c, UNNEST(tags) AS t;
+CREATE TABLE FUNCTION `proj-x.shop.big_region_orders`(which STRING, since DATE, floor NUMERIC) AS
+  SELECT r.id, r.customer_id, r.total, r.region FROM `proj-x.shop.region_orders`(which, since) AS r WHERE r.total >= floor;
+CREATE VIEW `proj-x.shop_reports.north_2024` AS
+  SELECT customer_id, total FROM `proj-x.shop.region_orders`('north', DATE '2024-01-01');
 """
 
 
@@ -426,6 +430,8 @@ def tvf_bundle(tmp_path_factory):
         "id,question,params,correct_sql,expected_result,dataset\n"
         'by_region,Paid order total per customer in the north since 2024,,"SELECT customer_id, SUM(total) AS spend FROM `proj-x.shop.region_orders`(\'north\', DATE \'2024-01-01\') GROUP BY customer_id",,\n'
         'recent,Recent paid order count,,"SELECT COUNT(*) AS n FROM `proj-x.shop_reports.recent_paid`",,\n'
+        'big,Count of big north orders since 2024 over 50,,"SELECT COUNT(*) AS n FROM `proj-x.shop.big_region_orders`(\'north\', DATE \'2024-01-01\', 50)",,\n'
+        'north_view,Order total per customer in the north 2024 view,,"SELECT customer_id, SUM(total) AS spend FROM `proj-x.shop_reports.north_2024` GROUP BY customer_id",,\n'
     )
     (tmp / "sqlgami.yaml").write_text(
         "dialect: bigquery\nschema: schema.sql\nterms: terms\n"
@@ -449,7 +455,7 @@ def test_table_functions_and_nested_views_are_read_expanded_gated_and_run_on_fix
     fn = catalog.resolve("region_orders", "proj-x.shop")
     assert fn is not None and fn.is_table_function and fn.parameters == (("which", "STRING"), ("since", "DATE"))
     manifest = json.loads((tvf_bundle / "manifest.json").read_text())
-    assert manifest["references"] == 2 and manifest["rejected"] == 0, manifest
+    assert manifest["references"] == 4 and manifest["rejected"] == 0, manifest
     from sqlgami.fixtures import Fixture
 
     ddl = Fixture.read(tvf_bundle / "fixtures" / "clean-s4").ddl
@@ -469,6 +475,19 @@ def test_table_functions_and_nested_views_are_read_expanded_gated_and_run_on_fix
         assert arity.has("unknown_table") and "takes 2 argument(s)" in next(f.message for f in arity.findings if f.code == "unknown_table")
         nested = scorer.explain("SELECT COUNT(*) AS n FROM `proj-x.shop_reports.recent_paid`", "Recent paid order count")
         assert set(nested.signals["views_expanded"]) == {"proj-x.shop_reports.recent_paid", "proj-x.shop.paid_orders"} and nested.signals["fixtures"]["verdict"] == "match"
+        # a TVF calling a TVF: the call runs on the fixtures through both bodies; a wrong argument
+        # at either level is a mismatch
+        big = scorer.explain("SELECT COUNT(*) AS n FROM `proj-x.shop.big_region_orders`('north', DATE '2024-01-01', 50)", "Count of big north orders since 2024 over 50")
+        assert set(big.signals["views_expanded"]) == {"proj-x.shop.big_region_orders", "proj-x.shop.region_orders"} and big.signals["fixtures"]["verdict"] == "match", big.summary()
+        wrong_floor = scorer.explain("SELECT COUNT(*) AS n FROM `proj-x.shop.big_region_orders`('north', DATE '2024-01-01', 500)", "Count of big north orders since 2024 over 50")
+        assert wrong_floor.signals["fixtures"]["verdict"] == "mismatch"
+        wrong_region = scorer.explain("SELECT COUNT(*) AS n FROM `proj-x.shop.big_region_orders`('south', DATE '2024-01-01', 50)", "Count of big north orders since 2024 over 50")
+        assert wrong_region.signals["fixtures"]["verdict"] == "mismatch"
+        swapped = scorer.explain("SELECT COUNT(*) AS n FROM `proj-x.shop.big_region_orders`(DATE '2024-01-01', 'north', 50)", "Count of big north orders since 2024 over 50")
+        assert swapped.signals["fixtures"]["verdict"] in ("mismatch", "unverified") and swapped.verdict.value != "likely_right", swapped.summary()
+        # a view over a TVF
+        view = scorer.explain("SELECT customer_id, SUM(total) AS spend FROM `proj-x.shop_reports.north_2024` GROUP BY customer_id", "Order total per customer in the north 2024 view")
+        assert set(view.signals["views_expanded"]) == {"proj-x.shop_reports.north_2024", "proj-x.shop.region_orders"} and view.signals["fixtures"]["verdict"] == "match", view.summary()
         arrays = scorer.explain("SELECT id, t FROM `proj-x.shop.tagged`(['vip', 'new']) ORDER BY id, t", "customers with tags")
         assert arrays.signals["views_expanded"] == ["proj-x.shop.tagged"] and arrays.stage("fixtures").status in (StageStatus.NOT_RUN, StageStatus.SKIPPED, StageStatus.PASSED)
 

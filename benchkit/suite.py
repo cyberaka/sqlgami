@@ -54,7 +54,11 @@ class Question:
     gold_alternatives: list[dict[str, Any]] = field(default_factory=list)
 
     def gold(self, engine: str) -> str | None:
-        return (self.gold_sql or {}).get(engine)
+        """The engine's gold; a question whose gold exists only as a script (BigQuery
+        ``DECLARE …; SELECT``) answers with the script, which labels, compiles and scores as
+        its final query."""
+        golds = self.gold_sql or {}
+        return golds.get(engine) or golds.get(f"{engine}_script")
 
     def accepted(self, engine: str) -> list[tuple[str, str]]:
         """Every accepted answer for an engine as ``(label, sql)``; the first is the gold itself."""

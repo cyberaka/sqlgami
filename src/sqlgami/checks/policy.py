@@ -18,7 +18,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import Scope
 
 from ..catalog import Column, RequiredPredicate, Table
-from ..model import NO, ColRef, SelectModel, strip, walk_own, unalias
+from ..model import NO, ColRef, SelectModel, flatten_or, strip, walk_own, unalias
 from ..report import Finding, Severity
 from .base import CheckContext, check
 
@@ -546,12 +546,15 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
     catalog = ctx.catalog
     # table -> for each SELECT, the rule columns its OR chains cover
     chains: dict[str, list[tuple[set[str], exp.Expression]]] = {}
+    # table -> every OR group's (its columns, its node, the one value it compares with)
+    group_values: dict[str, list[tuple[set[str], exp.Expression, exp.Expression | None]]] = {}
     for model in ctx.cache.models():
         per_table: dict[str, set[str]] = {}
         nodes: dict[str, exp.Expression] = {}
         for refs, same_value, node in model.or_groups:
             if not same_value:
                 continue
+            own: dict[str, set[str]] = {}
             for ref in refs:
                 # A branch on a column equated to another through a join (ON eps.lvl_2_id = h2.node_id
                 # ... WHERE h2.node_id = 7 OR ...) is a branch on that column too: rows where the
@@ -560,7 +563,10 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
                     base = _base_of(model, member)
                     if base is not None:
                         per_table.setdefault(base[0].qualified_name, set()).add(catalog.column_key(base[1]))
+                        own.setdefault(base[0].qualified_name, set()).add(catalog.column_key(base[1]))
                         nodes.setdefault(base[0].qualified_name, node)
+            for name, columns in own.items():
+                group_values.setdefault(name, []).append((columns, node, _chain_value(model, node)))
         for name, columns in per_table.items():
             chains.setdefault(name, []).append((columns, nodes[name]))
         # UNNEST([STRUCT(eps.lvl_2_id AS node_id), ...]) x WHERE x.node_id = 12003 (or UNNEST([eps.lvl_2_id,
@@ -574,6 +580,7 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
                     pinned.setdefault(base[0].qualified_name, set()).add(catalog.column_key(base[1]))
             for name, columns in pinned.items():
                 chains.setdefault(name, []).append((columns, node))
+                group_values.setdefault(name, []).append((columns, node, _chain_value(model, node)))
     for table in ctx.analysis.tables.values():
         if not rule.applies_to(table):
             continue
@@ -587,6 +594,7 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
             continue
         satisfied = False
         widened: tuple[set[str], exp.Expression] | None = None
+        wrong_value: tuple[exp.Expression, str, Any, exp.Expression] | None = None
         best: set[str] = set()
         required = groups[0]
         for columns, node in chains.get(table.qualified_name, []):
@@ -597,10 +605,32 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
                     extra = columns - set().union(*groups)
                     if extra and widened is None:
                         widened = (extra, node)
+                    if wrong_value is None:
+                        # the value of the OR group that covers this policy group (not of another
+                        # OR in the same SELECT, such as a flag = 1 OR other_flag = 1)
+                        for own_columns, own_node, value in group_values.get(table.qualified_name, []):
+                            if own_columns & group:
+                                wrong_value = _value_against_params(value, ctx.params, own_node)
+                                break
                 # Report against the group the chain comes closest to.
                 if len(hit) > len(best) or (len(hit) == len(best) and len(group) < len(required)):
                     best, required = hit, group
         if satisfied:
+            if wrong_value is not None:
+                value, param, given, node = wrong_value
+                yield ctx.finding(
+                    "access_filter_value",
+                    Severity.HIGH,
+                    f"The access filter on {table.name} required by policy \"{what}\" is present, but it compares the "
+                    f"columns with {value.sql()} while the caller's {param} is {given!r}: the query is scoped to another "
+                    "manager (a hard-coded id, or a table function called with the wrong argument), so it returns rows the caller may not see.",
+                    node,
+                    suggestion=f"Compare with the template parameter {{{param}}} (pass it to the table function in the parameter's position).",
+                    rule=rule.name,
+                    table=table.qualified_name,
+                    value=value.sql(),
+                    parameter=param,
+                )
             if widened is not None:
                 extra, node = widened
                 yield ctx.finding(
@@ -644,6 +674,40 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
             )
 
 
+def _chain_value(model: SelectModel, node: exp.Expression) -> exp.Expression | None:
+    """The one value an OR chain (or a pivot's pin) compares its columns with."""
+    for branch in flatten_or(node):
+        choice = model._column_choices(branch)
+        if choice is not None:
+            return choice[1]
+        branch = strip(branch)
+        if isinstance(branch, exp.EQ):
+            for side in (branch.this, branch.expression):
+                if isinstance(strip(side), (exp.Literal, exp.Placeholder, exp.Parameter, exp.Cast)):
+                    return strip(side)
+    return None
+
+
+def _value_against_params(value: exp.Expression | None, params: dict[str, Any] | None, node: exp.Expression) -> tuple[exp.Expression, str, Any, exp.Expression] | None:
+    """A chain compared with a literal while the caller passed exactly one id-like parameter of
+    another value: ``(literal, parameter, its value, the chain)``. A placeholder, a parameter, or
+    the parameter's own value (the host filled the template) is fine."""
+    if value is None or not params:
+        return None
+    value = strip(value)
+    while isinstance(value, exp.Cast):
+        value = strip(value.this)
+    if not isinstance(value, exp.Literal):
+        return None
+    ids = {k: v for k, v in params.items() if str(k).lower().endswith("_id") and isinstance(v, (int, str)) and not isinstance(v, bool)}
+    if len(ids) != 1:
+        return None
+    (param, given), = ids.items()
+    if str(value.this).strip() == str(given).strip():
+        return None
+    return value, param, given, node
+
+
 def _unnest_pivots(model: SelectModel) -> list[tuple[str, list[tuple[str, str]], exp.Expression]]:
     """``(alias, [column refs exploded], the pinning condition)`` for every UNNEST source over an
     array of this SELECT's columns (plain, or as one field of STRUCTs) whose exploded value the
@@ -656,16 +720,26 @@ def _unnest_pivots(model: SelectModel) -> list[tuple[str, list[tuple[str, str]],
         if not isinstance(node, exp.Unnest) or len(node.expressions) != 1 or not isinstance(node.expressions[0], exp.Array):
             continue
         fields: dict[str, list[tuple[str, str]]] = {}  # exploded field name ("" for a plain value) -> column refs
+        positional: list[list[tuple[str, str] | None]] = []  # per struct, the column at each position
+        names: list[str] = []  # the first struct's field names: BigQuery types the array by position
         for element in node.expressions[0].expressions:
             element = element.this if isinstance(element, exp.Paren) else element
             if isinstance(element, exp.Struct):
-                for item in element.expressions:
-                    column = item.expression if isinstance(item, exp.PropertyEQ) else item.this if isinstance(item, exp.Alias) else None
-                    field = item.this.name if isinstance(item, exp.PropertyEQ) else item.alias if isinstance(item, exp.Alias) else None
-                    if isinstance(column, exp.Column) and column.table in model.sources and field:
-                        fields.setdefault(field.lower(), []).append((column.table, column.name))
+                row: list[tuple[str, str] | None] = []
+                for index, item in enumerate(element.expressions):
+                    column = item.expression if isinstance(item, exp.PropertyEQ) else item.this if isinstance(item, exp.Alias) else item
+                    field = item.this.name if isinstance(item, exp.PropertyEQ) else item.alias if isinstance(item, exp.Alias) else (item.name if isinstance(item, exp.Column) else "")
+                    ref = (column.table, column.name) if isinstance(column, exp.Column) and column.table in model.sources else None
+                    row.append(ref)
+                    if not positional and field:
+                        names.append(field.lower())
+                positional.append(row)
             elif isinstance(element, exp.Column) and element.table in model.sources:
                 fields.setdefault("", []).append((element.table, element.name))
+        for index, name in enumerate(names):
+            refs = [row[index] for row in positional if index < len(row) and row[index] is not None]
+            if refs and len(refs) == len(positional):
+                fields[name] = refs
         if not fields:
             continue
         for conjunct in model.conjuncts:

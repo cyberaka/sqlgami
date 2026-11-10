@@ -56,12 +56,10 @@ def compile_suite(
             if value not in values:
                 values.append(value)
     rules["params"] = params
-    # A question whose gold exists only as a script (DECLARE ... ; SELECT) is a reference too: the
-    # fixture stage binds the script's variables before translating it.
     references = [
-        {"key": q.id, "question": q.question, "sql": q.gold(engine) or q.gold(f"{engine}_script"), "params": q.param_values() or {}}
+        {"key": q.id, "question": q.question, "sql": q.gold(engine), "params": q.param_values() or {}}
         for q in suite.questions
-        if q.gold(engine) or q.gold(f"{engine}_script")
+        if q.gold(engine)  # a script-only gold answers as the script (Question.gold)
     ]
     if references_file is not None:
         # Host-registered references (templated golds) replace the suite's gold of the same id.
