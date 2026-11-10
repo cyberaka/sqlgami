@@ -190,6 +190,17 @@ def compile_bundle(
             (out / "terms").mkdir()
             shutil.copy(terms_path, out / "terms" / terms_path.name)
 
+    # The host's names for the fixture tables: what it declared under tables:, plus every
+    # three-part name the catalogue itself declares (```proj.ds.t``` is ds.t in the fixtures).
+    from .fixtures import logical_name
+
+    table_map: dict[str, str] = {}
+    for qualified in catalog.table_names():
+        if qualified.count(".") >= 2:
+            table_map[qualified.strip("`").lower()] = logical_name(qualified)
+    table_map.update({str(k).strip("`").lower(): str(v) for k, v in (config.get("tables") or {}).items()})
+    config = {**config, "tables": table_map}
+
     rules = FixtureRules.from_dict(config.get("fixtures") or {})
     fixtures = list(fixtures) if fixtures is not None else build(catalog, rules)
     for fixture in fixtures:

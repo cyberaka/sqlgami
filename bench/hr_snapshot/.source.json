@@ -3,13 +3,13 @@
   {
    "source": "/Users/cyberaka/shared/sqlgami-bench/hr_snapshot",
    "files": {
-    "suite.yaml": "5fc0cf844db81b360e5b8b4e0203ae5d",
-    "glossary.yaml": "2563b87dd0b9429c47c575e8861c7f8a",
+    "suite.yaml": "c1935bec283f4beee8ea7a95ecae4c2b",
+    "glossary.yaml": "b36c48697f05237cefdd7b01729e1fa6",
     "generate.py": "a5e95b5ccf763b9908b437e28d24a9dd",
     "terms/Examples.csv": "1fce79f4154c83d50d419733ad74eb38",
     "terms/KPIs.csv": "05645c9ea0b9540e07512b420d0ca6c1",
     "terms/Parameters.csv": "fe45a23afa3557cdd9f8c675bd54254c",
-    "terms/Terms.csv": "92eacbf869d3459bf199db9a85688298"
+    "terms/Terms.csv": "9a5bc65528ef7729807e4929fd12b9d9"
    }
   }
  ]

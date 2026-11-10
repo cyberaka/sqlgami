@@ -39,6 +39,8 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
+from sqlglot import exp
+
 from . import types as T
 from .catalog import Catalog, Table
 from .errors import ConfigurationError
@@ -262,13 +264,22 @@ def build_one(catalog: Catalog, rules: FixtureRules, profile: str) -> Fixture:
     return Fixture(name, profile, rules.seed, data, ddl, types)
 
 
+def logical_name(qualified: str) -> str:
+    """The fixture's name for a catalogue table: the logical ``schema.table``, lower-cased, with a
+    BigQuery project stripped from a three-part name (```acme-prod.hr.snapshot``` is the same
+    table as ``hr.snapshot`` in every other dialect file, and digests the same)."""
+    name = qualified.strip("`").lower()
+    parts = name.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 3 else name
+
+
 def _tables(catalog: Catalog) -> dict[str, Table]:
     found: dict[str, Table] = {}
     for qualified in catalog.table_names():
         schema, _, name = qualified.rpartition(".")
         table = catalog.resolve(name, schema or None, quoted=True) or catalog.resolve(name, schema or None)
         if table is not None and not table.is_view:
-            found[qualified.lower()] = table
+            found[logical_name(qualified)] = table
     return found
 
 
@@ -278,7 +289,7 @@ def _views(catalog: Catalog) -> dict[str, Table]:
         schema, _, name = qualified.rpartition(".")
         table = catalog.resolve(name, schema or None, quoted=True) or catalog.resolve(name, schema or None)
         if table is not None and table.is_view and table.definition:
-            found[qualified.lower()] = table
+            found[logical_name(qualified)] = table
     return found
 
 
@@ -296,8 +307,17 @@ def _view_ddl(catalog: Catalog) -> list[str]:
         try:
             import sqlglot
 
-            # Rendered through the parser for every dialect, so the same view reads the same.
-            query = sqlglot.parse_one(query, read=catalog.dialect).sql(dialect="duckdb")
+            # Rendered through the parser for every dialect, so the same view reads the same;
+            # a three-part name inside the view is the logical table.
+            tree = sqlglot.parse_one(query, read=catalog.dialect)
+            for node in tree.find_all(sqlglot.exp.Table):
+                if node.catalog and node.db:
+                    node.set("catalog", None)
+                for part in (node.args.get("db"), node.args.get("this")):
+                    if isinstance(part, sqlglot.exp.Identifier):
+                        part.set("quoted", False)  # a backticked or double-quoted name is the same table
+                        part.set("this", part.name.lower())
+            query = tree.sql(dialect="duckdb")
         except Exception:
             continue
         column_list = f" ({', '.join(columns)})" if columns else ""
@@ -513,8 +533,33 @@ def _date(value: Any) -> dt.date:
     return dt.date.fromisoformat(str(value))
 
 
+_CANONICAL_TYPES = {
+    # one DDL spelling per family, so the same logical schema digests the same from every dialect file
+    "BIGINT": "INT", "INT": "INT", "INTEGER": "INT", "SMALLINT": "INT", "TINYINT": "INT", "MEDIUMINT": "INT", "INT128": "INT", "UBIGINT": "INT", "UINT": "INT",
+    "VARCHAR": "VARCHAR", "TEXT": "VARCHAR", "CHAR": "VARCHAR", "NCHAR": "VARCHAR", "NVARCHAR": "VARCHAR",
+    "DOUBLE": "DOUBLE", "FLOAT": "DOUBLE", "REAL": "DOUBLE",
+    "BOOLEAN": "BOOLEAN",
+}
+
+
+def _fixture_type(declared: str, dialect: str) -> str:
+    """The DuckDB type the fixture declares for a column: sqlglot's reading of the declared
+    type in the catalogue's own dialect (BigQuery's TIMESTAMP is an instant, TIMESTAMPTZ), with
+    integer, text, floating and boolean families each spelled one way."""
+    from .types import parse_type, sqlglot_type_name
+
+    data_type = parse_type(declared, dialect) or parse_type(declared, "duckdb")
+    if data_type is not None and isinstance(data_type.this, exp.DataType.Type):
+        canonical = _CANONICAL_TYPES.get(data_type.this.value)
+        if canonical:
+            return canonical
+    if data_type is not None:
+        return data_type.sql(dialect="duckdb")
+    name = sqlglot_type_name(declared, "duckdb")
+    return "VARCHAR" if name == "UNKNOWN" else name
+
+
 def _ddl(catalog: Catalog, tables: Sequence[Table], qualified: Sequence[str]) -> tuple[str, dict[str, list[str]]]:
-    from .types import sqlglot_type_name
 
     statements: list[str] = []
     types: dict[str, list[str]] = {}
@@ -525,9 +570,7 @@ def _ddl(catalog: Catalog, tables: Sequence[Table], qualified: Sequence[str]) ->
         parts = []
         declared: list[str] = []
         for column in table.columns:
-            type_name = sqlglot_type_name(column.type, "duckdb")
-            if type_name == "UNKNOWN":
-                type_name = "VARCHAR"
+            type_name = _fixture_type(column.type, catalog.dialect)
             parts.append(f"{column.name.lower()} {type_name}")
             declared.append(type_name)
         statements.append(f"CREATE TABLE {name} ({', '.join(parts)})")

@@ -95,8 +95,8 @@ PINNED_RULES = {
     "critical_rows": {"customers": [{"id": 99, "name": "Zed", "tenant_id": 1}]},
 }
 PINNED_DIGESTS = {
-    "clean": "11268673e296dd4f719e21122778fde079fee0c6fc47146d4c64a0e631844b6c",
-    "nulls": "5551a9d32baed3464c6b989a9d6a62d4a3c86d83900cdbe46bc1826e5e4fa0d2",
+    "clean": "d032b057450215d5de0815cb1d4de90487b0b6b4052900760fb0635173f47798",
+    "nulls": "10939405dd79da5954f2bba11e98eed3705aa6dd3e5a9275cd2c897bcdb6254a",
 }
 
 
@@ -122,8 +122,18 @@ def test_fixtures_depend_on_logical_schema_only_not_the_dialect_spelling():
     CREATE TABLE shop.orders_p1 PARTITION OF shop.orders FOR VALUES FROM (1) TO (100);
     CREATE VIEW shop.paid_v AS SELECT id FROM shop.orders WHERE status = 'paid';
     """
+    bq = """
+    CREATE TABLE `acme-prod.shop.customers` (id INT64 NOT NULL, name STRING NOT NULL, created_at TIMESTAMP, PRIMARY KEY (id) NOT ENFORCED);
+    CREATE TABLE `acme-prod.shop.orders` (id INT64 NOT NULL, customer_id INT64, total NUMERIC(10,2), status STRING,
+      PRIMARY KEY (id) NOT ENFORCED, FOREIGN KEY (customer_id) REFERENCES `acme-prod.shop.customers` (id) NOT ENFORCED)
+      PARTITION BY RANGE_BUCKET(id, GENERATE_ARRAY(0, 1000, 100)) CLUSTER BY customer_id;
+    CREATE VIEW `acme-prod.shop.paid_v` AS SELECT id FROM `acme-prod.shop.orders` WHERE status = 'paid';
+    """
     rules = {"seed": 3, "profiles": ["clean"], "rows": {"shop.customers": 4, "shop.orders": 6}}
     a = fixtures.build(Catalog.from_ddl(duck, "duckdb"), rules)[0]
     b = fixtures.build(Catalog.from_ddl(pg, "postgres"), rules)[0]
+    c = fixtures.build(Catalog.from_ddl(bq, "bigquery"), rules)[0]
     assert a.digest() == b.digest(), (a.ddl, b.ddl)
-    assert set(a.tables) == {"shop.customers", "shop.orders"}
+    assert a.digest() == c.digest(), (a.ddl, c.ddl)  # a three-part BigQuery name is the logical schema.table
+    assert a.views_digest() == c.views_digest(), (a.ddl, c.ddl)
+    assert set(a.tables) == set(c.tables) == {"shop.customers", "shop.orders"}

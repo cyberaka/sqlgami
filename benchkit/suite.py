@@ -335,19 +335,25 @@ def load_suite(name_or_path: str | Path) -> Suite:
     ):
         for row in _read_jsonl(path / filename):
             try:
-                target.append(
-                    Variant(
-                        id=row["id"],
-                        question_id=row["question_id"],
-                        engine=row["engine"],
-                        sql=row["sql"],
-                        kind=kind,
-                        description=row.get("description") or "",
-                        bug_class=row.get("bug_class"),
-                        expected_outcome=row.get("expected_outcome"),
-                        mutator=row.get("mutator"),
+                # A row carries its engine's SQL in "sql" and, optionally, the same variant for
+                # other engines in sql_<engine> ("sql_bigquery"): one Variant per engine.
+                versions = [(row["engine"], row["sql"])] + [
+                    (key[4:], value) for key, value in row.items() if key.startswith("sql_") and isinstance(value, str) and value.strip() and key[4:] != row["engine"]
+                ]
+                for engine, sql in versions:
+                    target.append(
+                        Variant(
+                            id=row["id"],
+                            question_id=row["question_id"],
+                            engine=engine,
+                            sql=sql,
+                            kind=kind,
+                            description=row.get("description") or "",
+                            bug_class=row.get("bug_class"),
+                            expected_outcome=row.get("expected_outcome"),
+                            mutator=row.get("mutator"),
+                        )
                     )
-                )
             except KeyError as exc:
                 raise SuiteError(f"{filename}: an entry is missing {exc}") from exc
     return suite

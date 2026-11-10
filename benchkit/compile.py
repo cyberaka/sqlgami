@@ -111,7 +111,9 @@ def compile_suite(
         where = (extra or {}).get("subsample") or rules.get("subsample") or {}  # the suite's own recipe when no file is given
         prebuilt = []
         for s in suite.nasty_seeds() or suite.seeds:
-            conn = build.connect(suite, engine, s)
+            # Fixtures are cut from the DuckDB seed databases whatever the engine: the data is
+            # engine-neutral and digests the same from every dialect's DDL.
+            conn = build.connect(suite, "duckdb" if engine == "bigquery" else engine, s)
             try:
                 prebuilt.append(from_connection(conn, catalog, f"seed-{s.seed}", where=where, profile="subsample", seed=s.seed))
             finally:
@@ -184,7 +186,7 @@ def _measure_discrimination(bundle: Bundle, suite: Suite, engine: str) -> None:
                 continue
             question = suite.question(bug.question_id)
             params = question.param_values() if question else {}
-            result = _run_on(conn, bug.sql, engine, params or {}, timeout_s=10.0, slots=reference.slots, allowed_functions=(suite.config.get("sqlgami") or {}).get("allowed_functions") or ())
+            result = _run_on(conn, bug.sql, engine, params or {}, timeout_s=10.0, slots=reference.slots, allowed_functions=(suite.config.get("sqlgami") or {}).get("allowed_functions") or (), tables=bundle.tables or None)
             if not result.get("ok") or (result["strict"] != stored["strict"] and result["loose"] != stored["loose"]):
                 diverged += 1
         scores[name] = diverged

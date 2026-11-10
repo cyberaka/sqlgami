@@ -45,7 +45,7 @@ CORE = frozenset(
         "func:ARRAY_AGG", "func:GROUP_CONCAT", "func:ROW_NUMBER", "func:RANK", "func:DENSE_RANK", "func:LAG", "func:LEAD",
         "func:FIRST_VALUE", "func:LAST_VALUE", "clause:window",
         # scalar
-        "func:CAST", "func:TRY_CAST", "func:COALESCE", "func:IF", "func:NULLIF", "func:GREATEST", "func:LEAST", "func:ABS", "func:ROUND",
+        "func:CAST", "func:TRY_CAST", "func:COALESCE", "func:IF", "func:CASE", "func:NULLIF", "func:GREATEST", "func:LEAST", "func:ABS", "func:ROUND",
         "func:FLOOR", "func:CEIL", "func:SAFE_DIVIDE", "func:LOWER", "func:UPPER", "func:TRIM", "func:LENGTH",
         "func:CONCAT", "func:SUBSTRING", "func:STARTS_WITH", "func:ENDS_WITH", "func:REGEXP_LIKE",
         # dates
@@ -145,4 +145,18 @@ def translate(sql: str, dialect: str, tables: Mapping[str, str] | None = None, t
     if unverified:
         raise Untranslatable(", ".join(unverified))
     mapped = map_tables(tree, tables)
+    tree = _rewrite(tree, dialect)
     return Translation(tree.sql(dialect=target), used, mapped)
+
+
+def _rewrite(tree: exp.Expression, dialect: str) -> exp.Expression:
+    """Rewrites where sqlglot's translation is not the source engine's semantics (each one is a
+    case in the fidelity tests, proven natively)."""
+    if dialect == "bigquery":
+        # COUNTIF over no rows, or over rows where the condition is never TRUE, is 0 in BigQuery;
+        # DuckDB's COUNT_IF gives NULL for an empty or all-NULL input.
+        for node in list(tree.find_all(exp.CountIf)):
+            if isinstance(node.parent, exp.Coalesce):
+                continue
+            node.replace(exp.Coalesce(this=node.copy(), expressions=[exp.Literal.number(0)]))
+    return tree

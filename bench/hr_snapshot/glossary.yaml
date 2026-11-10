@@ -7,7 +7,8 @@ definitions:
       "My organisation" for a manager scope is every associate whose reporting-chain columns
       (lvl_2_id through lvl_7_id) include the manager's node, OR whose functional-chain columns
       (lvl_2_id_fn through lvl_7_id_fn) include it. A manager appears at any reporting or
-      functional level.
+      functional level. The manager's own row is not part of "my organisation" unless their
+      own chain columns include them.
 
   pay_period:
     meaning: >

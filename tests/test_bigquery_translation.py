@@ -25,7 +25,8 @@ def conn():
         "CREATE TABLE t AS SELECT * FROM (VALUES "
         "(1, DATE '2024-03-15', 10, 2, 'a', TIMESTAMP '2024-03-15 10:20:30'), "
         "(2, DATE '2024-01-31', 7, 0, 'b', TIMESTAMP '2024-01-31 23:59:59'), "
-        "(3, DATE '2024-02-29', NULL, 4, 'a', NULL)) v(id, d, x, y, g, ts)"
+        "(3, DATE '2024-02-29', NULL, 4, 'a', NULL), "
+        "(4, DATE '2024-04-30', NULL, 1, 'c', NULL)) v(id, d, x, y, g, ts)"  # group c: x is only NULL
     )
     return c
 
@@ -46,27 +47,30 @@ def _norm(value):
 
 CASES = [
     # (BigQuery SQL, expected rows in BigQuery semantics, constructs the case verifies)
-    ("SELECT id, DATE_SUB(d, INTERVAL 1 DAY) AS v FROM t ORDER BY id", [(1, D(2024, 3, 14)), (2, D(2024, 1, 30)), (3, D(2024, 2, 28))], {"func:DATE_SUB", "part:DAY"}),
-    ("SELECT id, DATE_ADD(d, INTERVAL 2 MONTH) AS v FROM t ORDER BY id", [(1, D(2024, 5, 15)), (2, D(2024, 3, 31)), (3, D(2024, 4, 29))], {"func:DATE_ADD", "part:MONTH"}),
-    ("SELECT id, DATE_TRUNC(d, MONTH) AS v FROM t ORDER BY id", [(1, D(2024, 3, 1)), (2, D(2024, 1, 1)), (3, D(2024, 2, 1))], {"func:DATE_TRUNC"}),
-    ("SELECT id, DATE_TRUNC(d, QUARTER) AS v FROM t ORDER BY id", [(1, D(2024, 1, 1)), (2, D(2024, 1, 1)), (3, D(2024, 1, 1))], {"part:QUARTER"}),
-    ("SELECT id, DATE_DIFF(d, DATE '2024-01-01', DAY) AS v FROM t ORDER BY id", [(1, 74), (2, 30), (3, 59)], {"func:DATEDIFF"}),  # first minus second
+    ("SELECT id, DATE_SUB(d, INTERVAL 1 DAY) AS v FROM t ORDER BY id", [(1, D(2024, 3, 14)), (2, D(2024, 1, 30)), (3, D(2024, 2, 28)), (4, D(2024, 4, 29))], {"func:DATE_SUB", "part:DAY"}),
+    ("SELECT id, DATE_ADD(d, INTERVAL 2 MONTH) AS v FROM t ORDER BY id", [(1, D(2024, 5, 15)), (2, D(2024, 3, 31)), (3, D(2024, 4, 29)), (4, D(2024, 6, 30))], {"func:DATE_ADD", "part:MONTH"}),
+    ("SELECT id, DATE_TRUNC(d, MONTH) AS v FROM t ORDER BY id", [(1, D(2024, 3, 1)), (2, D(2024, 1, 1)), (3, D(2024, 2, 1)), (4, D(2024, 4, 1))], {"func:DATE_TRUNC"}),
+    ("SELECT id, DATE_TRUNC(d, QUARTER) AS v FROM t ORDER BY id", [(1, D(2024, 1, 1)), (2, D(2024, 1, 1)), (3, D(2024, 1, 1)), (4, D(2024, 4, 1))], {"part:QUARTER"}),
+    ("SELECT id, DATE_DIFF(d, DATE '2024-01-01', DAY) AS v FROM t ORDER BY id", [(1, 74), (2, 30), (3, 59), (4, 120)], {"func:DATEDIFF"}),  # first minus second
     ("SELECT DATE_DIFF(DATE '2024-03-15', DATE '2024-01-01', WEEK) AS v", [(10,)], {"part:WEEK"}),  # Sunday-week boundaries crossed between a Monday and a Friday ten weeks on
     ("SELECT DATE_DIFF(DATE '2024-03-15', DATE '2024-01-01', MONTH) AS v, DATE_DIFF(DATE '2025-01-01', DATE '2024-03-15', YEAR) AS w", [(2, 1)], {"part:YEAR"}),
-    ("SELECT id, EXTRACT(MONTH FROM d) AS v, EXTRACT(YEAR FROM d) AS w FROM t ORDER BY id", [(1, 3, 2024), (2, 1, 2024), (3, 2, 2024)], {"func:EXTRACT"}),
-    ("SELECT id, FORMAT_DATE('%Y-%m', d) AS v FROM t ORDER BY id", [(1, "2024-03"), (2, "2024-01"), (3, "2024-02")], {"func:TIME_TO_STR", "func:TS_OR_DS_TO_DATE"}),
-    ("SELECT id, SAFE_DIVIDE(x, y) AS v FROM t ORDER BY id", [(1, 5), (2, None), (3, None)], {"func:SAFE_DIVIDE"}),
-    ("SELECT COUNTIF(x > 5) AS v, COUNT(*) AS n, SUM(x) AS s, MIN(d) AS lo, MAX(d) AS hi, AVG(y) AS a FROM t", [(2, 3, 17, D(2024, 1, 31), D(2024, 3, 15), 2)], {"func:COUNT_IF", "func:COUNT", "func:SUM", "func:MIN", "func:MAX", "func:AVG"}),
-    ("SELECT id, IFNULL(x, -1) AS v, COALESCE(x, y) AS w FROM t ORDER BY id", [(1, 10, 10), (2, 7, 7), (3, -1, 4)], {"func:COALESCE"}),
-    ("SELECT id, IF(x > 5, 'big', 'small') AS v FROM t ORDER BY id", [(1, "big"), (2, "big"), (3, "small")], {"func:IF"}),
-    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY d) = 1 ORDER BY id", [(2, "b"), (3, "a")], {"clause:qualify", "clause:window", "func:ROW_NUMBER"}),
-    ("SELECT id, RANK() OVER (ORDER BY y DESC) AS r, DENSE_RANK() OVER (ORDER BY y DESC) AS dr, LAG(id) OVER (ORDER BY id) AS p, LEAD(id) OVER (ORDER BY id) AS n FROM t ORDER BY id", [(1, 2, 2, None, 2), (2, 3, 3, 1, 3), (3, 1, 1, 2, None)], {"func:RANK", "func:DENSE_RANK", "func:LAG", "func:LEAD"}),
+    ("SELECT id, EXTRACT(MONTH FROM d) AS v, EXTRACT(YEAR FROM d) AS w FROM t ORDER BY id", [(1, 3, 2024), (2, 1, 2024), (3, 2, 2024), (4, 4, 2024)], {"func:EXTRACT"}),
+    ("SELECT id, FORMAT_DATE('%Y-%m', d) AS v FROM t ORDER BY id", [(1, "2024-03"), (2, "2024-01"), (3, "2024-02"), (4, "2024-04")], {"func:TIME_TO_STR", "func:TS_OR_DS_TO_DATE"}),
+    ("SELECT id, SAFE_DIVIDE(x, y) AS v FROM t ORDER BY id", [(1, 5), (2, None), (3, None), (4, None)], {"func:SAFE_DIVIDE"}),
+    ("SELECT g, COUNTIF(x > 5) AS n FROM t GROUP BY g ORDER BY g", [("a", 1), ("b", 1), ("c", 0)], {"func:COUNT_IF"}),  # an all-NULL group is 0, not NULL
+    ("SELECT COUNTIF(x > 5) AS n FROM t WHERE id > 100", [(0,)], set()),  # and so is an empty set
+    ("SELECT COUNTIF(x > 5) AS v, COUNT(*) AS n, SUM(x) AS s, MIN(d) AS lo, MAX(d) AS hi, AVG(y) AS a FROM t", [(2, 4, 17, D(2024, 1, 31), D(2024, 4, 30), 1.75)], {"func:COUNT_IF", "func:COUNT", "func:SUM", "func:MIN", "func:MAX", "func:AVG"}),
+    ("SELECT id, IFNULL(x, -1) AS v, COALESCE(x, y) AS w FROM t ORDER BY id", [(1, 10, 10), (2, 7, 7), (3, -1, 4), (4, -1, 1)], {"func:COALESCE"}),
+    ("SELECT id, CASE WHEN x > 5 THEN 'big' WHEN x IS NULL THEN 'none' ELSE 'small' END AS v, CASE x WHEN 7 THEN 'seven' ELSE 'other' END AS w FROM t ORDER BY id", [(1, "big", "other"), (2, "big", "seven"), (3, "none", "other"), (4, "none", "other")], {"func:CASE"}),
+    ("SELECT id, IF(x > 5, 'big', 'small') AS v FROM t ORDER BY id", [(1, "big"), (2, "big"), (3, "small"), (4, "small")], {"func:IF"}),
+    ("SELECT id, g FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY d) = 1 ORDER BY id", [(2, "b"), (3, "a"), (4, "c")], {"clause:qualify", "clause:window", "func:ROW_NUMBER"}),
+    ("SELECT id, RANK() OVER (ORDER BY y DESC) AS r, DENSE_RANK() OVER (ORDER BY y DESC) AS dr, LAG(id) OVER (ORDER BY id) AS p, LEAD(id) OVER (ORDER BY id) AS n FROM t ORDER BY id", [(1, 2, 2, None, 2), (2, 4, 4, 1, 3), (3, 1, 1, 2, 4), (4, 3, 3, 3, None)], {"func:RANK", "func:DENSE_RANK", "func:LAG", "func:LEAD"}),
     ("SELECT v FROM UNNEST([1, 2, 3]) AS v ORDER BY v", [(1,), (2,), (3,)], {"clause:unnest", "clause:array", "func:UNNEST", "func:ARRAY"}),
-    ("SELECT ARRAY_LENGTH(ARRAY_AGG(STRUCT(id, g))) AS v FROM t", [(3,)], {"func:ARRAY_SIZE", "func:ARRAY_AGG", "func:STRUCT", "clause:struct"}),
-    ("SELECT STRING_AGG(g, ',' ORDER BY id) AS v, ANY_VALUE(g) AS a, APPROX_COUNT_DISTINCT(g) AS c FROM t", [("a,b,a", "a", 2)], {"func:GROUP_CONCAT", "func:ANY_VALUE", "func:APPROX_DISTINCT"}),
+    ("SELECT ARRAY_LENGTH(ARRAY_AGG(STRUCT(id, g))) AS v FROM t", [(4,)], {"func:ARRAY_SIZE", "func:ARRAY_AGG", "func:STRUCT", "clause:struct"}),
+    ("SELECT STRING_AGG(g, ',' ORDER BY id) AS v, ANY_VALUE(g) AS a, APPROX_COUNT_DISTINCT(g) AS c FROM t", [("a,b,a,c", "a", 3)], {"func:GROUP_CONCAT", "func:ANY_VALUE", "func:APPROX_DISTINCT"}),
     ("SELECT SAFE_CAST('x' AS INT64) AS v, CAST(7 AS INT64) AS w, CAST('2024-01-05' AS DATE) AS d, CAST(1.5 AS STRING) AS s", [(None, 7, D(2024, 1, 5), "1.5")], {"func:TRY_CAST", "func:CAST", "type:BIGINT", "type:DATE", "type:TEXT"}),
     ("SELECT CAST(x AS FLOAT64) / 4 AS v, CAST(TRUE AS BOOL) AS b, CAST(1 AS NUMERIC) AS n, CAST('2024-01-05 10:00:00' AS TIMESTAMP) AS ts FROM t WHERE id = 1", [(2.5, True, 1, dt.datetime(2024, 1, 5, 10, 0))], {"type:DOUBLE", "type:BOOLEAN", "type:DECIMAL", "type:TIMESTAMPTZ"}),
-    ("SELECT id, LAST_DAY(d) AS v FROM t ORDER BY id", [(1, D(2024, 3, 31)), (2, D(2024, 1, 31)), (3, D(2024, 2, 29))], {"func:LAST_DAY"}),
+    ("SELECT id, LAST_DAY(d) AS v FROM t ORDER BY id", [(1, D(2024, 3, 31)), (2, D(2024, 1, 31)), (3, D(2024, 2, 29)), (4, D(2024, 4, 30))], {"func:LAST_DAY"}),
     ("SELECT ARRAY_LENGTH(GENERATE_DATE_ARRAY(DATE '2024-01-01', DATE '2024-01-10', INTERVAL 1 DAY)) AS v", [(10,)], {"func:GENERATE_DATE_ARRAY"}),
     ("SELECT TIMESTAMP_TRUNC(TIMESTAMP '2024-03-15 10:20:30', HOUR) AS v", [(dt.datetime(2024, 3, 15, 10, 0),)], {"func:TIMESTAMP_TRUNC", "part:HOUR"}),
     ("SELECT EXTRACT(MINUTE FROM TIMESTAMP '2024-03-15 10:20:30') AS m, EXTRACT(SECOND FROM TIMESTAMP '2024-03-15 10:20:30') AS s", [(20, 30)], {"part:MINUTE", "part:SECOND"}),
@@ -74,9 +78,9 @@ CASES = [
     ("SELECT DATE('2024-01-05') AS d, PARSE_DATE('%Y%m%d', '20240105') AS p, DATE_DIFF(CURRENT_DATE(), CURRENT_DATE(), DAY) AS z, DATE(TIMESTAMP '2024-03-15 10:20:30') AS t", [(D(2024, 1, 5), D(2024, 1, 5), 0, D(2024, 3, 15))], {"func:DATE", "func:STR_TO_DATE", "func:CURRENT_DATE"}),
     ("SELECT LOWER('Ab') AS l, UPPER('Ab') AS u, TRIM(' x ') AS t, LENGTH('abc') AS n, CONCAT('a', 'b') AS c, SUBSTR('abcdef', 2, 3) AS s, STARTS_WITH('abc', 'ab') AS st, ENDS_WITH('abc', 'bc') AS en, REGEXP_CONTAINS('abc', 'b.') AS re", [("ab", "AB", "x", 3, "ab", "bcd", True, True, True)], {"func:LOWER", "func:UPPER", "func:TRIM", "func:LENGTH", "func:CONCAT", "func:SUBSTRING", "func:STARTS_WITH", "func:ENDS_WITH", "func:REGEXP_LIKE"}),
     ("SELECT NULLIF(3, 3) AS n, GREATEST(1, 5, 3) AS g, LEAST(1, 5, 3) AS l", [(None, 5, 1)], {"func:NULLIF", "func:GREATEST", "func:LEAST"}),
-    ("SELECT FIRST_VALUE(id) OVER (ORDER BY d) AS f, LAST_VALUE(id) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM t ORDER BY id LIMIT 1", [(2, 1)], {"func:FIRST_VALUE", "func:LAST_VALUE"}),
+    ("SELECT FIRST_VALUE(id) OVER (ORDER BY d) AS f, LAST_VALUE(id) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM t ORDER BY id LIMIT 1", [(2, 4)], {"func:FIRST_VALUE", "func:LAST_VALUE"}),
     ("SELECT id FROM t WHERE d >= (SELECT MIN(d) FROM t) AND d < DATE_ADD((SELECT MIN(d) FROM t), INTERVAL 1 MONTH) ORDER BY id", [(2,)], set()),  # scalar-subquery date bounds; Jan 31 + 1 month clamps to Feb 29
-    ("SELECT g, SUM(n) AS total FROM (SELECT g, d, COUNT(*) AS n FROM t GROUP BY g, d) GROUP BY g ORDER BY g", [("a", 2), ("b", 1)], set()),  # two-level aggregation
+    ("SELECT g, SUM(n) AS total FROM (SELECT g, d, COUNT(*) AS n FROM t GROUP BY g, d) GROUP BY g ORDER BY g", [("a", 2), ("b", 1), ("c", 1)], set()),  # two-level aggregation
 ]
 
 
@@ -153,7 +157,7 @@ def test_bigquery_statements_are_judged_on_the_fixtures_through_the_verified_tra
     from sqlgami.report import StageStatus
 
     manifest = __import__("json").loads((bq_bundle / "manifest.json").read_text())
-    assert manifest["dialect"] == "bigquery" and manifest["references"] == 1 and manifest["tables"]["`proj-x.shop.orders`"] == "shop.orders"
+    assert manifest["dialect"] == "bigquery" and manifest["references"] == 1 and manifest["tables"]["proj-x.shop.orders"] == "shop.orders"
     question = "Paid order count and average order total per region over the last six months"
     with Scorer("bigquery", catalog=BQ_DDL, bundle=bq_bundle) as scorer:
         same = scorer.explain(REF, question)
@@ -176,3 +180,25 @@ def test_bigquery_statements_are_judged_on_the_fixtures_through_the_verified_tra
         # a project the host did not map
         other = scorer.explain(REF.replace("`proj-x.shop.customers`", "`other-proj.shop.customers`"), question)
         assert other.stage("fixtures").status == StageStatus.NOT_RUN and "no fixture table declared" in (other.stage("fixtures").detail or "")
+
+
+@pytest.mark.skipif(__import__("os").environ.get("SQLGAMI_BQ_LIVE") != "1", reason="native proof runs only with SQLGAMI_BQ_LIVE=1 against the sandbox")
+def test_native_bigquery_agrees_with_the_translation_on_every_case(conn, tmp_path):
+    """Ground truth for the allow-list (ADR 0003 B2): the same fixture rows in the sandbox, every
+    case run natively, normalised rows equal to the DuckDB translation's."""
+    from sqlgami.contrib.bigquery import BigQuerySandbox
+
+    sandbox = BigQuerySandbox(ledger=tmp_path / "ledger.jsonl")
+    dataset = sandbox.ensure_dataset("bench_translation", note="fidelity fixture for tests/test_bigquery_translation.py")
+    rows = conn.execute("SELECT id, d, x, y, g, ts FROM t ORDER BY id").fetchall()
+    sandbox.load_table(dataset, "t", [("id", "INT64"), ("d", "DATE"), ("x", "INT64"), ("y", "INT64"), ("g", "STRING"), ("ts", "TIMESTAMP")], rows)
+    disagreements = []
+    for sql, expected, verifies in CASES:
+        native_sql = sql.replace(" FROM t", f" FROM `{sandbox.project}.{dataset}.t`").replace("(SELECT MIN(d) FROM t)", f"(SELECT MIN(d) FROM `{sandbox.project}.{dataset}.t`)")
+        native = sandbox.run(native_sql)
+        assert native.ok, (sql, native.error)
+        translated = [tuple(_norm(v) for v in row) for row in conn.execute(translate(sql, "bigquery").sql).fetchall()]
+        got = [tuple(_norm(v) for v in row) for row in native.rows]
+        if sorted(map(repr, got)) != sorted(map(repr, translated)):
+            disagreements.append((sql, got, translated))
+    assert not disagreements, disagreements
