@@ -162,15 +162,16 @@ class DuckDBAdapter(Adapter):
             except self._duckdb.Error as exc:
                 raise AdapterError(f"DuckDB metadata query failed: {exc}") from exc
 
-    def _guarded(self, sql: str, max_rows: int | None, timeout_s: float) -> tuple[list[str], list[tuple], bool]:
+    def _guarded(self, sql: str, max_rows: int | None, timeout_s: float, grace_s: float | None = None) -> tuple[list[str], list[tuple], bool]:
         """Run ``sql`` under a wall-clock bound the caller can rely on.
 
         The statement runs on a worker thread. Past ``timeout_s`` the engine is asked to stop,
-        again every quarter second for ``GRACE_S`` in case a request is lost (DuckDB drops an
-        interrupt that lands between statements, and has been seen to ignore one inside a
-        recursive CTE). If it still has not stopped, the cursor is abandoned: the caller gets a
-        timeout now, a fresh cursor serves the next statement, and the old one is interrupted in
-        the background until it gives up.
+        again every quarter second for ``grace_s`` (default ``GRACE_S``) in case a request is
+        lost (DuckDB drops an interrupt that lands between statements, and has been seen to
+        ignore one inside a recursive CTE). If it still has not stopped, the cursor is abandoned:
+        the caller gets a timeout now, a fresh cursor serves the next statement, and the old one
+        is interrupted in the background until it gives up. A caller on a live deadline passes
+        the time it has left as ``grace_s``: the bound is then ``timeout_s + grace_s``.
         """
         with self._lock:
             conn = self.conn
@@ -189,10 +190,10 @@ class DuckDBAdapter(Adapter):
             worker.start()
             if done.wait(timeout_s):
                 return self._unbox(box, None)
-            deadline = time.monotonic() + self.GRACE_S
+            deadline = time.monotonic() + (self.GRACE_S if grace_s is None else max(0.0, grace_s))
             while not done.is_set() and time.monotonic() < deadline:
                 _interrupt(conn)
-                done.wait(0.25)
+                done.wait(min(0.25, max(0.001, deadline - time.monotonic())))
             if done.is_set():
                 return self._unbox(box, f"stopped after {timeout_s:g}s")
             self._abandon(conn, done)
@@ -259,11 +260,11 @@ class DuckDBAdapter(Adapter):
         plan = "\n".join(str(row[-1]) for row in rows)
         return DryRunResult(ok=True, plan=plan)
 
-    def execute(self, sql: str, *, max_rows: int, timeout_s: float) -> ExecutionResult:
+    def execute(self, sql: str, *, max_rows: int, timeout_s: float, grace_s: float | None = None) -> ExecutionResult:
         assert_read_only(sql, self.dialect, self.allowed_functions, allowed_tables=self.allowed_tables)
         started = time.perf_counter()
         try:
-            columns, rows, truncated = self._guarded(sql, max_rows, timeout_s)
+            columns, rows, truncated = self._guarded(sql, max_rows, timeout_s, grace_s)
         except (self._duckdb.Error, _Timeout) as exc:
             return ExecutionResult(
                 ok=False,

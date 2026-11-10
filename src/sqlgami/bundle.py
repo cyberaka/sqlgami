@@ -447,10 +447,12 @@ def _run_on(
     slots: dict[str, Any] | None = None,
     allowed_functions: Sequence[str] = (),
     allowed_tables: Sequence[str] = (),
+    grace_s: float | None = None,
 ) -> dict[str, Any]:
     """Run ``sql`` on a fixture connection and return the stored form of its result. The same
     gate as everywhere applies: a statement that is not a single read-only query over known
-    functions and tables is not sent."""
+    functions and tables is not sent. ``grace_s`` bounds how long past ``timeout_s`` the engine
+    is given to stop before the cursor is abandoned (a live deadline passes what it has left)."""
     from .engines.duckdb import DuckDBAdapter
     from .errors import UnsafeQueryError
 
@@ -462,7 +464,7 @@ def _run_on(
     adapter.allowed_functions = frozenset(n.lower() for n in allowed_functions)
     adapter.allowed_tables = frozenset(n.lower() for n in allowed_tables)
     try:
-        result = adapter.execute(text, max_rows=10_000, timeout_s=timeout_s or 30.0)
+        result = adapter.execute(text, max_rows=10_000, timeout_s=timeout_s or 30.0, grace_s=grace_s)
     except UnsafeQueryError as exc:
         return {"ok": False, "error": f"not sent: {exc}"}
     if not result.ok:

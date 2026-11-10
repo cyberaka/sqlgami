@@ -582,7 +582,10 @@ one from bench suites and prints its error on questions held out of the fit.
   `statement_timeout`; DuckDB runs each statement on a worker thread, is asked
   to stop with `interrupt()` repeatedly for a grace period, and if it still runs
   (DuckDB has been seen to ignore the request inside a recursive CTE) the
-  statement is abandoned and a fresh cursor serves the next one. A statement
+  statement is abandoned and a fresh cursor serves the next one. Under a live
+  deadline the grace is the few milliseconds the call can spare, so the cursor
+  is abandoned at the deadline rather than waited for, and the fixture stage
+  keeps 15 % of the deadline back for the stages after it. A statement
   that was cut short is a `timeout` outcome and never counts as verified; a
   report that ran out of budget carries a `budget_spent` note.
 - Nothing is sent to a database, a network service or an LLM unless you pass a

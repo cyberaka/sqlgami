@@ -143,10 +143,18 @@ def _default_deadline_ms() -> float | None:
 class _Deadline:
     """One score() call's deadline and timing ledger."""
 
+    # Share of the deadline kept back by the fixture stage for the stages after it (the question
+    # stage, scoring): a fixture run that would eat into it is not started.
+    RESERVE = 0.15
+
     def __init__(self, deadline_ms: float | None) -> None:
         self.started = time.perf_counter()
         self.deadline_ms = deadline_ms
         self.skipped: list[str] = []
+
+    @property
+    def reserve_ms(self) -> float:
+        return (self.deadline_ms or 0.0) * self.RESERVE
 
     def elapsed_ms(self) -> float:
         return (time.perf_counter() - self.started) * 1000
@@ -609,6 +617,7 @@ def _stages(
 
 BONUS_FIXTURES = (1.2, 1.6)  # the candidate matches the reference on one fixture / on two or more
 RUNAWAY_CODES = ("unbounded_recursion", "cartesian_join")  # statements not run on fixtures inside a deadline
+LIVE_GRACE_S = 0.005  # past a live deadline the engine gets this long to stop before the cursor is abandoned
 
 
 def _fixture_stage(
@@ -703,40 +712,53 @@ def _fixture_stage(
         stored = reference.results.get(fixture_name)
         if not stored or not stored.get("ok"):
             continue
+        # The time this stage may still use: what is left, less a reserve for the stages after it.
         left = deadline.remaining_ms()
+        usable = None if left is None else left - deadline.reserve_ms
         # What a run is expected to cost: the reference's typical time on this fixture, doubled
-        # (the candidate may be heavier). The per-statement clamp is the safety net beyond it.
+        # (the candidate may be heavier). The per-statement clamp is the safety net beyond it:
+        # under a deadline a statement is stopped at the usable time, and the cursor abandoned a
+        # few milliseconds later if the engine has not stopped it — never waited for.
         per_run = entry.get("reference_ms") or entry.get("reference_max_ms") or 5.0
         needed = per_run * (4 if not same_values else 2) + 1.0
-        if left is not None and left < needed:
+        if usable is not None and usable < needed:
             deadline.cut(name)
             outcome["fixtures"].append({"fixture": fixture_name, "status": "not_run", "reason": DEADLINE})
             continue
-        timeout_s = min(options.timeout_s, left / 1000) if left is not None else options.timeout_s
+        timeout_s = min(options.timeout_s, usable / 1000) if usable is not None else options.timeout_s
+        grace_s = LIVE_GRACE_S if usable is not None else None
         try:
             conn = bundle.connection(fixture_name)
         except Exception as exc:
             outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": str(exc)[:160]})
             continue
         if not same_values:
-            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables)
+            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s)
             if not stored.get("ok"):
-                outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": f"the reference fails under these values: {str(stored.get('error'))[:120]}"})
+                error = str(stored.get("error") or "")
+                if "stopped" in error or "abandoned" in error:
+                    deadline.cut(name)
+                    outcome["fixtures"].append({"fixture": fixture_name, "status": "not_run", "reason": DEADLINE})
+                else:
+                    outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": f"the reference fails under these values: {error[:120]}"})
                 continue
             left = deadline.remaining_ms()
-            timeout_s = min(options.timeout_s, left / 1000) if left is not None else options.timeout_s
-            if left is not None and left <= 0:
+            usable = None if left is None else left - deadline.reserve_ms
+            if usable is not None and usable < per_run + 1.0:
                 deadline.cut(name)
                 outcome["fixtures"].append({"fixture": fixture_name, "status": "not_run", "reason": DEADLINE})
                 continue
+            timeout_s = min(options.timeout_s, usable / 1000) if usable is not None else options.timeout_s
         if not stored.get("row_count"):
             # An empty reference result proves nothing: any query returning nothing would match.
             outcome["fixtures"].append({"fixture": fixture_name, "status": "no_evidence", "reason": "the reference returns no rows on this fixture"})
             continue
-        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables)
+        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s)
         if not result.get("ok"):
             error = str(result.get("error") or "")
-            status = "timeout" if "stopped" in error or "deadline" in error else "error"
+            status = "timeout" if "stopped" in error or "abandoned" in error or "deadline" in error else "error"
+            if status == "timeout" and grace_s is not None:
+                deadline.cut(name)  # the statement was stopped at the deadline, not by its own limit
             outcome["fixtures"].append({"fixture": fixture_name, "status": status, "reason": error[:200]})
             if status == "error" and dialect == "duckdb" and mismatch is None:
                 mismatch = Finding(

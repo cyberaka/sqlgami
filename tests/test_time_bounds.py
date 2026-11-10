@@ -51,6 +51,20 @@ def test_duckdb_statement_that_ignores_the_interrupt_is_abandoned(monkeypatch):
     adapter.close()
 
 
+def test_a_live_caller_bounds_the_grace_and_is_not_kept_waiting(monkeypatch):
+    """Under a live deadline the caller passes the few milliseconds it can spare as grace_s: the
+    bound is timeout + grace, whether or not the engine honours the interrupt in time."""
+    adapter = _adapter()
+    monkeypatch.setattr(D, "_interrupt", lambda conn: None)  # the worst case: a lost interrupt
+    started = time.perf_counter()
+    result = adapter.execute(SLOW, max_rows=10, timeout_s=0.02, grace_s=0.005)
+    elapsed = time.perf_counter() - started
+    assert not result.ok and result.error_kind == "timeout"
+    assert elapsed < 0.02 + 0.005 + 0.1, elapsed  # not the 3 s default grace
+    assert adapter.execute("SELECT COUNT(*) FROM t", max_rows=10, timeout_s=5).rows == [(2000,)]
+    adapter.close()
+
+
 def test_non_terminating_recursive_cte_is_a_static_note_and_a_timeout_not_a_hang():
     """The exact shape an LLM wrote on the hr snapshot: a recursive CTE over a table that holds
     each key many times, grown with UNION ALL. It never finishes; the report must."""
