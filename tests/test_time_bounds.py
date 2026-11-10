@@ -186,3 +186,34 @@ def test_the_default_deadline_is_fifty_milliseconds(monkeypatch):
     assert Options().deadline_ms is None
     monkeypatch.setenv("SQLGAMI_DEADLINE_MS", "120")
     assert Options().deadline_ms == 120.0
+
+
+DEADLINE_OVERHEAD_MS = 250.0  # what a score() call may add to its deadline: the engine's interrupt latency
+# (DuckDB honours an interrupt within a few ms; only an engine that IGNORES it costs the 3 s
+# abandonment grace, which the lost-interrupt test covers separately) plus Python overhead.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT SUM(a.i * b.i) FROM range(300000) a(i), range(300000) b(i)",  # one slow statement
+        "SELECT COUNT(*) FROM t",  # a fast one
+        "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r) SELECT COUNT(*) FROM r",  # never ends
+    ],
+)
+def test_score_never_exceeds_the_deadline_plus_a_fixed_overhead(sql):
+    """Sample mode, deadline 40 ms, a 15 s statement timeout: the deadline clamps every
+    statement, so even a query that would run for seconds comes back within the deadline plus
+    DEADLINE_OVERHEAD_MS, reported as a timeout, never as a pass."""
+    conn = duckdb.connect()
+    conn.execute("CREATE TABLE t AS SELECT i FROM range(10) r(i)")
+    with Scorer("duckdb", db=conn, options=Options(deadline_ms=40.0, timeout_s=15.0)) as scorer:
+        scorer.sample("SELECT COUNT(*) FROM t", "warm")
+        for _ in range(3):
+            started = time.perf_counter()
+            report = scorer.sample(sql, "a question")
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            assert elapsed_ms <= 40.0 + DEADLINE_OVERHEAD_MS, (sql, elapsed_ms)
+            if "range(300000)" in sql or "RECURSIVE" in sql:
+                assert report.stage("sample").status != StageStatus.PASSED
+                assert report.has("execution_timeout") or report.stage("sample").status == StageStatus.NOT_RUN

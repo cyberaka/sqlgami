@@ -184,18 +184,26 @@ class _Bounded:
     period.
     """
 
-    def __init__(self, adapter: Adapter, budget_s: float) -> None:
+    def __init__(self, adapter: Adapter, budget_s: float, deadline: "_Deadline | None" = None) -> None:
         self._adapter = adapter
         self._deadline = time.monotonic() + budget_s
+        self._call_deadline = deadline
         self.spent = False  # set once a statement was refused or cut short for lack of time
 
     def remaining(self) -> float:
-        return self._deadline - time.monotonic()
+        left = self._deadline - time.monotonic()
+        if self._call_deadline is not None:
+            call_left = self._call_deadline.remaining_ms()
+            if call_left is not None:
+                left = min(left, call_left / 1000)
+        return left
 
     def _clamp(self, timeout_s: float) -> float | None:
         left = self.remaining()
-        if left <= 0.05:
+        if left <= 0.002:
             self.spent = True
+            if self._call_deadline is not None and self._call_deadline.expired():
+                self._call_deadline.cut("statement")
             return None
         if left < timeout_s:
             self.spent = True
@@ -299,7 +307,8 @@ def _run(
     clock = _Clock()
     deadline = _Deadline(options.deadline_ms)
     report.timing = {"deadline_ms": options.deadline_ms}
-    bounded: _Bounded | None = _Bounded(adapter, options.budget_s) if adapter is not None else None
+    # Every statement gets at most the time left on the deadline as well as on the budget.
+    bounded: _Bounded | None = _Bounded(adapter, options.budget_s, deadline) if adapter is not None else None
     adapter = bounded  # type: ignore[assignment]  # every stage below talks to the database through the budget
     try:
         _stages(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober, terms, clock, deadline, bounded)
