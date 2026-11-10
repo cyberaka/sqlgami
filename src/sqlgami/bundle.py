@@ -113,7 +113,7 @@ def schema_hash(catalog: Catalog) -> str:
     for name in catalog.table_names():
         schema, _, bare = name.rpartition(".")
         table = catalog.resolve(bare, schema or None, quoted=True) or catalog.resolve(bare, schema or None)
-        if table is None or table.is_view:
+        if table is None or table.is_view or table.is_table_function:
             continue
         h.update(name.lower().encode("utf-8"))
         for column in sorted(table.columns, key=lambda c: c.name.lower()):
@@ -247,7 +247,7 @@ def compile_bundle(
                 outcome = _run_on(
                     connections[fixture.name], reference.sql, dialect, reference.params, slots=reference.slots,
                     allowed_functions=config.get("allowed_functions") or (), allowed_tables=config.get("allowed_tables") or (),
-                    tables=config.get("tables") or None,
+                    tables=config.get("tables") or None, functions=catalog.scalar_functions and {k: {"parameters": [list(p) for p in f.parameters], "body": f.body, "language": f.language} for k, f in catalog.scalar_functions.items()} or None,
                 )
                 timings[fixture.name].append((time.perf_counter() - started) * 1000)
                 if outcome.get("error"):
@@ -269,6 +269,8 @@ def compile_bundle(
         "dialect": dialect,
         "schema_file": str(config.get("schema") or ""),  # which dialect's DDL the fixtures came from
         "tables": {str(k): str(v) for k, v in (config.get("tables") or {}).items()},  # host names -> fixture tables (ADR 0003)
+        # The host's scalar functions: SQL ones are inlined on the fixtures, JavaScript ones make a reader not_run.
+        "functions": {k: {"parameters": [list(p) for p in f.parameters], "body": f.body, "language": f.language} for k, f in catalog.scalar_functions.items()},
         "schema_hash": schema_hash(catalog),
         "catalogue": catalogue.to_dict() if catalogue is not None else None,
         "fixtures": [
@@ -288,6 +290,9 @@ def compile_bundle(
         "references": len(kept),
         "rejected": len(rejected),
         "expansion": expansion_summary,
+        # Views and table functions whose body uses a construct the translation has not verified:
+        # a statement reading one gets no fixture verdict.
+        "untranslatable_views": dict(__import__("sqlgami.fixtures", fromlist=["UNTRANSLATABLE_VIEWS"]).UNTRANSLATABLE_VIEWS),
         # References whose question states a number that no slot or parameter binds ("the two
         # counts"): a question compares under them only when it states the same number, so the
         # host may want to reword the reference, or write that number as a {slot}.
@@ -448,7 +453,7 @@ def _scalar(text: str) -> Any:
         return text
 
 
-def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str, Any] | None = None, tables: Mapping[str, str] | None = None) -> str:
+def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str, Any] | None = None, tables: Mapping[str, str] | None = None, functions: Mapping[str, Any] | None = None) -> str:
     """The statement as DuckDB SQL for a fixture: slots and parameters bound, and — for another
     dialect — translated through the verified allow-list (:mod:`sqlgami.translate`), raising
     ``Untranslatable`` for a construct whose translation is not proven."""
@@ -473,8 +478,8 @@ def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str,
     elif len(statements) == 1:
         tree = statements[0]
     else:
-        return translate(text, dialect, tables).sql
-    return translate(tree, dialect, tables).sql
+        return translate(text, dialect, tables, functions=functions).sql
+    return translate(tree, dialect, tables, functions=functions).sql
 
 
 def _run_on(
@@ -489,6 +494,7 @@ def _run_on(
     grace_s: float | None = None,
     tables: Mapping[str, str] | None = None,
     executable: str | None = None,
+    functions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run ``sql`` on a fixture connection and return the stored form of its result. The same
     gate as everywhere applies: a statement that is not a single read-only query over known
@@ -501,13 +507,16 @@ def _run_on(
     from .translate import Untranslatable
 
     try:
-        text = executable if executable is not None else _executable(sql, dialect, params, slots, tables)
+        text = executable if executable is not None else _executable(sql, dialect, params, slots, tables, functions)
     except Untranslatable as exc:
         return {"ok": False, "error": str(exc), "untranslatable": exc.construct}
     except Exception as exc:
         return {"ok": False, "error": f"could not prepare: {exc}"}
     adapter = DuckDBAdapter(conn)
-    adapter.allowed_functions = frozenset(n.lower() for n in allowed_functions)
+    # The fixture's own table functions (catalogue TVFs materialised as table macros) are
+    # read-only by construction: the gate may call them. Everything else is as the host allowed.
+    declared = {str(v).split(".")[-1].lower() for v in (tables or {}).values()}
+    adapter.allowed_functions = frozenset(n.lower() for n in allowed_functions) | frozenset(declared)
     adapter.allowed_tables = frozenset(n.lower() for n in allowed_tables)
     try:
         result = adapter.execute(text, max_rows=10_000, timeout_s=timeout_s or 30.0, grace_s=grace_s)
@@ -592,6 +601,14 @@ class Bundle:
     @property
     def dialect(self) -> str:
         return str(self.manifest.get("dialect") or "duckdb")
+
+    @property
+    def functions(self) -> dict[str, Any]:
+        return dict(self.manifest.get("functions") or {})
+
+    @property
+    def untranslatable_views(self) -> dict[str, str]:
+        return dict(self.manifest.get("untranslatable_views") or {})
 
     @property
     def tables(self) -> dict[str, str]:

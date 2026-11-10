@@ -153,7 +153,7 @@ def test_view_cycle_and_broken_view_do_not_crash():
     """
     scorer = Scorer("duckdb", catalog=Catalog.from_ddl(ddl, "duckdb"))
     cyclic = scorer.explain("SELECT * FROM a")
-    assert cyclic.has("analysis_incomplete")
+    assert cyclic.has("view_nesting")  # a view that refers to itself: a HIGH, with the reason
     broken = scorer.explain("SELECT * FROM broken")
     finding = next(f for f in broken.findings if f.code == "unknown_table")
     assert "inside view" in finding.message

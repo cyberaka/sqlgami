@@ -119,6 +119,11 @@ class Analysis:
     variable_values: dict[str, exp.Expression] = field(default_factory=dict)
     unbound_variables: list[str] = field(default_factory=list)  # referenced but never given a value
     bound_sql: str | None = None  # the final query with its variables bound, for the fixture stage
+    # Scalar functions: SQL ones the host declared are inlined; JavaScript ones cannot be run on
+    # fixtures; qualified names the host never declared are unknown.
+    inlined_functions: list[str] = field(default_factory=list)
+    js_functions: list[str] = field(default_factory=list)
+    unknown_functions: list[str] = field(default_factory=list)
     shadowed_variables: list[str] = field(default_factory=list)
 
     @property
@@ -233,6 +238,7 @@ def _sqlite_scalar_extremes(tree: exp.Expression) -> None:
 
 
 _SCRIPT_DIALECTS = {"bigquery"}
+_BUILTIN_TABLE_FUNCTIONS = {"generate_series", "exploding_generate_series", "range", "unnest", "read_csv", "read_csv_auto", "read_parquet", "json_each", "json_tree", "generate_subscripts", "regexp_matches", "string_split", "glob"}
 
 
 @dataclass
@@ -396,6 +402,7 @@ class _Resolver:
             self._sqlite_string_identifiers(tree)
         if analysis.variables:
             self._bind_variables(tree)
+        self._inline_scalar_functions(tree)
         try:
             self._expand_natural_joins(tree)
         except (SqlglotError, RecursionError, KeyError, AttributeError):
@@ -465,7 +472,7 @@ class _Resolver:
         analysis, catalog = self.analysis, self.catalog
         ident = node.this
         if not isinstance(ident, exp.Identifier):
-            analysis.table_functions.append(node.sql(dialect=self.dialect))
+            self._resolve_table_function(node, search_path, stack)
             return
         name = ident.name
         db_ident = node.args.get("db")
@@ -489,38 +496,13 @@ class _Resolver:
             return
 
         alias = node.args.get("alias")
+        if table.is_table_function:
+            written = node.copy()
+            written.set("alias", None)
+            analysis.unknown_tables.append({"name": written.sql(dialect=self.dialect), "suggestions": [f"{table.qualified_name}({', '.join(p for p, _ in table.parameters)})"], "inside_view": stack[-1] if stack else None, "reason": "a table function is called with arguments"})
+            return
         if table.is_view:
-            qualified = table.qualified_name
-            if qualified in stack:
-                raise OptimizeError(f"view {qualified} refers to itself")
-            if len(stack) >= MAX_VIEW_DEPTH:
-                raise OptimizeError(f"views are nested more than {MAX_VIEW_DEPTH} deep")
-            parsed = self.catalog.view_tree(table, self.dialect)
-            if parsed is None:
-                raise OptimizeError(f"the definition of view {qualified} could not be parsed")
-            inner, view_columns = parsed[0].copy(), parsed[1]
-            self._resolve_tables(inner, table.schema, stack + (qualified,))
-            if qualified not in analysis.views_used:
-                analysis.views_used.append(qualified)
-            if alias is None or not alias.this:
-                alias_ident = exp.to_identifier(name, quoted=bool(ident.args.get("quoted")))
-                columns = list(alias.columns) if alias is not None else []
-            else:
-                alias_ident = alias.this.copy()
-                columns = [c.copy() for c in alias.columns]
-            if not columns:
-                columns = [exp.to_identifier(c, quoted=True) for c in (view_columns or table.view_columns)]
-            subquery = exp.Subquery(
-                this=inner,
-                alias=exp.TableAlias(this=alias_ident, columns=columns or None),
-            )
-            subquery.meta["sqlgami_view"] = qualified
-            # In a parenthesised join group the joins hang off the first table; keep them.
-            for key in ("joins", "pivots", "laterals"):
-                carried = node.args.get(key)
-                if carried:
-                    subquery.set(key, carried)
-            node.replace(subquery)
+            self._expand(node, table, name, ident, alias, stack, {})
             return
 
         schema_key = catalog.storage_key(table.schema)
@@ -534,6 +516,109 @@ class _Resolver:
         node.set("db", exp.to_identifier(schema_key, quoted=True))
         node.set("catalog", None)
         analysis.tables[(schema_key, name_key)] = table
+
+    def _inline_scalar_functions(self, tree: exp.Expression) -> None:
+        """A scalar SQL function the host declared is a macro: its body replaces the call with the
+        arguments bound (so the checks see the expression), as the engine computes it. A JavaScript
+        function stays a call the fixtures cannot run; a qualified function the host never declared
+        is unknown — never a pass."""
+        analysis, catalog = self.analysis, self.catalog
+        for node in list(tree.find_all(exp.Anonymous)):
+            if isinstance(node.parent, exp.Table) and node.parent.this is node:
+                continue  # a table function: resolved as a table
+            name = str(node.name)
+            function = catalog.scalar_function(name)
+            if function is None:
+                if name.count(".") >= 1 and name.lower() not in analysis.unknown_functions:
+                    analysis.unknown_functions.append(name.lower())
+                continue
+            if function.body is None:
+                if function.qualified_name not in analysis.js_functions:
+                    analysis.js_functions.append(function.qualified_name)
+                continue
+            args = list(node.expressions)
+            if len(args) != len(function.parameters):
+                if name.lower() not in analysis.unknown_functions:
+                    analysis.unknown_functions.append(f"{name.lower()} ({len(function.parameters)} parameter(s), {len(args)} given)")
+                continue
+            try:
+                body = sqlglot.parse_one(f"SELECT {function.body}", read=self.dialect).expressions[0]
+            except Exception:
+                analysis.unknown_functions.append(f"{name.lower()} (its body does not parse)")
+                continue
+            body = _substitute_variables(body, {param: arg for (param, _), arg in zip(function.parameters, args)})
+            node.replace(exp.Paren(this=body))
+            if function.qualified_name not in analysis.inlined_functions:
+                analysis.inlined_functions.append(function.qualified_name)
+
+    def _resolve_table_function(self, node: exp.Table, search_path: list[str] | None, stack: tuple[str, ...]) -> None:
+        """``FROM f(args)``: a table function the catalogue declares is expanded like a view with
+        its arguments bound to its parameters; an engine built-in (generate_series, range) is
+        noted; anything else is an unknown table — never a pass."""
+        analysis, catalog = self.analysis, self.catalog
+        call = node.this
+        written = node.copy()
+        written.set("alias", None)
+        name_text = call.name if isinstance(call, exp.Anonymous) else call.sql_name() if isinstance(call, exp.Func) else ""
+        parts = [p for p in name_text.replace("`", "").split(".") if p]
+        table = None
+        if parts:
+            bare, schema = parts[-1], ".".join(parts[:-1]) or None
+            try:
+                table = catalog.resolve(bare, schema, quoted=True) or catalog.resolve(bare, schema, search_path=search_path)
+            except Exception:
+                table = None
+        if table is None or not table.is_table_function:
+            if self.dialect != "bigquery" and (len(parts) == 1 and parts[0].lower() in _BUILTIN_TABLE_FUNCTIONS or not isinstance(call, exp.Anonymous)):
+                analysis.table_functions.append(node.sql(dialect=self.dialect))  # the engine's own table function, as before
+                return
+            analysis.unknown_tables.append({"name": written.sql(dialect=self.dialect), "suggestions": catalog.suggest_tables(parts[-1] if parts else name_text), "inside_view": stack[-1] if stack else None, "reason": "no table function of this name is declared"})
+            return
+        args = list(call.expressions) if isinstance(call, (exp.Anonymous, exp.Func)) else []
+        if len(args) != len(table.parameters):
+            analysis.unknown_tables.append({"name": written.sql(dialect=self.dialect), "suggestions": [f"{table.qualified_name}({', '.join(p for p, _ in table.parameters)})"], "inside_view": stack[-1] if stack else None, "reason": f"{table.qualified_name} takes {len(table.parameters)} argument(s), {len(args)} given"})
+            return
+        bindings = {param: arg for (param, _), arg in zip(table.parameters, args)}
+        ident = exp.to_identifier(parts[-1] if parts else name_text, quoted=True)
+        self._expand(node, table, parts[-1] if parts else name_text, ident, node.args.get("alias"), stack, bindings)
+
+    def _expand(self, node: exp.Table, table: Any, name: str, ident: exp.Identifier, alias: Any, stack: tuple[str, ...], bindings: dict[str, exp.Expression]) -> None:
+        """Replace a view or table-function reference by its body as a subquery, so every check
+        applies inside it (with a table function's arguments bound to its parameters)."""
+        analysis = self.analysis
+        qualified = table.qualified_name
+        if qualified in stack:
+            raise OptimizeError(f"view {qualified} refers to itself")
+        if len(stack) >= MAX_VIEW_DEPTH:
+            raise OptimizeError(f"views are nested more than {MAX_VIEW_DEPTH} deep")
+        parsed = self.catalog.view_tree(table, self.dialect)
+        if parsed is None:
+            raise OptimizeError(f"the definition of view {qualified} could not be parsed")
+        inner, view_columns = parsed[0].copy(), parsed[1]
+        if bindings:
+            inner = _substitute_variables(inner, bindings)
+        self._resolve_tables(inner, table.schema, stack + (qualified,))
+        if qualified not in analysis.views_used:
+            analysis.views_used.append(qualified)
+        if alias is None or not alias.this:
+            alias_ident = exp.to_identifier(name, quoted=bool(ident.args.get("quoted")))
+            columns = list(alias.columns) if alias is not None else []
+        else:
+            alias_ident = alias.this.copy()
+            columns = [c.copy() for c in alias.columns]
+        if not columns:
+            columns = [exp.to_identifier(c, quoted=True) for c in (view_columns or table.view_columns)]
+        subquery = exp.Subquery(
+            this=inner,
+            alias=exp.TableAlias(this=alias_ident, columns=columns or None),
+        )
+        subquery.meta["sqlgami_view"] = qualified
+        # In a parenthesised join group the joins hang off the first table; keep them.
+        for key in ("joins", "pivots", "laterals"):
+            carried = node.args.get(key)
+            if carried:
+                subquery.set(key, carried)
+        node.replace(subquery)
 
     def _mapping_schema(self) -> MappingSchema:
         catalog = self.catalog

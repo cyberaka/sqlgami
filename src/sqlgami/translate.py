@@ -83,6 +83,8 @@ def constructs_of(tree: exp.Expression) -> set[str]:
     found: set[str] = set()
     for node in tree.walk():
         if isinstance(node, exp.Anonymous):
+            if isinstance(node.parent, exp.Table) and node.parent.this is node:
+                continue  # a table function call: the table map decides whether it is known
             found.add("func:" + str(node.name).upper())
         elif isinstance(node, exp.Func) and not isinstance(node, _OPERATORS):
             found.add("func:" + node.sql_name().upper())  # operators (+, =, AND) are not constructs
@@ -118,6 +120,18 @@ def map_tables(tree: exp.Expression, tables: Mapping[str, str] | None) -> dict[s
     ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
     done: dict[str, str] = {}
     for table in list(tree.find_all(exp.Table)):
+        call = table.this
+        if isinstance(call, exp.Anonymous):
+            # FROM `proj.ds.f`(args): the function maps like a table; its body lives in the
+            # fixtures as a table macro of the mapped name
+            key = str(call.name).strip("`").lower()
+            target = mapping.get(key)
+            if target is None and key.count(".") >= 2:
+                raise Untranslatable(f"table function {key} has no fixture table declared under tables:")
+            if target is not None:
+                call.set("this", exp.to_identifier(target, quoted=False))
+                done[key] = target
+            continue
         key = _table_key(table)
         if not key or key in ctes:
             continue
@@ -134,11 +148,47 @@ def map_tables(tree: exp.Expression, tables: Mapping[str, str] | None) -> dict[s
     return done
 
 
-def translate(sql: str | exp.Expression, dialect: str, tables: Mapping[str, str] | None = None, target: str = "duckdb") -> Translation:
+def inline_functions(tree: exp.Expression, functions: Mapping[str, Mapping[str, Any]], dialect: str) -> exp.Expression:
+    """Replace calls of the host's scalar SQL functions by their bodies with the arguments bound
+    (``functions``: qualified name -> {parameters: [[name, type], ...], body: expr, language}).
+    A JavaScript function cannot run on the fixtures: :class:`Untranslatable`."""
+    if not functions:
+        return tree
+    by_name = {str(k).strip("`").lower(): v for k, v in functions.items()}
+
+    def lookup(name: str) -> Mapping[str, Any] | None:
+        key = name.strip("`").lower()
+        if key in by_name:
+            return by_name[key]
+        parts = key.split(".")
+        if len(parts) >= 3 and ".".join(parts[-2:]) in by_name:
+            return by_name[".".join(parts[-2:])]
+        return None
+
+    from .analysis import _substitute_variables
+
+    for node in list(tree.find_all(exp.Anonymous)):
+        if isinstance(node.parent, exp.Table) and node.parent.this is node:
+            continue
+        spec = lookup(str(node.name))
+        if spec is None:
+            continue
+        if spec.get("language", "sql") != "sql" or not spec.get("body"):
+            raise Untranslatable(f"{spec.get('language', 'javascript')} function {node.name}")
+        params = [p[0] for p in spec.get("parameters") or []]
+        if len(params) != len(node.expressions):
+            raise Untranslatable(f"function {node.name} called with {len(node.expressions)} argument(s), declared with {len(params)}")
+        body = sqlglot.parse_one(f"SELECT {spec['body']}", read=dialect).expressions[0]
+        node.replace(exp.Paren(this=_substitute_variables(body, dict(zip(params, node.expressions)))))
+    return tree
+
+
+def translate(sql: str | exp.Expression, dialect: str, tables: Mapping[str, str] | None = None, target: str = "duckdb", functions: Mapping[str, Mapping[str, Any]] | None = None) -> Translation:
     """``sql`` (text, or a parsed tree) in ``dialect`` as DuckDB SQL, or :class:`Untranslatable`."""
     if dialect == target:
         return Translation(sql if isinstance(sql, str) else sql.sql(dialect=target))
     tree = sqlglot.parse_one(sql, read=dialect) if isinstance(sql, str) else sql.copy()
+    tree = inline_functions(tree, functions or {}, dialect)
     used = constructs_of(tree)
     allowed = VERIFIED.get(dialect, CORE)
     unverified = sorted(c for c in used if c not in allowed)

@@ -358,6 +358,8 @@ def _stages(
     if prepared.disabled_filters:
         report.signals["disabled_filters"] = list(prepared.disabled_filters)
     analysis = A.analyse(prepared.analysis_sql, catalog, dialect, options.allowed_functions, options.allowed_tables)
+    if analysis.inlined_functions or analysis.js_functions:
+        report.signals["functions"] = {"inlined": list(analysis.inlined_functions), "javascript": list(analysis.js_functions)}
     if analysis.script_statements:
         report.signals["script"] = {
             "statements": list(analysis.script_statements),
@@ -439,17 +441,30 @@ def _stages(
     schema_findings: list[Finding] = []
     if catalog is None:
         _stage(report, "schema", StageStatus.SKIPPED, "no schema or database connection was supplied")
-    elif analysis.unknown_tables or analysis.unknown_columns or analysis.ambiguous_columns:
+    elif analysis.unknown_tables or analysis.unknown_columns or analysis.ambiguous_columns or analysis.unknown_functions:
         for item in analysis.unknown_tables:
             hint = f" Did you mean {', '.join(item['suggestions'])}?" if item["suggestions"] else ""
             inside = f" (referenced inside view {item['inside_view']})" if item.get("inside_view") else ""
+            reason = f" {item['reason']}." if item.get("reason") else ""
+            what = "Table function" if "(" in str(item["name"]) else "Table"
             schema_findings.append(
                 Finding(
                     "unknown_table",
                     Severity.ERROR,
-                    f"Table {item['name']} does not exist{inside}.{hint}",
+                    f"{what} {item['name']} does not exist{inside}.{reason}{hint}",
                     "schema",
                     evidence=item,
+                )
+            )
+        for name in analysis.unknown_functions:
+            schema_findings.append(
+                Finding(
+                    "unknown_function",
+                    Severity.ERROR,
+                    f"Function {name} is not declared in the schema (CREATE FUNCTION), so the query cannot be judged or run.",
+                    "schema",
+                    suggestion="Add the function's CREATE FUNCTION statement to the schema the scorer is given.",
+                    evidence={"function": name},
                 )
             )
         for item in analysis.unknown_columns:
@@ -476,6 +491,19 @@ def _stages(
             )
         report.findings.extend(schema_findings)
         _stage(report, "schema", StageStatus.FAILED, schema_findings[0].message, clock.lap())
+    elif analysis.resolved is None and analysis.resolve_error and ("nested more than" in analysis.resolve_error or "refers to itself" in analysis.resolve_error):
+        report.findings.append(
+            Finding(
+                "view_nesting",
+                Severity.HIGH,
+                f"The views and table functions this statement reads cannot be expanded: {analysis.resolve_error}. "
+                "Nothing inside them was checked.",
+                "schema",
+                suggestion="Flatten the deepest views, or raise the limit knowingly.",
+                evidence={"error": analysis.resolve_error},
+            )
+        )
+        _stage(report, "schema", StageStatus.FAILED, analysis.resolve_error, clock.lap())
     elif analysis.resolved is None:
         detail = analysis.resolve_error or "the statement could not be analysed"
         report.findings.append(
@@ -640,6 +668,11 @@ def _fixture_stage(
     if any(f.severity == Severity.ERROR for f in report.findings):
         _stage(report, name, StageStatus.NOT_RUN, "the statement cannot run")
         return
+    javascript = (report.signals.get("functions") or {}).get("javascript") or []
+    if javascript:
+        report.signals["fixtures"] = {"verdict": "unverified", "untranslatable": f"javascript function {javascript[0]}", "fixtures": []}
+        _stage(report, name, StageStatus.NOT_RUN, f"untranslatable: javascript function {javascript[0]}: a JavaScript function cannot run on the fixture engine")
+        return
     from . import bundle as B
 
     matched_terms: list[str] = []
@@ -717,9 +750,15 @@ def _fixture_stage(
     # script variable is known here, before any fixture is touched.
     from .translate import Untranslatable
 
+    unsupported = [v for v in (report.signals.get("views_expanded") or []) if __import__("sqlgami.fixtures", fromlist=["logical_name"]).logical_name(v) in bundle.untranslatable_views]
+    if unsupported:
+        construct = bundle.untranslatable_views[__import__("sqlgami.fixtures", fromlist=["logical_name"]).logical_name(unsupported[0])]
+        report.signals["fixtures"] = {**outcome, "verdict": "unverified", "untranslatable": construct, "fixtures": []}
+        _stage(report, name, StageStatus.NOT_RUN, f"untranslatable: {construct}: the body of {unsupported[0]} uses a construct whose translation to the fixture engine is not verified", clock.lap())
+        return
     try:
-        executable = B._executable(sql, dialect, live_params, live_slots, bundle.tables or None)
-        reference_executable = B._executable(reference.sql, dialect, live_params, live_slots, bundle.tables or None) if not same_values else None
+        executable = B._executable(sql, dialect, live_params, live_slots, bundle.tables or None, bundle.functions or None)
+        reference_executable = B._executable(reference.sql, dialect, live_params, live_slots, bundle.tables or None, bundle.functions or None) if not same_values else None
     except Untranslatable as exc:
         why = str(exc) if "script variable" in str(exc) else f"{exc}: the translation of this construct to the fixture engine is not verified"
         report.signals["fixtures"] = {**outcome, "verdict": "unverified", "untranslatable": exc.construct, "fixtures": [{"fixture": e["name"], "status": "untranslatable", "reason": str(exc)} for e in bundle.fixture_order()[:1]]}

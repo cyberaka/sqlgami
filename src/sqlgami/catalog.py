@@ -19,6 +19,7 @@ from .errors import CatalogError
 
 TABLE = "table"
 VIEW = "view"
+TABLE_FUNCTION = "table_function"  # CREATE TABLE FUNCTION f(p ...) AS SELECT ...: a view with parameters
 MATERIALIZED_VIEW = "materialized_view"
 
 # Dialects where a quoted identifier keeps its case and an unquoted one folds to lower case.
@@ -86,10 +87,16 @@ class Table:
     partition_columns: tuple[str, ...] = ()
     # For a periodic snapshot table (one row per thing per snapshot): the snapshot date column.
     snapshot_column: str | None = None
+    # A table function's declared parameters, in order: (name, declared type).
+    parameters: tuple[tuple[str, str], ...] = ()
 
     @property
     def is_view(self) -> bool:
         return self.kind in (VIEW, MATERIALIZED_VIEW)
+
+    @property
+    def is_table_function(self) -> bool:
+        return self.kind == TABLE_FUNCTION
 
     @property
     def qualified_name(self) -> str:
@@ -266,6 +273,8 @@ class Catalog:
         self.soft_delete_column = soft_delete_column
         # Host names for catalogue tables (```proj-x.hr.snapshot``` -> hr.snapshot), declared, never guessed.
         self.table_aliases: dict[str, str] = {}
+        # Scalar SQL and JavaScript functions the host declared (CREATE FUNCTION), by qualified name.
+        self.scalar_functions: dict[str, ScalarFunction] = {}
         if soft_delete_policy not in ("advisory", "required"):
             raise CatalogError("soft_delete_policy must be 'advisory' or 'required'")
         self.soft_delete_policy = soft_delete_policy
@@ -452,6 +461,21 @@ class Catalog:
         ]
         return self._get(matches[0]) if len(matches) == 1 else None
 
+    def scalar_function(self, name: str) -> "ScalarFunction | None":
+        """A declared scalar function by the name a query writes (```proj.ds.g```, ``ds.g`` or
+        ``g`` when unambiguous); None when the host declared none of that name."""
+        key = name.strip("`").lower()
+        found = self.scalar_functions.get(key)
+        if found is not None:
+            return found
+        parts = key.split(".")
+        if len(parts) >= 3:
+            found = self.scalar_functions.get(".".join(parts[-2:]))
+            if found is not None:
+                return found
+        matches = [f for k, f in self.scalar_functions.items() if k.split(".")[-1] == parts[-1] and (len(parts) == 1 or k.endswith("." + ".".join(parts[-2:])) or k.endswith(key))]
+        return matches[0] if len(matches) == 1 else None
+
     def column(self, table: Table, name: str, quoted: bool = False) -> Column | None:
         key = self.column_reference_key(name, quoted)
         for column in table.columns:
@@ -636,6 +660,14 @@ class Catalog:
                 view = _view_from_create(statement, dialect)
                 if view is not None:
                     catalog.add(view)
+            elif kind == "FUNCTION":
+                function = _table_function_from_create(statement, dialect)
+                if function is not None:
+                    catalog.add(function)
+                else:
+                    scalar = _scalar_function_from_create(statement, dialect)
+                    if scalar is not None:
+                        catalog.scalar_functions[scalar.qualified_name.lower()] = scalar
             elif kind == "INDEX" and statement.args.get("unique"):
                 pending_indexes.append(statement)
         for statement in pending_indexes:
@@ -801,6 +833,72 @@ def _view_from_create(statement: exp.Create, dialect: str) -> Table | None:
         kind=MATERIALIZED_VIEW if materialized else VIEW,
         definition=statement.expression.sql(dialect=dialect),
         view_columns=view_columns,
+    )
+
+
+@dataclass
+class ScalarFunction:
+    """``CREATE FUNCTION ds.g(x INT64) RETURNS INT64 AS (expr)``, or a JavaScript one."""
+
+    name: str
+    schema: str | None
+    parameters: tuple[tuple[str, str], ...] = ()
+    body: str | None = None  # the SQL expression, for a SQL function; None for JavaScript
+    language: str = "sql"
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}" if self.schema else self.name
+
+
+def _scalar_function_from_create(statement: exp.Create, dialect: str) -> ScalarFunction | None:
+    target = statement.this
+    if not isinstance(target, exp.UserDefinedFunction) or not isinstance(target.this, exp.Table):
+        return None
+    parameters = tuple(
+        (item.name.lower(), item.args["kind"].sql(dialect=dialect) if item.args.get("kind") is not None else "")
+        for item in (target.expressions or []) if isinstance(item, exp.ColumnDef)
+    )
+    properties = statement.args.get("properties")
+    language = "sql"
+    if properties is not None:
+        for prop in properties.expressions:
+            if isinstance(prop, exp.LanguageProperty):
+                language = prop.name.lower()
+    body = statement.expression
+    if language != "sql" or body is None or isinstance(body, exp.RawString):
+        return ScalarFunction(target.this.name, schema_name_of(target.this, dialect), parameters, None, language if language != "sql" else "js")
+    while isinstance(body, exp.Paren):
+        body = body.this
+    return ScalarFunction(target.this.name, schema_name_of(target.this, dialect), parameters, body.sql(dialect=dialect), "sql")
+
+
+def _table_function_from_create(statement: exp.Create, dialect: str) -> Table | None:
+    """``CREATE TABLE FUNCTION ds.f(p INT64, …) AS SELECT …`` (BigQuery's own DDL wraps the body in
+    parentheses): a view with parameters. A scalar function (``RETURNS … AS (expr)``) is not a
+    table and is left out."""
+    target = statement.this
+    expression = statement.expression
+    while isinstance(expression, (exp.Subquery, exp.Paren)) and isinstance(expression.this, exp.Expression):
+        expression = expression.this
+    if not isinstance(target, exp.UserDefinedFunction) or not isinstance(expression, exp.Query):
+        return None
+    statement = statement.copy()
+    statement.set("expression", expression)
+    name = target.this
+    if not isinstance(name, exp.Table):
+        return None
+    parameters: list[tuple[str, str]] = []
+    for item in target.expressions or []:
+        if isinstance(item, exp.ColumnDef):
+            kind = item.args.get("kind")
+            parameters.append((item.name.lower(), kind.sql(dialect=dialect) if kind is not None else ""))
+    return Table(
+        name=name.name,
+        schema=schema_name_of(name, dialect),
+        kind=TABLE_FUNCTION,
+        definition=statement.expression.sql(dialect=dialect),
+        parameters=tuple(parameters),
     )
 
 

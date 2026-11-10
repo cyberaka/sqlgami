@@ -369,3 +369,151 @@ def test_pilot_template_initialises_passes_the_doctor_and_compiles(tmp_path):
     (tmp_path / "pilot" / "terms" / "Terms.csv").write_text("term,phrases,kind,table,sql,nulls,description\nactive,active,filtr,hr.emp_period_snapshot,status_cd = 'A',,\n")
     broken = diagnose(tmp_path / "pilot" / "sqlgami.yaml")
     assert not broken.ok and any("kind" in p for p in broken.problems)
+
+
+TVF_DDL = """
+CREATE TABLE `proj-x.shop.customers` (id INT64, name STRING, region STRING, PRIMARY KEY (id) NOT ENFORCED);
+CREATE TABLE `proj-x.shop.orders` (id INT64, customer_id INT64, total NUMERIC, status STRING, created_at DATE, PRIMARY KEY (id) NOT ENFORCED, FOREIGN KEY (customer_id) REFERENCES `proj-x.shop.customers` (id) NOT ENFORCED);
+CREATE VIEW `proj-x.shop.paid_orders` AS SELECT * FROM `proj-x.shop.orders` WHERE status = 'paid';
+CREATE VIEW `proj-x.shop_reports.recent_paid` AS SELECT o.id, o.customer_id, o.total, o.created_at FROM `proj-x.shop.paid_orders` AS o WHERE o.created_at >= DATE '2024-01-01';
+CREATE TABLE FUNCTION `proj-x.shop.region_orders`(which STRING, since DATE) AS
+  SELECT o.id, o.customer_id, o.total, c.region FROM `proj-x.shop.orders` AS o JOIN `proj-x.shop.customers` AS c ON c.id = o.customer_id
+  WHERE c.region = which AND o.created_at >= since;
+CREATE TABLE FUNCTION `proj-x.shop.tagged`(tags ARRAY<STRING>) AS
+  SELECT c.id, t FROM `proj-x.shop.customers` AS c, UNNEST(tags) AS t;
+"""
+
+
+@pytest.fixture(scope="module")
+def tvf_bundle(tmp_path_factory):
+    from sqlgami.bundle import compile_bundle
+
+    tmp = tmp_path_factory.mktemp("tvf")
+    (tmp / "schema.sql").write_text(TVF_DDL)
+    (tmp / "terms").mkdir()
+    (tmp / "terms" / "Terms.csv").write_text("term,phrases,kind,table,sql,nulls,description\npaid,paid,filter,shop.orders,status = 'paid',,\n")
+    (tmp / "terms" / "Examples.csv").write_text(
+        "id,question,params,correct_sql,expected_result,dataset\n"
+        'by_region,Paid order total per customer in the north since 2024,,"SELECT customer_id, SUM(total) AS spend FROM `proj-x.shop.region_orders`(\'north\', DATE \'2024-01-01\') GROUP BY customer_id",,\n'
+        'recent,Recent paid order count,,"SELECT COUNT(*) AS n FROM `proj-x.shop_reports.recent_paid`",,\n'
+    )
+    (tmp / "sqlgami.yaml").write_text(
+        "dialect: bigquery\nschema: schema.sql\nterms: terms\n"
+        "fixtures: {seed: 4, profiles: [clean, nulls], rows: {shop.customers: 8, shop.orders: 60}, values: {shop.orders.status: [paid, open], shop.customers.region: [north, south]}, dates: {start: '2023-06-01', end: '2024-12-31'}}\n"
+    )
+    compile_bundle(tmp / "sqlgami.yaml", tmp / "bundle")
+    return tmp / "bundle"
+
+
+def test_table_functions_and_nested_views_are_read_expanded_gated_and_run_on_fixtures(tvf_bundle):
+    """A CREATE TABLE FUNCTION is a view with parameters: declared from DDL, expanded with the
+    caller's arguments so every check applies inside, refused when unknown or mis-called, and
+    materialised in the fixtures as a table macro through the verified translation. Views over
+    views and a cross-dataset view resolve through the logical name."""
+    import json
+
+    from sqlgami import Catalog, Scorer
+    from sqlgami.report import StageStatus
+
+    catalog = Catalog.from_ddl(TVF_DDL, "bigquery")
+    fn = catalog.resolve("region_orders", "proj-x.shop")
+    assert fn is not None and fn.is_table_function and fn.parameters == (("which", "STRING"), ("since", "DATE"))
+    manifest = json.loads((tvf_bundle / "manifest.json").read_text())
+    assert manifest["references"] == 2 and manifest["rejected"] == 0, manifest
+    from sqlgami.fixtures import Fixture
+
+    ddl = Fixture.read(tvf_bundle / "fixtures" / "clean-s4").ddl
+    assert "CREATE MACRO shop.region_orders(which, since) AS TABLE" in ddl and "CREATE VIEW shop_reports.recent_paid" in ddl, ddl
+    with Scorer("bigquery", catalog=TVF_DDL, bundle=tvf_bundle, required_predicates=[{"name": "paid_only", "tables": ["shop.orders"], "match": "all", "columns": ["status"]}]) as scorer:
+        same = scorer.explain("SELECT customer_id, SUM(total) AS spend FROM `proj-x.shop.region_orders`('north', DATE '2024-01-01') GROUP BY customer_id", "Paid order total per customer in the north since 2024")
+        assert same.signals["views_expanded"] == ["proj-x.shop.region_orders"]
+        assert same.signals["fixtures"]["verdict"] == "match", same.summary()
+        # another argument changes the result: a verdict through the macro, with the arguments
+        other = scorer.explain("SELECT customer_id, SUM(total) AS spend FROM `proj-x.shop.region_orders`('south', DATE '2024-01-01') GROUP BY customer_id", "Paid order total per customer in the north since 2024")
+        assert other.signals["fixtures"]["verdict"] == "mismatch"
+        # the policy applies inside the body: the function filters region, not status, so the status policy is missing
+        assert same.has("required_predicate")
+        unknown = scorer.explain("SELECT COUNT(*) FROM `proj-x.shop.other_fn`('north') AS o", "orders in the north")
+        assert unknown.has("unknown_table") and unknown.verdict.value == "invalid"
+        arity = scorer.explain("SELECT COUNT(*) FROM `proj-x.shop.region_orders`('north') AS o", "orders in the north")
+        assert arity.has("unknown_table") and "takes 2 argument(s)" in next(f.message for f in arity.findings if f.code == "unknown_table")
+        nested = scorer.explain("SELECT COUNT(*) AS n FROM `proj-x.shop_reports.recent_paid`", "Recent paid order count")
+        assert set(nested.signals["views_expanded"]) == {"proj-x.shop_reports.recent_paid", "proj-x.shop.paid_orders"} and nested.signals["fixtures"]["verdict"] == "match"
+        arrays = scorer.explain("SELECT id, t FROM `proj-x.shop.tagged`(['vip', 'new']) ORDER BY id, t", "customers with tags")
+        assert arrays.signals["views_expanded"] == ["proj-x.shop.tagged"] and arrays.stage("fixtures").status in (StageStatus.NOT_RUN, StageStatus.SKIPPED, StageStatus.PASSED)
+
+
+INFO_SCHEMA_DUMP = """
+CREATE TABLE `proj-x.shop.customers`
+(
+  id INT64 NOT NULL,
+  name STRING OPTIONS(description="display name"),
+  region STRING
+)
+OPTIONS(
+  description="customers",
+  labels=[("team", "sales")]
+);
+CREATE TABLE `proj-x.shop.orders`
+(
+  id INT64 NOT NULL,
+  customer_id INT64,
+  total NUMERIC,
+  status STRING,
+  created_at DATE
+)
+PARTITION BY created_at
+CLUSTER BY customer_id;
+CREATE VIEW `proj-x.shop.paid_orders`
+OPTIONS(
+  description="paid only"
+)
+AS SELECT * FROM `proj-x.shop.orders` WHERE status = 'paid';
+CREATE TABLE FUNCTION `proj-x.shop.region_orders`(which STRING) AS (
+  SELECT o.id, o.customer_id, o.total FROM `proj-x.shop.paid_orders` AS o JOIN `proj-x.shop.customers` AS c ON c.id = o.customer_id WHERE c.region = which
+);
+CREATE TABLE FUNCTION `proj-x.shop_reports.big_region_orders`(which STRING, floor NUMERIC) AS (
+  SELECT * FROM `proj-x.shop.region_orders`(which) WHERE total >= floor
+);
+CREATE VIEW `proj-x.shop_reports.north_big` AS SELECT customer_id, total FROM `proj-x.shop_reports.big_region_orders`('north', 50);
+CREATE FUNCTION `proj-x.shop.pct`(a NUMERIC, b NUMERIC) RETURNS FLOAT64 AS (
+  SAFE_DIVIDE(a, b) * 100
+);
+CREATE FUNCTION `proj-x.shop.shout`(x STRING) RETURNS STRING LANGUAGE js AS r\"\"\"
+  return x.toUpperCase();
+\"\"\";
+"""
+
+
+def test_information_schema_dump_nesting_and_scalar_functions(tmp_path):
+    """BigQuery's own DDL (OPTIONS, PARTITION/CLUSTER, parenthesised bodies, LANGUAGE js) is read
+    as a host would dump it; a view over a TVF over a TVF over a view resolves to the base tables;
+    a scalar SQL function is inlined as a macro, a JavaScript one keeps the fixtures from running,
+    an undeclared qualified function is an ERROR; nesting beyond the limit is a clear finding."""
+    from sqlgami import Catalog, Scorer
+    from sqlgami.bundle import compile_bundle
+    from sqlgami.report import StageStatus
+
+    catalog = Catalog.from_ddl(INFO_SCHEMA_DUMP, "bigquery")
+    assert catalog.resolve("big_region_orders", "proj-x.shop_reports").is_table_function
+    assert catalog.scalar_function("`proj-x.shop.pct`").body == "SAFE_DIVIDE(a, b) * 100" and catalog.scalar_function("proj-x.shop.shout").language == "js"
+    (tmp_path / "schema.sql").write_text(INFO_SCHEMA_DUMP)
+    (tmp_path / "sqlgami.yaml").write_text("dialect: bigquery\nschema: schema.sql\nfixtures: {seed: 4, profiles: [clean], rows: {shop.customers: 8, shop.orders: 60}, values: {shop.orders.status: [paid, open], shop.customers.region: [north, south]}}\nreferences:\n  - {key: nb, question: north big orders per customer, sql: \"SELECT customer_id, SUM(total) AS t FROM `proj-x.shop_reports.north_big` GROUP BY customer_id\"}\n")
+    bundle = compile_bundle(tmp_path / "sqlgami.yaml", tmp_path / "bundle")
+    assert bundle.manifest["references"] == 1 and bundle.manifest["rejected"] == 0 and "proj-x.shop.pct" in bundle.manifest["functions"]
+    with Scorer("bigquery", catalog=INFO_SCHEMA_DUMP, bundle=tmp_path / "bundle") as scorer:
+        nested = scorer.explain("SELECT customer_id, SUM(total) AS t FROM `proj-x.shop_reports.north_big` GROUP BY customer_id", "north big orders per customer")
+        assert set(nested.signals["views_expanded"]) == {"proj-x.shop_reports.north_big", "proj-x.shop_reports.big_region_orders", "proj-x.shop.region_orders", "proj-x.shop.paid_orders"}
+        assert nested.signals["fixtures"]["verdict"] == "match", nested.summary()
+        inlined = scorer.explain("SELECT customer_id, `proj-x.shop.pct`(SUM(total), 1000) AS share FROM `proj-x.shop_reports.north_big` GROUP BY customer_id", "share of north big orders per customer")
+        assert inlined.signals["functions"]["inlined"] == ["proj-x.shop.pct"] and not inlined.has("unknown_function")
+        assert inlined.stage("fixtures").status in (StageStatus.PASSED, StageStatus.NOT_RUN) and "untranslatable" not in (inlined.stage("fixtures").detail or "")
+        js = scorer.explain("SELECT `proj-x.shop.shout`(name) AS n FROM `proj-x.shop.customers`", "customer names in capitals")
+        assert js.signals["functions"]["javascript"] == ["proj-x.shop.shout"]
+        assert js.stage("fixtures").status == StageStatus.NOT_RUN and "javascript function proj-x.shop.shout" in (js.stage("fixtures").detail or "")
+        unknown = scorer.explain("SELECT `proj-x.shop.mystery`(name) AS n FROM `proj-x.shop.customers`", "names")
+        assert unknown.has("unknown_function") and unknown.verdict.value == "invalid"
+    deep = INFO_SCHEMA_DUMP + "".join(f"CREATE VIEW `proj-x.shop.v{i}` AS SELECT * FROM `proj-x.shop.v{i-1 if i > 0 else 'x'}`;\n".replace("vx", "paid_orders") for i in range(0, 36))
+    report = Scorer("bigquery", catalog=deep).explain("SELECT COUNT(*) FROM `proj-x.shop.v35`", "count")
+    finding = next(f for f in report.findings if f.code == "view_nesting")
+    assert finding.severity.value == "high" and "nested more than" in finding.message and report.score <= 0.4

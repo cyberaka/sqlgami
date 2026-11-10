@@ -291,19 +291,24 @@ def _tables(catalog: Catalog) -> dict[str, Table]:
     for qualified in catalog.table_names():
         schema, _, name = qualified.rpartition(".")
         table = catalog.resolve(name, schema or None, quoted=True) or catalog.resolve(name, schema or None)
-        if table is not None and not table.is_view:
+        if table is not None and not table.is_view and not table.is_table_function:
             found[logical_name(qualified)] = table
     return found
 
 
 def _views(catalog: Catalog) -> dict[str, Table]:
+    """Views and table functions: both are a body the fixture must carry (a view as CREATE VIEW,
+    a table function as a DuckDB table macro)."""
     found: dict[str, Table] = {}
     for qualified in catalog.table_names():
         schema, _, name = qualified.rpartition(".")
         table = catalog.resolve(name, schema or None, quoted=True) or catalog.resolve(name, schema or None)
-        if table is not None and table.is_view and table.definition:
+        if table is not None and (table.is_view or table.is_table_function) and table.definition:
             found[logical_name(qualified)] = table
     return found
+
+
+UNTRANSLATABLE_VIEWS: dict[str, str] = {}  # logical view/function name -> the construct that kept it out of the last fixture build
 
 
 def _view_ddl(catalog: Catalog) -> list[str]:
@@ -311,6 +316,7 @@ def _view_ddl(catalog: Catalog) -> list[str]:
     from .catalog import view_query_from_sql
 
     views = _views(catalog)
+    UNTRANSLATABLE_VIEWS.clear()
     pending: dict[str, str] = {}
     for qualified, table in views.items():
         parsed = view_query_from_sql(table.definition or "", catalog.dialect)
@@ -330,8 +336,23 @@ def _view_ddl(catalog: Catalog) -> list[str]:
                     if isinstance(part, sqlglot.exp.Identifier):
                         part.set("quoted", False)  # a backticked or double-quoted name is the same table
                         part.set("this", part.name.lower())
-            query = tree.sql(dialect="duckdb")
+            if catalog.dialect != "duckdb":
+                from .translate import Untranslatable, translate
+
+                own = {q.strip("`").lower(): logical_name(q) for q in catalog.table_names() if q.count(".") >= 2}
+                functions = {k: {"parameters": [list(p) for p in f.parameters], "body": f.body, "language": f.language} for k, f in getattr(catalog, "scalar_functions", {}).items()}
+                try:
+                    query = translate(tree, catalog.dialect, own or None, functions=functions or None).sql
+                except Untranslatable as exc:
+                    UNTRANSLATABLE_VIEWS[qualified] = exc.construct
+                    continue
+            else:
+                query = tree.sql(dialect="duckdb")
         except Exception:
+            continue
+        if table.is_table_function:
+            params = ", ".join(p for p, _ in table.parameters)
+            pending[qualified] = f"CREATE MACRO {qualified}({params}) AS TABLE {query}"
             continue
         column_list = f" ({', '.join(columns)})" if columns else ""
         pending[qualified] = f"CREATE VIEW {qualified}{column_list} AS {query}"
@@ -600,7 +621,7 @@ def _ddl(catalog: Catalog, tables: Sequence[Table], qualified: Sequence[str]) ->
 
     statements: list[str] = []
     types: dict[str, list[str]] = {}
-    schemas = sorted({q.rpartition(".")[0] for q in qualified if "." in q})
+    schemas = sorted({q.rpartition(".")[0] for q in qualified if "." in q} | {v.rpartition(".")[0] for v in _views(catalog) if "." in v})
     for schema in schemas:
         statements.append(f"CREATE SCHEMA IF NOT EXISTS {schema}")
     for table, name in zip(tables, qualified):
