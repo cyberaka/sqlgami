@@ -3,9 +3,9 @@
   {
    "source": "/Users/cyberaka/shared/sqlgami-bench/hr_snapshot",
    "files": {
-    "suite.yaml": "c417af80c173f7b12a5d9c401d471770",
-    "glossary.yaml": "85618bf9b052d61baccdf18da15183b7",
-    "generate.py": "9342accde198a88d9520185ce9485fc7"
+    "suite.yaml": "45a9a525fc351d692768551ece347ef1",
+    "glossary.yaml": "a15f57884af3c31f053d182b1633ebef",
+    "generate.py": "903dbec6abe28ebc1df7057b300bd785"
    }
   }
  ]

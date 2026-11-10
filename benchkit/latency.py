@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from sqlgami import Scorer
+from sqlgami import Options, Scorer
 
 from . import build
 from .suite import Suite
@@ -67,7 +67,7 @@ def measure(
     glossary_file = suite.path / "glossary.yaml"
     glossary = glossary_file.read_text(encoding="utf-8") if glossary_file.exists() else None
     terms = suite.terms_source(engine)
-    kwargs: dict[str, Any] = dict(glossary=glossary, terms=str(terms) if terms else None, **config)
+    kwargs: dict[str, Any] = dict(glossary=glossary, terms=str(terms) if terms else None, options=Options(deadline_ms=None), **config)
     statements = [(q.gold(engine), q.question, q.param_values() or None) for q in suite.questions if q.gold(engine)]
     if lines:
         statements = [(stretch(sql, lines), question, params) for sql, question, params in statements]

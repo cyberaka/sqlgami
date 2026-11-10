@@ -1,0 +1,13 @@
+name,type,example_values
+manager_id,integer,12003;52002
+n,integer,8;13;26;90;180
+m,integer,25
+assoc_id,input,
+rate,input,
+current,input,
+prior,input,
+new_hires,input,
+termed_90,input,
+termed_180,input,
+leavers,input,
+headcount_start,input,

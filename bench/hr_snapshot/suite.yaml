@@ -48,11 +48,12 @@ seeds:
   - {seed: 44, profile: nasty}
   - {seed: 45, profile: clean}  # pooled person-id hierarchy; 12003 is a manager employee
   - {seed: 46, profile: nasty}  # pooled person-id hierarchy; 12003 is a manager employee
-  - {seed: 47, profile: nasty}  # pooled; fn-only on-leave person exposes AND/OR precedence
+  - {seed: 47, profile: nasty}  # pooled; fn-only on-leave person
+  - {seed: 48, profile: nasty}  # pooled; rep-side on-leave people (lvl_3_id=12003)
 
-seed_45_46_47_pooling:
+seed_45_46_47_48_pooling:
   rule: >
-    On seeds 45, 46 and 47 ONLY, hierarchy node_ids are drawn from a shared pool of
+    On seeds 45, 46, 47 and 48 ONLY, hierarchy node_ids are drawn from a shared pool of
     person assoc_ids (the same assoc_ids that appear in hr.employee_dim). The reporting
     and functional chains both draw from this pool, so a single person_id can appear as
     a node in BOTH chains at potentially different levels. Employees' assoc_ids on
@@ -62,22 +63,32 @@ seed_45_46_47_pooling:
   default_manager_scope:
     manager_id: 12003
     placement: >
-      On seeds 45/46/47, 12003 is placed at reporting LVL_3 (big subtree) AND functional
-      LVL_7 (single leaf). Some associates match {manager_id}=12003 only via the _fn
-      chain, exposing the missing-_fn-set trap.
+      On seeds 45/46/47/48, 12003 is placed at reporting LVL_3 (big subtree) AND
+      functional LVL_7 (single leaf). Some associates match {manager_id}=12003 only via
+      the _fn chain, exposing the missing-_fn-set trap.
   mid_year_churn: >
-    On seeds 45/46/47 under 12003's reporting subtree: 10 "long-term loyal", 10 "recent
-    layoffs" (term ~100-200 days ago), and 10 mid-year hires at 346-355 days ago. The
-    layoffs make year-over-year growth negative on seed 45; the mid-year hires span the
-    350-vs-364-day boundary.
+    On seeds 45/46/47/48 under 12003's reporting subtree: 10 "long-term loyal", 10
+    "recent layoffs" (term ~100-200 days ago), and 10 mid-year hires at 346-355 days
+    ago. The layoffs make year-over-year growth negative on seed 45; the mid-year
+    hires span the 350-vs-364-day boundary.
   seed_47_onleave: >
     On seed 47 ONLY: one of the fn-only employees (the smallest assoc_id among the 8
     fn-only matches) is pinned to hire ~3 years ago, no term_dt in hr.employee_dim,
     and status_cd='L' on the current authoritative snapshot (snap_dt = period_end_dt
     = current PPE). This person's rep-chain columns never equal {manager_id}=12003
-    at any level; their only match to 12003 is lvl_7_id_fn. Exposes the AND/OR
-    precedence bug `WHERE lvl_7_id_fn = m OR ... = m AND status_cd != 'L'`, where
-    unparenthesised AND binds only to one disjunct.
+    at any level; their only match to 12003 is lvl_7_id_fn. Exposes the precedence
+    bug variant where the status filter is AND-bound to the FIRST scope disjunct
+    (status != 'L' AND lvl_2_id = m OR ... OR lvl_7_id_fn = m), letting this person
+    leak through on the lvl_7_id_fn disjunct.
+  seed_48_onleave: >
+    On seed 48 ONLY: three employees whose reporting chain has lvl_3_id = {manager_id}
+    = 12003 and whose functional chain does NOT include 12003 at any level are pinned
+    to hire ~3 years ago, no term_dt in hr.employee_dim, and status_cd='L' on the
+    current authoritative snapshot (snap_dt = period_end_dt = current PPE). Their only
+    match to 12003 is via rep-side columns (specifically lvl_3_id). Exposes gemma's
+    precedence bug variant where the status filter is AND-bound to the LAST disjunct
+    (... OR lvl_7_id_fn = m AND status_cd != 'L'), letting these three rep-side
+    on-leave people leak through on the rep disjuncts that admit all status codes.
 
 row_budget:
   clean_seed_1: 35149    # 156 + 1112 + 250 + 33606 + 15 + 10 + 5 (ref)
@@ -86,6 +97,7 @@ row_budget:
   clean_seed_45: 41389   # 156 + 378 + 300 + 40851 + 30 (ref totals)
   nasty_seed_46: 39772   # 156 + 373 + 301 + 39112 + 30 (ref totals)
   nasty_seed_47: 41439   # 156 + 371 + 301 + 40584 + 27 (ref totals: 12 + 10 + 5)
+  nasty_seed_48: 40685   # 156 + 375 + 301 + 39826 + 27 (ref totals: 12 + 10 + 5)
   cap: 50000
 
 session:

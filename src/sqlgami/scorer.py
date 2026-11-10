@@ -189,6 +189,8 @@ class Scorer:
         self.calibrator = calibrator
         self.generator = generator
         self.prober = prober
+        if (generator is not None or prober is not None) and self.options.consistency == "auto":
+            self.options.consistency = "always"  # a generator or prober is an explicit opt-in
         if isinstance(glossary, dict):
             glossary = "\n".join(f"{term}: {meaning}" for term, meaning in glossary.items())
         self.glossary: str | None = glossary
@@ -307,7 +309,7 @@ def _chain_rules(catalogue: Any) -> list[RequiredPredicate]:
             continue
         left, _, _ = term.sql.rpartition("=")
         columns = tuple(c.strip() for c in left.split(",") if c.strip())
-        tables = tuple(t.strip() for t in term.table.split(";") if t.strip())
+        tables = tuple(t.strip() for t in term.table.split(";") if t.strip() and t.strip() != "*")
         if columns:
             rules.append(RequiredPredicate(term.name, columns, tables, "or_chain", "high", term.description))
     return rules

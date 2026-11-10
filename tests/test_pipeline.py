@@ -383,6 +383,7 @@ def test_bad_db_argument(engine):
 
 EXPECTED_KEYS = {
     "schema_version",
+    "timing",
     "advisory",
     "engine",
     "mode",
@@ -453,6 +454,7 @@ def test_scoring_the_same_sql_twice_gives_the_same_report(scorer):
     for data in (first, second):
         for stage in data["stages"]:
             stage["duration_ms"] = None
+        data["timing"] = {k: v for k, v in data["timing"].items() if k in ("deadline_ms", "cut_by_deadline")}  # clock readings vary
     assert first == second
 
 

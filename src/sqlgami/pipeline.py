@@ -93,6 +93,19 @@ class Options:
     # Wall-clock bound on everything one report sends to the database, all stages together.
     # Statements that would overrun it are cut short or not sent; the report says so.
     budget_s: float = 120.0
+    # The deadline for one score() call, in milliseconds (None: no deadline, for batch work).
+    # The live core (parse, gate, catalogue, static checks, question and term checks) always
+    # runs; the stages after it (dry run, sample and probes, reconciliation, and consistency
+    # under "if_time") start only while time remains, and a stage the deadline cuts is
+    # reported as not run, never as a pass. ``report.timing`` has the accounting.
+    deadline_ms: float | None = field(default_factory=lambda: _default_deadline_ms())
+    # Whether the consistency stage (alternative queries from a generator, which may call a
+    # model over the network) and the reconciliation stage (anchor probes from a prober) run:
+    # "auto" (the default: off, unless the Scorer was given a generator or prober, which is an
+    # explicit opt-in and means "always"), "off", "if_time" (only within the deadline) or
+    # "always". Alternatives and probes handed to score() directly call no model and run as
+    # supplied.
+    consistency: str = "auto"
 
 
 class _Clock:
@@ -107,6 +120,58 @@ class _Clock:
 
 
 BUDGET_SPENT = "the time budget for this report is spent"
+DEADLINE = "the deadline for this report passed"
+DEFAULT_DEADLINE_MS = 50.0
+
+
+def _default_deadline_ms() -> float | None:
+    """50 ms unless SQLGAMI_DEADLINE_MS says otherwise ("none" for no deadline: batch work, CI
+    against a slow database, audits)."""
+    import os
+
+    value = os.environ.get("SQLGAMI_DEADLINE_MS")
+    if value is None or value == "":
+        return DEFAULT_DEADLINE_MS
+    if value.strip().lower() in ("none", "off", "0"):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return DEFAULT_DEADLINE_MS
+
+
+class _Deadline:
+    """One score() call's deadline and timing ledger."""
+
+    def __init__(self, deadline_ms: float | None) -> None:
+        self.started = time.perf_counter()
+        self.deadline_ms = deadline_ms
+        self.skipped: list[str] = []
+
+    def elapsed_ms(self) -> float:
+        return (time.perf_counter() - self.started) * 1000
+
+    def remaining_ms(self) -> float | None:
+        if self.deadline_ms is None:
+            return None
+        return self.deadline_ms - self.elapsed_ms()
+
+    def expired(self) -> bool:
+        left = self.remaining_ms()
+        return left is not None and left <= 0
+
+    def cut(self, stage: str) -> None:
+        if stage not in self.skipped:
+            self.skipped.append(stage)
+
+    def ledger(self, report: Report) -> dict[str, Any]:
+        return {
+            "deadline_ms": self.deadline_ms,
+            "total_ms": round(self.elapsed_ms(), 3),
+            "stages_ms": {s.name: round(s.duration_ms, 3) for s in report.stages if s.duration_ms is not None},
+            "cut_by_deadline": list(self.skipped),
+            "over_deadline": self.deadline_ms is not None and self.elapsed_ms() > self.deadline_ms,
+        }
 
 
 class _Bounded:
@@ -232,8 +297,36 @@ def _run(
     terms: Any = None,
 ) -> None:
     clock = _Clock()
+    deadline = _Deadline(options.deadline_ms)
+    report.timing = {"deadline_ms": options.deadline_ms}
     bounded: _Bounded | None = _Bounded(adapter, options.budget_s) if adapter is not None else None
     adapter = bounded  # type: ignore[assignment]  # every stage below talks to the database through the budget
+    try:
+        _stages(report, sql, dialect, mode, catalog, adapter, question, glossary, options, params, alternatives, generator, probes, prober, terms, clock, deadline, bounded)
+    finally:
+        report.timing = deadline.ledger(report)
+
+
+def _stages(
+    report: Report,
+    sql: str,
+    dialect: str,
+    mode: str,
+    catalog: Catalog | None,
+    adapter: Any,
+    question: str | None,
+    glossary: str | None,
+    options: Options,
+    params: dict[str, Any] | None,
+    alternatives: Sequence[str] | None,
+    generator: Any,
+    probes: Sequence[Any] | None,
+    prober: Any,
+    terms: Any,
+    clock: _Clock,
+    deadline: _Deadline,
+    bounded: _Bounded | None,
+) -> None:
 
     # ------------------------------------------------------------- parse
     prepared = template.prepare(sql, dialect, params)
@@ -453,25 +546,33 @@ def _run(
     if blocked is not None and adapter is not None and mode != "static":
         _stage(report, "dry_run", StageStatus.SKIPPED, blocked)
         _stage(report, "sample", StageStatus.SKIPPED, blocked + "; unverified beyond static checks")
+    elif adapter is not None and mode != "static" and deadline.expired():
+        deadline.cut("dry_run")
+        deadline.cut("sample")
+        _not_run(report, ("dry_run", "sample"), DEADLINE)
     else:
         _database_stages(
-            report, prepared.executable_sql or sql, mode, adapter, analysis, ctx, schema_findings, options, clock
+            report, prepared.executable_sql or sql, mode, adapter, analysis, ctx, schema_findings, options, clock, deadline
         )
-    _consistency_stage(
-        report,
-        prepared.executable_sql or sql,
-        dialect,
-        mode,
-        catalog,
-        adapter,
-        question,
-        glossary,
-        options,
-        alternatives,
-        generator,
-        params,
-    )
-    _reconcile_stage(report, prepared.executable_sql or sql, dialect, mode, catalog, adapter, question, glossary, options, probes, prober, params)
+    # Alternatives or probes the host hands in run as supplied (no model is called for them);
+    # a generator or prober — which may call a model — runs only when Options.consistency
+    # allows it, and "if_time" stages are cut by the deadline.
+    for name, supplied, callable_ in (
+        ("consistency", alternatives is not None, generator is not None),
+        ("reconciliation", probes is not None, prober is not None),
+    ):
+        if callable_ and not supplied and options.consistency in ("off", "auto"):
+            _stage(report, name, StageStatus.NOT_RUN, "turned off (Options.consistency)")
+        elif (supplied or callable_) and options.consistency == "if_time" and deadline.expired():
+            deadline.cut(name)
+            _stage(report, name, StageStatus.NOT_RUN, DEADLINE)
+        elif name == "consistency":
+            _consistency_stage(
+                report, prepared.executable_sql or sql, dialect, mode, catalog, adapter, question, glossary, options,
+                alternatives, generator, params,
+            )
+        else:
+            _reconcile_stage(report, prepared.executable_sql or sql, dialect, mode, catalog, adapter, question, glossary, options, probes, prober, params)
     _question_stage(report, ctx, adapter, question, glossary, mode, options, terms, params)
     if bounded is not None and bounded.spent:
         report.findings.append(
@@ -713,7 +814,9 @@ def _database_stages(
     schema_findings: list[Finding],
     options: Options,
     clock: _Clock,
+    deadline: _Deadline | None = None,
 ) -> None:
+    deadline = deadline or _Deadline(None)
     wants_dry = mode in ("dry", "sample", "full")
     wants_sample = mode in ("sample", "full")
     if not wants_dry:
@@ -800,6 +903,10 @@ def _database_stages(
     if not wants_sample:
         _not_run(report, ("sample",), f"mode is {mode}")
         return
+    if deadline.expired():
+        deadline.cut("sample")
+        _not_run(report, ("sample",), DEADLINE)
+        return
     if not can_run:
         _stage(
             report,
@@ -847,7 +954,7 @@ def _database_stages(
             _stage(report, "sample", StageStatus.PASSED, detail, elapsed)
 
     if ctx is not None and ctx.probes:
-        _run_probes(report, ctx, adapter, options)
+        _run_probes(report, ctx, adapter, options, deadline)
 
 
 # ---------------------------------------------------------------------- cost
@@ -961,9 +1068,10 @@ def _probe_allowed(adapter: Adapter, table: Table, options: Options) -> bool:
     return count is None or count <= options.probe_row_ceiling
 
 
-def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Options) -> None:
+def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Options, deadline: _Deadline | None = None) -> None:
     """Check findings against the data: confirm them, dismiss them, or add new ones."""
     budget = options.max_probes
+    deadline = deadline or _Deadline(None)
     # Uniqueness probes: finding -> group -> outcomes. A group holds when every outcome is True.
     unique_results: dict[int, dict[str | None, list[tuple[bool, int | None] | None]]] = {}
     unique_findings: dict[int, Finding] = {}
@@ -983,8 +1091,11 @@ def _run_probes(report: Report, ctx: CheckContext, adapter: Adapter, options: Op
         if probe.kind == PROBE_UNIQUE and probe.finding is not None:
             unique_results.setdefault(id(probe.finding), {}).setdefault(probe.group, [])
             unique_findings[id(probe.finding)] = probe.finding
-        if budget <= 0:
-            report.checks_not_run.append(SkippedCheck(f"probe:{probe.kind}", "probe budget for this query is used up"))
+        if budget <= 0 or deadline.expired():
+            why = "probe budget for this query is used up" if budget <= 0 else DEADLINE
+            if budget > 0:
+                deadline.cut("probes")
+            report.checks_not_run.append(SkippedCheck(f"probe:{probe.kind}", why))
             if probe.kind == PROBE_UNIQUE:
                 note_unique(probe, None)
             continue

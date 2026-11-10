@@ -66,7 +66,7 @@ def check_terms(
         term = catalogue.term(match.name)
         kpi = catalogue.kpi(match.name) if term is None else None
         if term is not None:
-            outcome, finding = _judge_term(ctx, term, match, dialect, params)
+            outcome, finding = _judge_term(ctx, term, match, dialect, params, catalogue)
         elif kpi is not None:
             outcome, finding = _judge_kpi(ctx, kpi, match, catalogue, dialect)
         else:
@@ -74,6 +74,18 @@ def check_terms(
         outcomes.append(outcome)
         if finding is not None:
             findings.append(finding)
+        if kpi is not None:
+            # The KPI's required terms are judged as if the question had asked for each of them.
+            for name in kpi.requires:
+                required = catalogue.term(name)
+                if required is None or required.name.lower() in seen:
+                    continue
+                seen.add(required.name.lower())
+                implied = Match(required.name, f"{match.phrase} (requires {required.name})", match.span, {}, required.kind if required.enforceable else "")
+                outcome, finding = _judge_term(ctx, required, implied, dialect, params, catalogue)
+                outcomes.append(outcome)
+                if finding is not None:
+                    findings.append(finding)
     signal = {
         "catalogue": catalogue.to_dict(),
         "matched": [m.to_dict() for m in matches],
@@ -86,7 +98,7 @@ def check_terms(
 
 
 def _judge_term(
-    ctx: CheckContext, term: Term, match: Match, dialect: str, params: dict[str, Any] | None
+    ctx: CheckContext, term: Term, match: Match, dialect: str, params: dict[str, Any] | None, catalogue: Catalogue | None = None
 ) -> tuple[TermOutcome, Finding | None]:
     outcome = TermOutcome(term.name, term.kind, UNVERIFIED, phrase=match.phrase, bindings=match.bindings)
     if not term.enforceable:
@@ -100,7 +112,9 @@ def _judge_term(
             suggestion=f"Give the term {term.name} its sql in the catalogue (a filter, formula, window or source).",
             evidence={"term": term.name, "phrase": match.phrase},
         )
-    if term.table and not _reads(ctx, term.table):
+    if term.kind == "chain":
+        return outcome, None  # judged by the required-predicate rule it was folded into
+    if term.table and term.table.strip() != "*" and not _reads(ctx, term.table) and not _reads_column_of(ctx, term, dialect):
         outcome.status = NOT_READ
         outcome.detail = f"the query reads none of {term.table}"
         return outcome, Finding(
@@ -119,7 +133,7 @@ def _judge_term(
     if node is None:
         return outcome, None
     if term.kind == "filter":
-        return _judge_filter(ctx, term, match, node, outcome)
+        return _judge_filter(ctx, term, match, node, outcome, negated=_negated(ctx.question or "", match), catalogue=catalogue, dialect=dialect)
     if term.kind == "window":
         return _judge_window(ctx, term, match, node, outcome)
     if term.kind == "source":
@@ -140,6 +154,27 @@ def _bind(term: Term, bindings: dict[str, str]) -> Term:
         sql = sql.replace("{" + key + "}", str(number))
         dialects = {d: s.replace("{" + key + "}", str(number)) for d, s in dialects.items()}
     return Term(term.name, term.phrases, term.kind, term.table, sql, term.nulls, term.description, dialects, term.row)
+
+
+def _reads_column_of(ctx: CheckContext, term: Term, dialect: str) -> bool:
+    """The term is declared on one table but its column exists on a table the query does read
+    (tenant_id, deleted_at and the like live on many tables): judge it there."""
+    if term.kind not in ("filter", "window"):
+        return False
+    try:
+        node = parse_term_sql(term, dialect)
+    except Exception:
+        return False
+    if node is None:
+        return False
+    columns = {c.name.lower() for c in node.find_all(exp.Column)}
+    if not columns:
+        return False
+    for table in ctx.analysis.tables.values():
+        names = {ctx.catalog.column_key(c.name) for c in table.columns}
+        if columns <= names:
+            return True
+    return False
 
 
 def _reads(ctx: CheckContext, tables: str) -> bool:
@@ -257,18 +292,92 @@ def _value(node: exp.Expression) -> Any:
 
 
 def _conditions(ctx: CheckContext, column: str) -> list[tuple[_Cond, SelectModel]]:
-    """Every canonical condition on ``column`` in any SELECT of the statement (WHERE and ON)."""
+    """Every canonical condition on ``column`` that gates rows anywhere in the statement: WHERE and
+    ON conjuncts of every SELECT (CTEs and subqueries included), HAVING, the FILTER (WHERE ...)
+    of an aggregate, and the WHEN of a CASE inside an aggregate or a projection — the forms
+    production SQL uses for conditional measures (``SUM(CASE WHEN invol_exit_ind = 1 THEN 1
+    ELSE 0 END)``, ``COUNT(DISTINCT CASE WHEN status_cd = 'A' THEN assoc_id END)``)."""
     found: list[tuple[_Cond, SelectModel]] = []
     for model in ctx.cache.models():
+        tests: list[exp.Expression] = []
         for conjunct in model.conjuncts:
-            for part in flatten_and(conjunct.expr):
-                cond = _canonical(part)
-                if cond is not None and cond.column == column:
-                    found.append((cond, model))
+            tests.extend(flatten_and(conjunct.expr))
+        having = model.select.args.get("having")
+        if having is not None:
+            tests.extend(flatten_and(having.this))
+        for node in model.own():
+            if isinstance(node, exp.Filter):
+                where = node.args.get("expression")
+                if where is not None:
+                    tests.extend(flatten_and(where.this if isinstance(where, exp.Where) else where))
+            elif isinstance(node, exp.If) and isinstance(node.parent, exp.Case):
+                tests.extend(flatten_and(node.this))
+            elif isinstance(node, exp.Anonymous) and (node.name or "").lower() in ("countif", "count_if") and node.expressions:
+                tests.extend(flatten_and(node.expressions[0]))
+        for part in tests:
+            cond = _canonical(part)
+            if cond is not None and cond.column == column:
+                found.append((cond, model))
     return found
 
 
-def _judge_filter(ctx: CheckContext, term: Term, match: Match, node: exp.Expression, outcome: TermOutcome) -> tuple[TermOutcome, Finding | None]:
+_NEGATIONS_BEFORE = re.compile(r"\b(excluding|exclude|excludes|except|without|not|non|omit|omitting)\s*$")
+_NEGATIONS_AFTER = re.compile(r"^\s*\w*\s*(?:are |is |rows |ones )?(excluded|omitted|not included|left out)\b")
+
+
+def _negated(question: str, match: Match) -> bool:
+    """Whether the question negates the matched phrase — "excluding soft-deleted rows",
+    "non-contractors", "soft-deleted subscriptions excluded", "not on leave" when the term
+    itself is "on leave" — so the expected condition is the inverse. Only an immediate negation
+    counts; "no current address" as the label of a bucket does not."""
+    from .terms import normalise
+
+    text = normalise(question)
+    before = text[: match.span[0]].rstrip()
+    after = text[match.span[1]:]
+    return bool(_NEGATIONS_BEFORE.search(before[-24:])) or bool(_NEGATIONS_AFTER.match(after[:40]))
+
+
+def _inverse(cond: _Cond) -> _Cond:
+    flipped = {"eq": "ne", "ne": "eq", "in": "not_in", "not_in": "in", "is_null": "not_null", "not_null": "is_null"}
+    op = flipped.get(cond.op, "other")
+    return _Cond(cond.column, op, cond.values, None, f"NOT ({cond.text})")
+
+
+def _declared_elsewhere(catalogue: Catalogue | None, cond: _Cond, dialect: str, exclude: str) -> str | None:
+    """The name of another catalogue term whose condition is exactly ``cond`` — the query may be
+    applying that term (the default "not deleted" rather than "deleted")."""
+    if catalogue is None:
+        return None
+    for other in catalogue.terms:
+        if other.name.lower() == exclude.lower() or other.kind != "filter" or not other.enforceable:
+            continue
+        try:
+            node = parse_term_sql(other, dialect)
+        except Exception:
+            continue
+        declared = _canonical(node) if node is not None else None
+        if declared is None:
+            continue
+        if other.nulls == "include" and declared.op in ("ne", "not_in"):
+            declared.nulls_kept = True
+        elif other.nulls == "exclude" and declared.op in ("ne", "not_in"):
+            declared.nulls_kept = False
+        if _same_condition(cond, declared):
+            return other.name
+    return None
+
+
+def _judge_filter(
+    ctx: CheckContext,
+    term: Term,
+    match: Match,
+    node: exp.Expression,
+    outcome: TermOutcome,
+    negated: bool = False,
+    catalogue: Catalogue | None = None,
+    dialect: str = "",
+) -> tuple[TermOutcome, Finding | None]:
     wanted = _canonical(node)
     if wanted is None:
         outcome.detail = "the term's condition is not a simple test on one column; not checked"
@@ -277,6 +386,13 @@ def _judge_filter(ctx: CheckContext, term: Term, match: Match, node: exp.Express
         wanted.nulls_kept = True
     elif term.nulls == "exclude" and wanted.op in ("ne", "not_in"):
         wanted.nulls_kept = False
+    expected_text = term.sql
+    if negated:
+        # "excluding X": the query must apply the opposite of X. What happens to NULL rows under
+        # the negation is not declared, so it is not judged.
+        wanted = _inverse(wanted)
+        expected_text = f"NOT ({term.sql})"
+        outcome.detail = "the question negates the term"
     found = _conditions(ctx, wanted.column)
     if not found:
         inside_or = _tested_inside_or(ctx, wanted.column)
@@ -289,7 +405,7 @@ def _judge_filter(ctx: CheckContext, term: Term, match: Match, node: exp.Express
         return outcome, Finding(
             "term_missing",
             Severity.HIGH,
-            f'The question asks for "{match.phrase}" ({term.name}), which the catalogue defines as {term.sql}; '
+            f'The question asks for "{match.phrase}" ({term.name}), which the catalogue defines as {expected_text}; '
             + (
                 f"the only test on {wanted.column} sits inside an OR branch ({inside_or}), so it does not apply to every row."
                 if inside_or
@@ -297,8 +413,8 @@ def _judge_filter(ctx: CheckContext, term: Term, match: Match, node: exp.Express
             ),
             "question",
             snippet=inside_or or None,
-            suggestion=f"Apply {term.sql} to every row (as its own AND condition).",
-            evidence={"term": term.name, "expected": term.sql},
+            suggestion=f"Apply {expected_text} to the rows that reach the answer.",
+            evidence={"term": term.name, "expected": expected_text},
         )
     for cond, _ in found:
         if _same_condition(cond, wanted):
@@ -306,6 +422,23 @@ def _judge_filter(ctx: CheckContext, term: Term, match: Match, node: exp.Express
             outcome.detail = cond.text
             return outcome, None
     contradiction = next((c for c, _ in found if _contradicts(c, wanted)), None)
+    if contradiction is not None and not negated:
+        sibling = _declared_elsewhere(catalogue, contradiction, dialect, term.name)
+        if sibling is not None:
+            # The question mentions the term, and the query applies the catalogue's OTHER term on
+            # that column ("deleted" mentioned in passing, rows filtered to not_deleted): the
+            # author declared both, so this is a note, not a contradiction.
+            outcome.status = DIFFERS
+            outcome.detail = f"applies {sibling} instead"
+            return outcome, Finding(
+                "term_differs",
+                Severity.LOW,
+                f'The question mentions "{match.phrase}" ({term.name}, {term.sql}); the query applies the '
+                f"catalogue's {sibling} ({contradiction.text}) on that column instead.",
+                "question",
+                snippet=contradiction.text,
+                evidence={"term": term.name, "applied": sibling, "found": contradiction.text},
+            )
     if contradiction is not None:
         outcome.status = CONTRADICTED
         outcome.detail = contradiction.text
@@ -313,23 +446,23 @@ def _judge_filter(ctx: CheckContext, term: Term, match: Match, node: exp.Express
         return outcome, Finding(
             "term_contradicted",
             Severity.HIGH,
-            f'The catalogue defines "{match.phrase}" ({term.name}) as {term.sql}; the query has '
+            f'The catalogue defines "{match.phrase}" ({term.name}) as {expected_text}; the query has '
             f"{contradiction.text}, {why}",
             "question",
             snippet=contradiction.text,
-            suggestion=f"Write the condition as {term.sql}.",
-            evidence={"term": term.name, "expected": term.sql, "found": contradiction.text},
+            suggestion=f"Write the condition as {expected_text}.",
+            evidence={"term": term.name, "expected": expected_text, "found": contradiction.text},
         )
     outcome.status = DIFFERS
     outcome.detail = found[0][0].text
     return outcome, Finding(
         "term_differs",
-        Severity.MEDIUM,
-        f'The catalogue defines "{match.phrase}" ({term.name}) as {term.sql}; the query filters '
+        Severity.LOW,
+        f'The catalogue defines "{match.phrase}" ({term.name}) as {expected_text}; the query filters '
         f"{wanted.column} differently ({found[0][0].text}), which may or may not mean the same.",
         "question",
         snippet=found[0][0].text,
-        evidence={"term": term.name, "expected": term.sql, "found": found[0][0].text},
+        evidence={"term": term.name, "expected": expected_text, "found": found[0][0].text},
     )
 
 
@@ -501,12 +634,15 @@ def _judge_window(ctx: CheckContext, term: Term, match: Match, node: exp.Express
             outcome.detail = "the term's frame is not a plain N PRECEDING; not checked"
             return outcome, None
         if not found:
+            # A rolling measure can be written without a frame (a self-join, a correlated
+            # subquery); the absence of a frame is a note, a wrong frame is the finding.
             outcome.status = MISSING
             outcome.detail = "no window frame in the query"
             return outcome, Finding(
                 "term_missing",
-                Severity.MEDIUM,
-                f'The question asks for "{match.phrase}" ({term.name}), defined as {expected_text}, and the query has no such window frame.',
+                Severity.LOW,
+                f'The question asks for "{match.phrase}" ({term.name}), defined as {expected_text}; the query has no '
+                "window frame, so the rolling measure, if computed another way, could not be checked against it.",
                 "question",
                 evidence={"term": term.name, "expected": expected_text},
             )

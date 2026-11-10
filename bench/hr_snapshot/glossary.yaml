@@ -36,6 +36,22 @@ definitions:
       "the last 26 pay periods"). "A year ago" means 26 biweekly periods ago by the same
       rule.
 
+  n_to_m_pay_periods_ago:
+    meaning: >
+      A range of biweekly pay periods from N periods ago through M periods ago, inclusive
+      (N ≤ M). In period_seq terms the range is period_seq BETWEEN -M AND -N. For
+      example "the 6 to 25 pay-periods-ago window" is period_seq BETWEEN -25 AND -6, 20
+      consecutive biweekly periods. The longer phrase wins over the generic "N pay
+      periods ago", so it does not misfire as a single-period reference.
+
+  trailing_moving_average:
+    meaning: >
+      A trailing window frame on an already-ordered series: the current row and the N-1
+      biweekly periods before it (N periods total). In SQL window-frame terms that is
+      ROWS BETWEEN (N-1) PRECEDING AND CURRENT ROW over ORDER BY period_seq. Averaging
+      over fewer than N available periods at the start of the series is permitted — the
+      frame just includes whatever rows exist.
+
   authoritative_snapshot:
     meaning: >
       Each biweekly pay period can be snapshotted more than once as later facts become known.
@@ -50,9 +66,13 @@ definitions:
   authoritative_hire_and_term_dates:
     meaning: >
       hr.employee_dim is the system of record for an associate's hire date and termination
-      date. Metrics that compare an associate's hire and termination (e.g. "terminated within
-      N days of hire") read hire_dt and term_dt from hr.employee_dim — not from the
-      snapshot's own term_dt, which only reflects what was known at that period's close.
+      date. EVERY use of hire_dt — whether for a hire-vs-term comparison (e.g. "terminated
+      within N days of hire") OR for a hire-date window check (e.g. "a new hire is counted
+      in a window if their hire_dt falls inside that window's pay periods") OR for tenure
+      ranking OR anything else — reads hire_dt from hr.employee_dim. The same holds for
+      term_dt. The snapshot's own hire_dt and term_dt columns reflect only what was known
+      at that period's close and MUST NOT be used as the authoritative value, even when
+      today's data happens to agree with hr.employee_dim.
 
   ninety_day_new_hire_turnover:
     meaning: >
@@ -114,3 +134,10 @@ definitions:
     meaning: >
       There is no deleted_at column in this suite. A terminated associate (status 'T') is
       not a soft-delete and still appears on authoritative snapshots.
+
+  employment_type:
+    meaning: >
+      An associate's employment type: 'FTE' (full-time employee), 'Contractor', or
+      'Intern'. An associate whose employment type is unknown is recorded with no value
+      (NULL) rather than one of these labels. "Non-contractor" or "not a contractor"
+      includes associates whose employment type is NULL — they are not contractors.

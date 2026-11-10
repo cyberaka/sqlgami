@@ -132,3 +132,57 @@ def test_unbounded_recursion_note(sql, flagged):
     with Scorer("duckdb", catalog="CREATE TABLE t (id INTEGER, parent INTEGER)") as scorer:
         report = scorer.explain(sql, "tree size")
     assert report.has("unbounded_recursion") is flagged
+
+
+# ------------------------------------------------------------------ the deadline (ADR 0002)
+
+
+def test_live_core_always_runs_and_later_stages_are_cut_at_the_deadline(engine, db):
+    """A deadline that has already passed when the database stages would start: the parse,
+    gate, catalogue, static and question stages still run; dry run, sample and probes are
+    reported not_run with the deadline as the reason, never as a pass."""
+    with Scorer(engine, db=db, options=Options(deadline_ms=0.0001)) as scorer:
+        report = scorer.sample("SELECT c.name, SUM(o.total) FROM customers c JOIN orders o ON o.customer_id = c.id JOIN items i ON i.order_id = o.id GROUP BY c.name", "spend per customer")
+    assert report.stage("static").status == StageStatus.PASSED
+    assert report.stage("question").status == StageStatus.PASSED
+    assert report.stage("dry_run").status == StageStatus.NOT_RUN and "deadline" in (report.stage("dry_run").detail or "")
+    assert report.stage("sample").status == StageStatus.NOT_RUN
+    assert report.has("fan_out")  # the static finding stands; nothing ran to settle it
+    assert report.timing["deadline_ms"] == 0.0001 and set(report.timing["cut_by_deadline"]) >= {"dry_run", "sample"}
+    assert report.timing["over_deadline"] is True and report.timing["total_ms"] > 0
+    assert report.verdict.value != "likely_right"
+
+
+def test_no_deadline_runs_everything_and_the_ledger_is_written(scorer):
+    report = scorer.sample("SELECT COUNT(*) FROM orders", "how many orders")
+    assert report.timing["deadline_ms"] is None  # conftest sets SQLGAMI_DEADLINE_MS=none for the test databases
+    assert report.stage("sample").status == StageStatus.PASSED
+    assert "stages_ms" in report.timing and report.timing["cut_by_deadline"] == []
+    data = report.to_dict()
+    assert data["timing"]["total_ms"] >= 0
+
+
+def test_consistency_is_off_unless_a_generator_or_switch_asks_for_it(engine, db):
+    right = "SELECT c.name, SUM(o.total) AS spend FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name"
+    same = "WITH t AS (SELECT customer_id, SUM(total) AS s FROM orders GROUP BY customer_id) SELECT c.name, t.s FROM customers c JOIN t ON t.customer_id = c.id"
+    with Scorer(engine, db=db) as plain:
+        # alternatives the host hands in call no model: they run as supplied
+        assert plain.sample(right, "spend per customer", alternatives=[same]).stage("consistency").status == StageStatus.PASSED
+    with Scorer(engine, db=db, generator=lambda q, s, g, k: [same], options=Options(consistency="off", deadline_ms=None)) as off:
+        report = off.score(right, "spend per customer", mode="full")
+        assert report.stage("consistency").status == StageStatus.NOT_RUN and "turned off" in (report.stage("consistency").detail or "")
+    with Scorer(engine, db=db, generator=lambda q, s, g, k: [same]) as opted:
+        assert opted.options.consistency == "always"  # a generator is an explicit opt-in
+        assert opted.score(right, "spend per customer", mode="full").stage("consistency").status == StageStatus.PASSED
+    with Scorer(engine, db=db, options=Options(consistency="if_time", deadline_ms=0.0001)) as late:
+        report = late.sample(right, "spend per customer", alternatives=[same])
+        assert report.stage("consistency").status == StageStatus.NOT_RUN and "consistency" in report.timing["cut_by_deadline"]
+
+
+def test_the_default_deadline_is_fifty_milliseconds(monkeypatch):
+    monkeypatch.delenv("SQLGAMI_DEADLINE_MS", raising=False)
+    assert Options().deadline_ms == 50.0
+    monkeypatch.setenv("SQLGAMI_DEADLINE_MS", "none")
+    assert Options().deadline_ms is None
+    monkeypatch.setenv("SQLGAMI_DEADLINE_MS", "120")
+    assert Options().deadline_ms == 120.0

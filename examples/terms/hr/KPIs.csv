@@ -1,4 +1,4 @@
-kpi,phrases,formula,format,reference_sql,description
-basis_points,basis points;bp;bps,CAST(FLOOR({rate} * 10000) AS BIGINT),integer floor,,"A rate as an integer in ten-thousandths, floored."
-year_over_year_growth,year-over-year;year over year;yoy growth,({current} - {prior}) * 10000 / {prior},integer floor,,"Change against the count 26 periods ago, in basis points of the prior value."
-turnover_rate,turnover rate;annual turnover,{leavers} / {headcount},integer bp,,"Leavers over the window divided by headcount at its start."
+kpi,phrases,formula,format,requires,reference_sql,description
+basis_points,basis points;bp;bps,CAST(FLOOR({rate} * 10000) AS BIGINT),integer floor,,,"A rate as an integer in ten-thousandths, floored."
+year_over_year_growth,year-over-year;year over year;yoy growth,({current} - {prior}) * 10000 / {prior},integer floor,active,,"Change against the count 26 periods ago, in basis points of the prior value."
+turnover_rate,turnover rate;annual turnover,{leavers} / {headcount},integer bp,active,,"Leavers over the window divided by headcount at its start."

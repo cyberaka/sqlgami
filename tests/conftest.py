@@ -6,7 +6,13 @@ import itertools
 import os
 import sqlite3
 
+import os
+
 import pytest
+
+# The test databases (Postgres over the network, DuckDB files) are slower than a host's live
+# embedded fixtures; the deadline tests set their own deadline explicitly.
+os.environ.setdefault("SQLGAMI_DEADLINE_MS", "none")
 
 SHOP_DDL = """
 CREATE TABLE customers (

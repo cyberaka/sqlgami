@@ -106,7 +106,7 @@ def test_phrases_match_exactly_after_normalisation_and_bind_numbers():
     assert found["last_n_pay_periods"].bindings == {"n": "26"} and found["trailing_moving_average"].bindings == {"n": "4"}
     assert found["not_on_leave"].phrase == "currently not on leave"  # the longer phrase wins
     assert not c.match("How many orders were paid?")
-    assert normalise("Pay-Periods_Ago") == " pay periods ago "
+    assert normalise("Pay-Periods Ago") == " pay periods ago " and normalise("deleted_at") == " deleted_at "
 
 
 # ------------------------------------------------------------------ judging: filters
@@ -130,7 +130,7 @@ def test_filter_term_satisfied_contradicted_or_missing():
     missing = sc.explain(base + "s.snap_dt = s.period_end_dt", question, params={"manager_id": 7})
     assert _term_findings(missing)["term_missing"].severity == Severity.HIGH
     other = sc.explain(base + "s.status_cd IN ('A', 'T')", question, params={"manager_id": 7})
-    assert _term_findings(other)["term_differs"].severity == Severity.MEDIUM
+    assert _term_findings(other)["term_differs"].severity == Severity.LOW
 
 
 def test_filter_inside_an_or_branch_is_reported_as_not_applied_to_every_row():
@@ -266,3 +266,64 @@ def test_glossary_yaml_with_a_terms_section_is_a_catalogue():
     assert sc.terms is not None and sc.terms.term("not_on_leave") is not None
     report = sc.explain("SELECT COUNT(*) FROM hr_emp_period_snapshot WHERE status_cd <> 'L'", "How many are not on leave?")
     assert _term_findings(report)["term_contradicted"].severity == Severity.HIGH
+
+
+# ------------------------------------------------------------------ matching rules the audit asked for
+
+
+def test_phrases_match_whole_tokens_only_and_spans_do_not_overlap():
+    c = Catalogue.from_sheets(
+        {
+            "terms": "term,phrases,kind,table,sql,nulls,description\n"
+            "voluntary,voluntary,filter,t,invol_exit_ind = 0,,\n"
+            "involuntary,involuntary,filter,t,invol_exit_ind = 1,,\n"
+            "on_leave,on leave,filter,t,status_cd = 'L',,\n"
+            "not_on_leave,not on leave,filter,t,status_cd IS DISTINCT FROM 'L',include,\n"
+            "soft_deleted,deleted;soft-deleted,filter,t,deleted_at IS NOT NULL,,\n"
+            "not_deleted,non-deleted;not deleted;undeleted,filter,t,deleted_at IS NULL,,\n"
+        }
+    )
+    names = [m.name for m in c.match("Involuntary leavers only")]
+    assert names == ["involuntary"]  # "voluntary" is not matched inside "involuntary"
+    names = [m.name for m in c.match("people not on leave")]
+    assert names == ["not_on_leave"]  # the longer phrase consumes the span; "on leave" does not also fire
+    for question in ("non-deleted tenants", "not deleted tenants", "undeleted tenants"):
+        assert [m.name for m in c.match(question)] == ["not_deleted"], question
+    assert [m.name for m in c.match("rows where deleted_at IS NULL")] == []  # an identifier is not the word
+    assert [m.name for m in c.match("the deleted rows")] == ["soft_deleted"]
+
+
+def test_conditions_inside_conditional_aggregation_count():
+    sql = (
+        "SELECT COUNT(DISTINCT CASE WHEN s.status_cd = 'A' THEN s.assoc_id END) AS active_headcount, "
+        "SUM(CASE WHEN s.invol_exit_ind = 1 THEN 1 ELSE 0 END) AS invol_n, "
+        "COUNT(*) FILTER (WHERE s.invol_exit_ind = 0) AS vol_n "
+        f"FROM hr_emp_period_snapshot s WHERE ({CHAIN})"
+    )
+    terms = TERMS + "active,active;active headcount,filter,hr_emp_period_snapshot,status_cd = 'A',,\n" \
+        "voluntary,voluntary,filter,hr_emp_period_snapshot,invol_exit_ind = 0,,\n" \
+        "involuntary,involuntary,filter,hr_emp_period_snapshot,invol_exit_ind = 1,,\n"
+    cat = Catalogue.from_sheets({"terms": terms, "kpis": KPIS, "parameters": PARAMS})
+    sc = Scorer("duckdb", catalog=HR_DDL, terms=cat)
+    report = sc.explain(sql, "Active headcount and voluntary and involuntary leavers in my organisation", params={"manager_id": 7})
+    assert not {k for k in _term_findings(report) if k != "undefined_term"}, report.summary()
+    # the contradiction check applies in those positions too
+    bad = sql.replace("CASE WHEN s.status_cd = 'A'", "CASE WHEN s.status_cd != 'L'")
+    report = sc.explain(bad, "Headcount not on leave in my organisation", params={"manager_id": 7})
+    assert _term_findings(report)["term_contradicted"].severity == Severity.HIGH
+
+
+def test_a_negated_phrase_expects_the_inverse_and_a_sibling_term_is_a_note():
+    terms = (
+        "term,phrases,kind,table,sql,nulls,description\n"
+        "soft_deleted,soft-deleted;deleted,filter,hr_emp_period_snapshot,hire_dt IS NOT NULL,,\n"
+        "not_deleted,non-deleted,filter,hr_emp_period_snapshot,hire_dt IS NULL,,\n"
+    )
+    cat = Catalogue.from_sheets({"terms": terms})
+    sc = Scorer("duckdb", catalog=HR_DDL, terms=cat)
+    excluded = sc.explain("SELECT COUNT(*) FROM hr_emp_period_snapshot WHERE hire_dt IS NULL", "How many rows, excluding soft-deleted ones?")
+    assert not {k for k in _term_findings(excluded) if k != "term_differs"}, excluded.summary()
+    mentioned = sc.explain("SELECT COUNT(*) FROM hr_emp_period_snapshot WHERE hire_dt IS NULL", "How many rows (NULL when the row is soft-deleted)?")
+    assert _term_findings(mentioned)["term_differs"].severity == Severity.LOW  # the query applies the sibling not_deleted
+    asked = sc.explain("SELECT COUNT(*) FROM hr_emp_period_snapshot WHERE hire_dt IS NULL", "How many soft-deleted rows are there?")
+    assert "term_differs" in _term_findings(asked) and "term_contradicted" not in _term_findings(asked)

@@ -349,8 +349,10 @@ my_organisation,my organisation;my org,chain,hr.emp_period_snapshot,"lvl_2_id, l
 headcount,headcount,,,,,documentation only: matched but not enforced
 ```
 
-`KPIs.csv`: `kpi,phrases,formula,format,reference_sql,description`, for example
-`basis_points,basis points;bp,CAST(FLOOR({rate} * 10000) AS BIGINT),integer floor,,`.
+`KPIs.csv`: `kpi,phrases,formula,format,requires,reference_sql,description`, for
+example `basis_points,basis points;bp,CAST(FLOOR({rate} * 10000) AS BIGINT),integer floor,,,`;
+`requires` lists the terms a KPI needs (`revenue` requires `paid_or_partial;not_deleted`),
+each checked as if the question had asked for it.
 `Parameters.csv` names template parameters and formula inputs
 (`manager_id,integer,12003` / `rate,input,`); `Examples.csv` holds training
 questions with their correct SQL for the offline compile step.

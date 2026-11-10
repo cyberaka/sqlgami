@@ -221,9 +221,10 @@ def generate(seed: int, profile: str, out_dir: Path):
         })
 
     has_fn_gaps = (profile != "clean")
-    # Seeds 45/46/47 use pooled person-id hierarchy; seeds 1-3/42/43/44 are UNCHANGED.
-    use_pooled = seed in (45, 46, 47)
+    # Seeds 45/46/47/48 use pooled person-id hierarchy; seeds 1-3/42/43/44 are UNCHANGED.
+    use_pooled = seed in (45, 46, 47, 48)
     seed47_onleave_aid = None
+    seed48_rep_onleave_aids = []
     if use_pooled:
         AID_BASE = 12001
         N_EMP = 300
@@ -342,8 +343,9 @@ def generate(seed: int, profile: str, out_dir: Path):
             for aid in fn_only:
                 assoc_assignments[aid]["fn_chain"] = fn_chain_12003
             # Seed 47 ONLY: force one fn-only employee to be on-leave on the current
-            # authoritative snapshot and active in employee_dim. This exposes the AND/OR
-            # precedence bug (WHERE lvl_7_id_fn = m OR lvl_X_id = m AND status != 'L').
+            # authoritative snapshot and active in employee_dim. The bug
+            # `WHERE status != 'L' AND lvl_2_id = m OR ... OR lvl_7_id_fn = m` (status
+            # filter binds only to the first disjunct) lets this person leak through.
             if seed == 47:
                 seed47_onleave_aid = sorted(fn_only)[0]
                 long_hire = AS_OF - timedelta(days=365 * 3)
@@ -354,6 +356,27 @@ def generate(seed: int, profile: str, out_dir: Path):
                         e["hire_dt"] = long_hire.isoformat()
                         e["term_dt"] = None
                         break
+            # Seed 48 ONLY: force 3 rep-side employees (lvl_3_id = 12003) to be on-leave
+            # on the current authoritative snapshot and active in employee_dim. These
+            # people match 12003 ONLY via the rep chain, NOT via lvl_7_id_fn. The bug
+            # `... OR lvl_7_id_fn = m AND status != 'L'` (AND binds only to the LAST
+            # disjunct) lets these rep-side on-leave people leak through.
+            if seed == 48 and rep_under_12003:
+                reserved = set(picks) | set(mid_year_aids) | set(fn_only)
+                eligible = [a for a in sorted(assoc_assignments.keys())
+                            if assoc_assignments[a]["rep_chain"].get("lvl_3_id") == KEY_MGR
+                            and a not in reserved
+                            and assoc_assignments[a]["fn_chain"].get("lvl_7_id") != KEY_MGR]
+                seed48_rep_onleave_aids = eligible[:3]
+                long_hire = AS_OF - timedelta(days=365 * 3)
+                for aid in seed48_rep_onleave_aids:
+                    assoc_assignments[aid]["hire_dt_d"] = long_hire
+                    assoc_assignments[aid]["term_dt_d"] = None
+                    for e in employees:
+                        if e["assoc_id"] == aid:
+                            e["hire_dt"] = long_hire.isoformat()
+                            e["term_dt"] = None
+                            break
 
     if inject_early_leavers_seed44:
         # Pick a leaf whose chain climbs to LVL_2 = 12003 (the big reporting org under {manager_id}=12003).
@@ -503,12 +526,22 @@ def generate(seed: int, profile: str, out_dir: Path):
         # and the real production fact is keyed. Grain reasoning now trusts the declared key.
 
     # Seed 47 ONLY: stamp status_cd='L' on the authoritative current snapshot for the
-    # pre-selected fn-only employee, so an AND/OR precedence bug that filters status only
-    # on the lvl_7_id_fn disjunct diverges from the correct (match) AND (status != 'L').
+    # pre-selected fn-only employee.
     if seed47_onleave_aid is not None:
         cur = CURRENT_PPE.isoformat()
         for r in snapshots:
             if (r["assoc_id"] == seed47_onleave_aid
+                    and r["snap_dt"] == cur
+                    and r["period_end_dt"] == cur):
+                r["status_cd"] = "L"
+
+    # Seed 48 ONLY: stamp status_cd='L' on the authoritative current snapshot for the
+    # 3 rep-side employees. These match 12003 via lvl_3_id only — not via lvl_7_id_fn.
+    if seed48_rep_onleave_aids:
+        cur = CURRENT_PPE.isoformat()
+        rep_set = set(seed48_rep_onleave_aids)
+        for r in snapshots:
+            if (r["assoc_id"] in rep_set
                     and r["snap_dt"] == cur
                     and r["period_end_dt"] == cur):
                 r["status_cd"] = "L"

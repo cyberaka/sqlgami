@@ -168,6 +168,9 @@ class Report:
     signals: dict[str, Any] = field(default_factory=dict)
     tables: list[str] = field(default_factory=list)
     plan: Any = None
+    # Wall-clock accounting: the deadline the report was made under, each stage's
+    # milliseconds, the total, and the stages the deadline cut (see Options.deadline_ms).
+    timing: dict[str, Any] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
     advisory: str = ADVISORY
 
@@ -204,6 +207,7 @@ class Report:
             "signals": _plain(self.signals),
             "tables": list(self.tables),
             "plan": _plain(self.plan),
+            "timing": _plain(self.timing),
         }
 
     def to_json(self, **kwargs: Any) -> str:

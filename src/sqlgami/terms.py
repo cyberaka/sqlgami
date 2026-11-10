@@ -17,10 +17,11 @@ Sheets, one row each, plain text columns:
   an access chain). A row with a blank ``sql`` is documentation only: it is matched, so the
   term is not reported as undefined, but nothing is enforced and the score is capped as for an
   undefined term.
-* **KPIs**: ``kpi | phrases | formula | format | reference_sql | description``. ``formula`` is
-  over terms (``{term_name}``) or plain SQL; ``format`` such as ``integer`` or ``integer bp``
-  says what the output must look like; ``reference_sql`` is a verified query for the compile
-  step (ADR 0002), not used live.
+* **KPIs**: ``kpi | phrases | formula | format | requires | reference_sql | description``.
+  ``formula`` is over terms (``{term_name}``) or plain SQL; ``format`` such as ``integer`` or
+  ``integer bp`` says what the output must look like; ``requires`` lists (``;``-separated)
+  the terms whose conditions the KPI needs — each is checked as if the question had asked for
+  it; ``reference_sql`` is a verified query for the compile step (ADR 0002), not used live.
 * **Examples**: ``id | question | params | correct_sql | expected_result | dataset`` — training
   data for the compile step; validated here, not used live.
 * **Parameters**: ``name | type | example_values``.
@@ -45,7 +46,7 @@ from .errors import ConfigurationError
 KINDS = ("filter", "formula", "window", "source", "chain")
 NULLS = ("", "include", "exclude", "separate")
 TERM_COLUMNS = ("term", "phrases", "kind", "table", "sql", "nulls", "description")
-KPI_COLUMNS = ("kpi", "phrases", "formula", "format", "reference_sql", "description")
+KPI_COLUMNS = ("kpi", "phrases", "formula", "format", "requires", "reference_sql", "description")
 EXAMPLE_COLUMNS = ("id", "question", "params", "correct_sql", "expected_result", "dataset")
 PARAMETER_COLUMNS = ("name", "type", "example_values")
 SHEETS = {"terms": TERM_COLUMNS, "kpis": KPI_COLUMNS, "examples": EXAMPLE_COLUMNS, "parameters": PARAMETER_COLUMNS}
@@ -89,13 +90,14 @@ class KPI:
     phrases: tuple[str, ...] = ()
     formula: str = ""
     format: str = ""
+    requires: tuple[str, ...] = ()  # terms whose conditions the KPI needs
     reference_sql: str = ""
     description: str = ""
     row: int = 0
 
     @property
     def enforceable(self) -> bool:
-        return bool(self.formula.strip() or self.format.strip())
+        return bool(self.formula.strip() or self.format.strip() or self.requires)
 
 
 @dataclass
@@ -283,6 +285,9 @@ class Catalogue:
                     problems.append(
                         Problem("KPIs", kpi.row, "formula", f"unknown term '{ref}' (a term, a KPI, or a Parameters row of type input)")
                     )
+            for required in kpi.requires:
+                if required.lower() not in names:
+                    problems.append(Problem("KPIs", kpi.row, "requires", f"unknown term '{required}'"))
             if kpi.formula.strip():
                 try:
                     sqlglot.parse_one(_placeholders_to_columns(kpi.formula), read=dialect)
@@ -372,8 +377,13 @@ class Catalogue:
 
 
 def normalise(text: str) -> str:
-    """Lower case; hyphens, underscores and runs of space become one space; no punctuation."""
-    text = text.lower().replace("-", " ").replace("_", " ")
+    """Lower case, one space between tokens, no punctuation. A hyphen splits words ("pay-period"
+    is "pay period") except after a negating prefix ("non-deleted" stays one token, so
+    "deleted" cannot match inside it); an identifier keeps its underscores ("deleted_at" is one
+    token, not the word "deleted")."""
+    text = text.lower()
+    text = re.sub(r"\b(non|un)-(?=\w)", r"\1", text)
+    text = text.replace("-", " ")
     text = re.sub(r"[^\w\s{}%]", " ", text)
     return " " + re.sub(r"\s+", " ", text).strip() + " "
 
@@ -492,6 +502,7 @@ def _kpi(row: dict[str, Any], number: int) -> KPI:
         phrases=_split_phrases(row.get("phrases")),
         formula=_text(row.get("formula")),
         format=_text(row.get("format")).lower(),
+        requires=_split_phrases(row.get("requires")),
         reference_sql=_text(row.get("reference_sql")),
         description=_text(row.get("description")),
         row=int(row.get("_row") or number),

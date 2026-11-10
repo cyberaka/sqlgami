@@ -225,7 +225,7 @@ def evaluate(
                 engine,
                 db=conn,
                 glossary=glossary,
-                options=Options(consistency_role=role, consistency_max_alternatives=24),
+                options=Options(consistency_role=role, consistency_max_alternatives=24, deadline_ms=None),  # batch: no deadline
                 terms=str(catalogue) if catalogue is not None else None,
                 **config,
             )
