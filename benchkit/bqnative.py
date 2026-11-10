@@ -162,6 +162,27 @@ def load_seed(sandbox: Any, suite: Suite, seed: Seed, *, replace: bool = False) 
     return datasets
 
 
+def _store(value: Any) -> Any:
+    if isinstance(value, dt.datetime):
+        return {"$dt": value.isoformat()}
+    if isinstance(value, dt.date):
+        return {"$d": value.isoformat()}
+    if isinstance(value, (bytes, bytearray)):
+        return {"$b": bytes(value).hex()}
+    return value
+
+
+def _revive(value: Any) -> Any:
+    if isinstance(value, dict):
+        if "$dt" in value:
+            return dt.datetime.fromisoformat(value["$dt"])
+        if "$d" in value:
+            return dt.date.fromisoformat(value["$d"])
+        if "$b" in value:
+            return bytes.fromhex(value["$b"])
+    return value
+
+
 def _native_outcome(result: Any) -> Outcome:
     if not result.ok:
         return Outcome(False, error=result.error)
@@ -280,10 +301,25 @@ class SeedConnection:
 
     def native_run(self, sql: str) -> Outcome:
         if sql not in self._cache:
-            is_script = sql.lstrip().upper().startswith("DECLARE")
-            native_sql = _rewrite_script(sql, self.sandbox.project, self.suite, self.seed) if is_script else _rewrite(sql, self.sandbox.project, self.suite, self.seed)
-            self._cache[sql] = _native_outcome(self.sandbox.run(native_sql))
+            self._cache[sql] = self._stored(sql)
         return self._cache[sql]
+
+    def _stored(self, sql: str) -> Outcome:
+        """Native results are kept on disk per seed and statement: a statement is run on the
+        service once, whatever the number of bench runs that label it."""
+        import hashlib
+
+        folder = Path("bench/.runs/bigquery/cache") / f"{self.suite.name}_s{self.seed.seed}"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / (hashlib.sha256(sql.encode("utf-8")).hexdigest() + ".json")
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return Outcome(data["ok"], rows=[tuple(_revive(v) for v in r) for r in data.get("rows", [])], columns=data.get("columns", []), error=data.get("error"))
+        is_script = sql.lstrip().upper().startswith("DECLARE")
+        native_sql = _rewrite_script(sql, self.sandbox.project, self.suite, self.seed) if is_script else _rewrite(sql, self.sandbox.project, self.suite, self.seed)
+        outcome = _native_outcome(self.sandbox.run(native_sql))
+        path.write_text(json.dumps({"ok": outcome.ok, "columns": outcome.columns, "rows": [[_store(v) for v in r] for r in outcome.rows], "error": outcome.error}), encoding="utf-8")
+        return outcome
 
     def close(self) -> None:
         pass
