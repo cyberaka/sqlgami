@@ -1,0 +1,30 @@
+{
+  "description": "Batch 4A: whole-query differential over 224 real LLM BigQuery candidates (168 plain + 56 DECLARE scripts) over the HR schema, native sandbox vs sqlgami.translate / script-binder -> DuckDB, seeds clean-1/nasty-42/nasty-44, {manager_id}=12003. Reused load_suite + bqnative._table_map/_rewrite + build.connect fixtures + same_rows-style compare.",
+  "stats": {
+    "candidates": 224,
+    "give_verdict": 219,
+    "not_run": 9,
+    "native_errored_candidate": 129,
+    "compared": 492,
+    "agree": 492,
+    "real_value_disagreements": 0,
+    "real_errors_on_valid_candidate": 24
+  },
+  "soundness_result": "Translation sound: every plain candidate and every script value that sqlgami gives a verdict on agreed with native BigQuery across ~492 comparisons. 0 real value disagreements.",
+  "findings": [
+    {
+      "id": "groupby_alias_collision",
+      "severity": "HIGH",
+      "count": 24,
+      "candidates": "hr_snapshot-q022 family (q022, q022a, q022b, q022c), generators claude-opus-blind-style + claude-haiku-blind-style, all 3 seeds",
+      "symptom": "translated DuckDB SQL raises BinderException 'column ppe_dt must appear in GROUP BY' while native BigQuery runs fine -> sqlgami would score a correct BigQuery script as a run error",
+      "root_cause_1": "BigQuery vs DuckDB resolve GROUP BY <name> differently when <name> is both a SELECT alias and an in-scope column: BigQuery binds the alias, DuckDB binds the column.",
+      "root_cause_2": "sqlgami's script binder rewrites the unambiguous GROUP BY pp.ppe_dt into GROUP BY period_end_dt (the SELECT alias), which collides with emp_period_snapshot.period_end_dt. The plain (non-script) version keeps pp.ppe_dt and agrees.",
+      "minimal_construct": "SELECT a.v AS k, COUNT(*) AS n FROM (SELECT 1 AS v) a CROSS JOIN (SELECT 2 AS k) b GROUP BY k  -- BigQuery: [[1,1]]; DuckDB translation: BinderException",
+      "test": "tests/test_redteam_bq_groupby_alias.py",
+      "fix_direction": "translate a GROUP BY alias-reference to an unambiguous form (underlying expression or ordinal) so DuckDB groups as BigQuery does; and the binder should not rewrite a GROUP BY column into a colliding alias"
+    }
+  ],
+  "harness_note": "An earlier pass reported 144 value disagreements; all were a harness artifact -- bq's multi-statement CSV output prints a per-statement header row that the parser counted as data (native_n == duck_n+1 in 144/144, extra row = the column names). After stripping it, script candidates agree 144/144. No sqlgami defect.",
+  "native_errored_note": "129 candidate x seed runs errored natively on BigQuery (e.g. LLM hallucinations like acme-people-prod.hr_ref.hierarchy_dim, which does not exist). sqlgami also rejects these (unknown_table); not a translation issue."
+}
