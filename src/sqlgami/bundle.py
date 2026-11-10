@@ -43,7 +43,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import sqlglot
 
@@ -176,7 +176,7 @@ def compile_bundle(
     terms_path: Path | None = None
     if terms_source:
         terms_path = Path(terms_source) if Path(terms_source).is_absolute() else base / terms_source
-        catalogue = load_terms(terms_path)
+        catalogue = load_terms(terms_path, dialect)
 
     out = Path(out)
     if out.exists():
@@ -236,6 +236,7 @@ def compile_bundle(
                 outcome = _run_on(
                     connections[fixture.name], reference.sql, dialect, reference.params, slots=reference.slots,
                     allowed_functions=config.get("allowed_functions") or (), allowed_tables=config.get("allowed_tables") or (),
+                    tables=config.get("tables") or None,
                 )
                 timings[fixture.name].append((time.perf_counter() - started) * 1000)
                 if outcome.get("error"):
@@ -256,6 +257,7 @@ def compile_bundle(
         "created": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
         "dialect": dialect,
         "schema_file": str(config.get("schema") or ""),  # which dialect's DDL the fixtures came from
+        "tables": {str(k): str(v) for k, v in (config.get("tables") or {}).items()},  # host names -> fixture tables (ADR 0003)
         "schema_hash": schema_hash(catalog),
         "catalogue": catalogue.to_dict() if catalogue is not None else None,
         "fixtures": [
@@ -435,15 +437,19 @@ def _scalar(text: str) -> Any:
         return text
 
 
-def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str, Any] | None = None) -> str:
+def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str, Any] | None = None, tables: Mapping[str, str] | None = None) -> str:
+    """The statement as DuckDB SQL for a fixture: slots and parameters bound, and — for another
+    dialect — translated through the verified allow-list (:mod:`sqlgami.translate`), raising
+    ``Untranslatable`` for a construct whose translation is not proven."""
     from . import template
+    from .translate import translate
 
     for slot, value in (slots or {}).items():
         sql = sql.replace("{" + slot + "}", str(int(value)) if isinstance(value, (int, float)) and float(value).is_integer() else str(value))
     prepared = template.prepare(sql, dialect, params or None)
     text = prepared.executable_sql or sql
     if dialect != "duckdb":
-        text = sqlglot.transpile(text, read=dialect, write="duckdb")[0]
+        text = translate(text, dialect, tables).sql
     return text
 
 
@@ -457,6 +463,7 @@ def _run_on(
     allowed_functions: Sequence[str] = (),
     allowed_tables: Sequence[str] = (),
     grace_s: float | None = None,
+    tables: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run ``sql`` on a fixture connection and return the stored form of its result. The same
     gate as everywhere applies: a statement that is not a single read-only query over known
@@ -464,9 +471,12 @@ def _run_on(
     is given to stop before the cursor is abandoned (a live deadline passes what it has left)."""
     from .engines.duckdb import DuckDBAdapter
     from .errors import UnsafeQueryError
+    from .translate import Untranslatable
 
     try:
-        text = _executable(sql, dialect, params, slots)
+        text = _executable(sql, dialect, params, slots, tables)
+    except Untranslatable as exc:
+        return {"ok": False, "error": str(exc), "untranslatable": exc.construct}
     except Exception as exc:
         return {"ok": False, "error": f"could not prepare: {exc}"}
     adapter = DuckDBAdapter(conn)
@@ -555,6 +565,11 @@ class Bundle:
     @property
     def dialect(self) -> str:
         return str(self.manifest.get("dialect") or "duckdb")
+
+    @property
+    def tables(self) -> dict[str, str]:
+        """The host's table map: its own names (```proj.ds.t```) to the fixture tables."""
+        return dict(self.manifest.get("tables") or {})
 
     @property
     def schema_hash(self) -> str:

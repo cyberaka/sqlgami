@@ -1,0 +1,148 @@
+"""Translation of a statement from its dialect to DuckDB for the fixture stage (ADR 0003, B1).
+
+Fixtures live in DuckDB; a host's BigQuery (or Postgres, SQLite) statement is run on them
+through sqlglot's transpilation — but only when every construct it uses is on the VERIFIED
+allow-list for that dialect: functions, clauses, types and date parts whose translation a test
+has shown to give the same result as the source engine on fixture data. A construct that is not
+on the list raises :class:`Untranslatable`, and the fixture stage reports ``not_run`` with the
+construct's name: a lost check, never a verdict. The list grows only by proof
+(``tests/test_bigquery_translation.py``; entries confirmed against the real service through
+the offline adapter are the ground truth).
+
+A host also declares how its names map to the bundle's tables (``tables:`` in the compile
+config): `` `proj-x.hr.emp_period_snapshot` `` → ``hr.emp_period_snapshot``. A three-part name
+with no mapping is untranslatable; nothing is guessed from a name's tail.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+import sqlglot
+from sqlglot import exp
+
+from .errors import SqlgamiError
+
+
+class Untranslatable(SqlgamiError):
+    """The statement uses a construct whose translation to DuckDB has not been verified."""
+
+    def __init__(self, construct: str) -> None:
+        super().__init__(f"untranslatable: {construct}")
+        self.construct = construct
+
+
+# Constructs whose DuckDB translation is verified equal on fixture data. Keyed by kind:
+#   func:NAME   a function (sqlglot's canonical name, or the raw name for anonymous ones)
+#   type:NAME   a type named in a CAST
+#   part:NAME   a date/time part named in DATE_TRUNC, DATE_DIFF, EXTRACT and the like
+#   clause:X    QUALIFY, UNNEST, STRUCT, ARRAY literals, window functions
+CORE = frozenset(
+    {
+        # aggregates and windows
+        "func:COUNT", "func:SUM", "func:MIN", "func:MAX", "func:AVG", "func:COUNT_IF", "func:ANY_VALUE", "func:APPROX_DISTINCT",
+        "func:ARRAY_AGG", "func:GROUP_CONCAT", "func:ROW_NUMBER", "func:RANK", "func:DENSE_RANK", "func:LAG", "func:LEAD",
+        "func:FIRST_VALUE", "func:LAST_VALUE", "clause:window",
+        # scalar
+        "func:CAST", "func:TRY_CAST", "func:COALESCE", "func:IF", "func:NULLIF", "func:GREATEST", "func:LEAST", "func:ABS", "func:ROUND",
+        "func:FLOOR", "func:CEIL", "func:SAFE_DIVIDE", "func:LOWER", "func:UPPER", "func:TRIM", "func:LENGTH",
+        "func:CONCAT", "func:SUBSTRING", "func:STARTS_WITH", "func:ENDS_WITH", "func:REGEXP_LIKE",
+        # dates
+        "func:DATE_SUB", "func:DATE_ADD", "func:DATE_TRUNC", "func:TIMESTAMP_TRUNC", "func:DATEDIFF", "func:EXTRACT", "func:TIME_TO_STR",
+        "func:LAST_DAY", "func:GENERATE_DATE_ARRAY", "func:DATE", "func:STR_TO_DATE", "func:TS_OR_DS_TO_DATE",
+        "func:CURRENT_DATE",
+        "part:DAY", "part:MONTH", "part:YEAR", "part:QUARTER", "part:HOUR", "part:MINUTE", "part:SECOND", "part:WEEK",
+        # arrays and structs
+        "func:ARRAY", "func:UNNEST", "func:STRUCT", "func:ARRAY_SIZE", "clause:unnest", "clause:struct", "clause:array",
+        # clauses and types
+        "clause:qualify",
+        # types as sqlglot names them after parsing BigQuery (INT64 → BIGINT, STRING → TEXT, FLOAT64 → DOUBLE, BOOL → BOOLEAN, NUMERIC → DECIMAL)
+        "type:BIGINT", "type:DOUBLE", "type:DECIMAL", "type:TEXT", "type:BOOLEAN", "type:DATE", "type:TIMESTAMPTZ",
+    }
+)
+VERIFIED: dict[str, frozenset[str]] = {"bigquery": CORE, "postgres": CORE, "sqlite": CORE}
+
+_OPERATORS = tuple(
+    getattr(exp, name)
+    for name in ("Connector", "Add", "Sub", "Mul", "Div", "IntDiv", "Mod", "Pow", "EQ", "NEQ", "GT", "GTE", "LT", "LTE", "Is", "NullSafeEQ", "NullSafeNEQ", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "DPipe", "Not", "Neg")
+    if hasattr(exp, name)
+)
+_PART_HOLDERS = (exp.DateTrunc, exp.TimestampTrunc, exp.DateDiff, exp.Extract, exp.TsOrDsDiff, exp.DateAdd, exp.DateSub)
+
+
+@dataclass
+class Translation:
+    sql: str
+    constructs: set[str] = field(default_factory=set)
+    tables: dict[str, str] = field(default_factory=dict)  # source name -> fixture table used
+
+
+def constructs_of(tree: exp.Expression) -> set[str]:
+    """Every construct the statement uses, keyed as in :data:`CORE`."""
+    found: set[str] = set()
+    for node in tree.walk():
+        if isinstance(node, exp.Anonymous):
+            found.add("func:" + str(node.name).upper())
+        elif isinstance(node, exp.Func) and not isinstance(node, _OPERATORS):
+            found.add("func:" + node.sql_name().upper())  # operators (+, =, AND) are not constructs
+        if isinstance(node, exp.Cast) and isinstance(node.to, exp.DataType):
+            found.add("type:" + (node.to.this.value if isinstance(node.to.this, exp.DataType.Type) else str(node.to.this)).upper())
+        if isinstance(node, _PART_HOLDERS):
+            unit = node.this if isinstance(node, exp.Extract) else node.args.get("unit")
+            if unit is not None:
+                # WEEK(SUNDAY) is sqlglot's spelling of BigQuery's Sunday-based WEEK
+                found.add("part:" + (unit.name if not isinstance(unit, exp.WeekStart) else "WEEK").upper().split("(")[0])
+        if isinstance(node, exp.Qualify):
+            found.add("clause:qualify")
+        if isinstance(node, exp.Unnest):
+            found.add("clause:unnest")
+        if isinstance(node, exp.Struct):
+            found.add("clause:struct")
+        if isinstance(node, exp.Array):
+            found.add("clause:array")
+        if isinstance(node, exp.Window):
+            found.add("clause:window")
+    return found
+
+
+def _table_key(table: exp.Table) -> str:
+    parts = [p for p in (table.catalog, table.db, table.name) if p]
+    return ".".join(parts).lower()
+
+
+def map_tables(tree: exp.Expression, tables: Mapping[str, str] | None) -> dict[str, str]:
+    """Rewrite table references through the host's map (```proj.ds.t``` → ``ds.t``); a three-part
+    name with no mapping is untranslatable. Returns what was mapped."""
+    mapping = {str(k).strip("`").lower(): str(v) for k, v in (tables or {}).items()}
+    ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    done: dict[str, str] = {}
+    for table in list(tree.find_all(exp.Table)):
+        key = _table_key(table)
+        if not key or key in ctes:
+            continue
+        target = mapping.get(key)
+        if target is None and table.catalog:
+            raise Untranslatable(f"table {key} has no fixture table declared under tables:")
+        if target is None:
+            continue
+        schema, _, name = target.rpartition(".")
+        table.set("catalog", None)
+        table.set("db", exp.to_identifier(schema) if schema else None)
+        table.set("this", exp.to_identifier(name))
+        done[key] = target
+    return done
+
+
+def translate(sql: str, dialect: str, tables: Mapping[str, str] | None = None, target: str = "duckdb") -> Translation:
+    """``sql`` in ``dialect`` as DuckDB SQL, or :class:`Untranslatable`."""
+    if dialect == target:
+        return Translation(sql)
+    tree = sqlglot.parse_one(sql, read=dialect)
+    used = constructs_of(tree)
+    allowed = VERIFIED.get(dialect, CORE)
+    unverified = sorted(c for c in used if c not in allowed)
+    if unverified:
+        raise Untranslatable(", ".join(unverified))
+    mapped = map_tables(tree, tables)
+    return Translation(tree.sql(dialect=target), used, mapped)

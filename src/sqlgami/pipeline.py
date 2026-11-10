@@ -740,7 +740,7 @@ def _fixture_stage(
             outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": str(exc)[:160]})
             continue
         if not same_values:
-            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s)
+            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s, tables=bundle.tables or None)
             if not stored.get("ok"):
                 error = str(stored.get("error") or "")
                 if "stopped" in error or "abandoned" in error:
@@ -760,7 +760,16 @@ def _fixture_stage(
             # An empty reference result proves nothing: any query returning nothing would match.
             outcome["fixtures"].append({"fixture": fixture_name, "status": "no_evidence", "reason": "the reference returns no rows on this fixture"})
             continue
-        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s)
+        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables, grace_s=grace_s, tables=bundle.tables or None)
+        if result.get("untranslatable"):
+            # A construct whose DuckDB translation is not verified: the fixtures cannot judge
+            # this statement at all. Say which construct; never a verdict.
+            outcome["fixtures"] = [{"fixture": fixture_name, "status": "untranslatable", "reason": str(result.get("error"))}]
+            outcome["verdict"] = "unverified"
+            outcome["untranslatable"] = result["untranslatable"]
+            report.signals["fixtures"] = outcome
+            _stage(report, name, StageStatus.NOT_RUN, f"{result['error']}: the translation of this construct to the fixture engine is not verified", clock.lap())
+            return
         if not result.get("ok"):
             error = str(result.get("error") or "")
             status = "timeout" if "stopped" in error or "abandoned" in error or "deadline" in error else "error"

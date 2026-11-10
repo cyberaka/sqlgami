@@ -260,6 +260,8 @@ class Catalog:
         )
         self.tenant_column = tenant_column
         self.soft_delete_column = soft_delete_column
+        # Host names for catalogue tables (```proj-x.hr.snapshot``` -> hr.snapshot), declared, never guessed.
+        self.table_aliases: dict[str, str] = {}
         if soft_delete_policy not in ("advisory", "required"):
             raise CatalogError("soft_delete_policy must be 'advisory' or 'required'")
         self.soft_delete_policy = soft_delete_policy
@@ -403,10 +405,25 @@ class Catalog:
     ) -> Table | None:
         """Find a table or view by the name written in a query."""
         name_key = self.reference_key(name, quoted)
+        if self.table_aliases:
+            written = ".".join(p for p in (schema, name) if p).strip("`").lower()
+            target = self.table_aliases.get(written)
+            if target is not None:
+                t_schema, _, t_name = target.rpartition(".")
+                found = self._get((self.storage_key(t_schema) if t_schema else self.default_schema or "", self.reference_key(t_name)))
+                if found is not None:
+                    return found
         if self.dialect == "bigquery" and (not schema or "." not in schema):
             return self._resolve_bigquery(name_key, schema)
         if schema:
-            return self._get((self.reference_key(schema, schema_quoted), name_key))
+            found = self._get((self.reference_key(schema, schema_quoted), name_key))
+            if found is None and self.dialect == "bigquery" and "." in schema and not self.default_project:
+                # project.dataset.table against a catalogue declared without projects: the
+                # catalogue is project-agnostic, so the dataset decides
+                project, _, dataset = schema.partition(".")
+                if not any("." in key[0] for key in self._ensure_index()):
+                    found = self._get((self.reference_key(dataset, schema_quoted), name_key))
+            return found
         for candidate in (list(search_path) if search_path else self.search_path):
             table = self._get((self.storage_key(candidate), name_key))
             if table is not None:

@@ -678,10 +678,11 @@ def catalogue_from_yaml_glossary(text: str) -> Catalogue | None:
     return None
 
 
-def load_terms(source: Any) -> Catalogue:
-    """``Scorer(terms=...)``: see :meth:`Catalogue.load`. Validation problems are errors."""
+def load_terms(source: Any, dialect: str = "duckdb") -> Catalogue:
+    """``Scorer(terms=...)``: see :meth:`Catalogue.load`. Validation problems are errors; the
+    SQL in the sheets is read in ``dialect`` (a BigQuery host writes backticked names)."""
     catalogue = Catalogue.load(source)
-    problems = catalogue.validate()
+    problems = catalogue.validate(dialect)
     if problems:
         shown = "; ".join(str(p) for p in problems[:5])
         more = f" (+{len(problems) - 5} more)" if len(problems) > 5 else ""

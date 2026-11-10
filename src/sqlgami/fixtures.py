@@ -131,6 +131,10 @@ class Fixture:
         except ImportError as exc:  # pragma: no cover - depends on the environment
             raise ConfigurationError("fixtures need the duckdb package: pip install sqlgami[duckdb]") from exc
         conn = duckdb.connect()
+        # Fixture time is UTC whatever the host machine's zone: a bare TIMESTAMP literal means
+        # the same instant here as it does in BigQuery, and results do not depend on where
+        # the bundle is loaded.
+        conn.execute("SET TimeZone = 'UTC'")
         for statement in self.ddl.split(";\n"):
             if statement.strip():
                 conn.execute(statement)

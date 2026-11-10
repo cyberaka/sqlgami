@@ -173,8 +173,11 @@ class Scorer:
                 raise ConfigurationError("the bundle was compiled against a different schema; recompile it (sqlgami compile)")
             if terms is None and self.bundle.terms_path() is not None:
                 terms = self.bundle.terms_path()
+            if self.catalog is not None and self.bundle.tables:
+                # the host's names for the catalogue's tables (```proj-x.hr.snapshot```), as declared at compile
+                self.catalog.table_aliases.update({str(k).strip("`").lower(): str(v) for k, v in self.bundle.tables.items()})
             self.bundle.warm()  # the fixtures are loaded once, here, not inside the first deadline
-        self.terms = load_terms(terms) if terms is not None else None
+        self.terms = load_terms(terms, self.dialect) if terms is not None else None
         if self.terms is None and isinstance(glossary, str) and "terms:" in glossary:
             self.terms = catalogue_from_yaml_glossary(glossary)
 
