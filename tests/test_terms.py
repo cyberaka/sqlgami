@@ -249,11 +249,19 @@ def test_documentation_only_term_is_undefined_and_caps_confidence():
     assert "terms" not in plain.signals  # no catalogue, no term findings, nothing capped for words
 
 
-def test_chain_term_becomes_the_access_rule():
+def test_chain_term_is_the_access_rule_when_the_question_asks_for_it():
     partial = "SELECT COUNT(*) FROM hr_emp_period_snapshot s WHERE " + " OR ".join(f"s.lvl_{n}_id = {{manager_id}}" for n in range(2, 8))
-    report = scorer().explain(partial, "Headcount under me", params={"manager_id": 7})
+    report = scorer().explain(partial, "Headcount in my organisation", params={"manager_id": 7})
     finding = next(f for f in report.findings if f.code == "required_predicate")
-    assert finding.severity == Severity.HIGH and "leaves out" in finding.message
+    assert finding.severity == Severity.HIGH and "leaves out" in finding.message and finding.evidence["term"] == "my_organisation"
+    # a question that does not ask for the term is not held to it (a policy that always applies
+    # belongs in required_predicates)
+    assert not scorer().explain(partial, "Headcount by reporting level", params={"manager_id": 7}).has("required_predicate")
+    # a one-column chain is a plain filter: tenant_id = {tenant_id}
+    one = Catalogue.from_sheets({"terms": TERMS + "tenant,tenant;for tenant,chain,,lvl_2_id = {manager_id},,\n", "kpis": KPIS, "parameters": PARAMS})
+    sc = Scorer("duckdb", catalog=HR_DDL, terms=one)
+    assert not {k for k in _term_findings(sc.explain("SELECT COUNT(*) FROM hr_emp_period_snapshot WHERE lvl_2_id = {manager_id}", "Rows for tenant 7", params={"manager_id": 7}))}
+    assert "term_missing" in _term_findings(sc.explain("SELECT COUNT(*) FROM hr_emp_period_snapshot", "Rows for tenant 7", params={"manager_id": 7}))
 
 
 def test_glossary_yaml_with_a_terms_section_is_a_catalogue():

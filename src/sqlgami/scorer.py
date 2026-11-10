@@ -177,8 +177,6 @@ class Scorer:
         self.terms = load_terms(terms) if terms is not None else None
         if self.terms is None and isinstance(glossary, str) and "terms:" in glossary:
             self.terms = catalogue_from_yaml_glossary(glossary)
-        if self.terms is not None and self.catalog is not None:
-            self.catalog.required_predicates.extend(_chain_rules(self.terms))
 
         self.options = options or Options()
         if allowed_functions:
@@ -325,16 +323,3 @@ class Scorer:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
-
-def _chain_rules(catalogue: Any) -> list[RequiredPredicate]:
-    """Terms of kind ``chain`` are access-chain rules: ``col1, col2, ... = {param}`` on a table."""
-    rules: list[RequiredPredicate] = []
-    for term in catalogue.terms:
-        if term.kind != "chain" or not term.sql.strip():
-            continue
-        left, _, _ = term.sql.rpartition("=")
-        columns = tuple(c.strip() for c in left.split(",") if c.strip())
-        tables = tuple(t.strip() for t in term.table.split(";") if t.strip() and t.strip() != "*")
-        if columns:
-            rules.append(RequiredPredicate(term.name, columns, tables, "or_chain", "high", term.description))
-    return rules

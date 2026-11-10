@@ -406,7 +406,9 @@ def _phrase_pattern(phrase: str) -> re.Pattern[str]:
             if name in ("n", "m"):
                 parts.append(rf"(?P<{name}>\d+|{'|'.join(_NUMBER_WORDS)})")
             else:
-                parts.append(rf"(?P<{name}>[\w.]+)")
+                # a parameter slot takes a value, not a word: a number, an identifier with digits
+                # or underscores, or a quoted/placeholder form — never plain prose
+                parts.append(rf"(?P<{name}>\{{\w+\}}|\d[\w.]*|[a-z]+\d[\w.]*|[a-z]*_[\w.]+)")
         else:
             word = re.escape(token)
             parts.append(word + ("(?:s|es)?" if not token.endswith("s") else "(?:es)?"))

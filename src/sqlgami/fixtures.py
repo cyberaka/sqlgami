@@ -91,18 +91,26 @@ class Fixture:
     tables: dict[str, tuple[list[str], list[tuple]]]  # qualified table name -> (columns, rows)
     ddl: str  # DuckDB DDL that creates the tables
     types: dict[str, list[str]] = field(default_factory=dict)  # qualified table name -> DuckDB column types
+    # The CSV text of each table as written to disk: the stored truth, hashed and loaded as is.
+    texts: dict[str, str] = field(default_factory=dict)
 
     def row_count(self) -> int:
         return sum(len(rows) for _, rows in self.tables.values())
 
+    def text_of(self, name: str) -> str:
+        if name not in self.texts:
+            columns, rows = self.tables[name]
+            self.texts[name] = _csv_text(columns, rows)
+        return self.texts[name]
+
     def digest(self) -> str:
-        """A content hash: the same fixture always hashes the same."""
+        """A content hash of the DDL and the tables' CSV text: the same fixture always hashes the
+        same, on any machine, whether built or read back from disk."""
         h = hashlib.sha256()
         h.update(self.ddl.encode("utf-8"))
         for name in sorted(self.tables):
-            columns, rows = self.tables[name]
             h.update(name.encode("utf-8"))
-            h.update(_csv_text(columns, rows).encode("utf-8"))
+            h.update(self.text_of(name).encode("utf-8"))
         return h.hexdigest()
 
     def connect(self) -> Any:
@@ -125,7 +133,7 @@ class Fixture:
                     continue
                 path = os.path.join(folder, name.replace(".", "_") + ".csv")
                 with open(path, "w", encoding="utf-8", newline="") as fh:
-                    fh.write(_csv_text(columns, rows))
+                    fh.write(self.text_of(name))
                 conn.execute(
                     f"INSERT INTO {name} ({', '.join(columns)}) SELECT * FROM read_csv(?, header = true, nullstr = '', "
                     f"columns = {{{', '.join(f'{c!r}: {t!r}' for c, t in zip(columns, self._column_types(name)))}}})",
@@ -144,8 +152,8 @@ class Fixture:
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "schema.sql").write_text(self.ddl, encoding="utf-8")
-        for name, (columns, rows) in self.tables.items():
-            (folder / f"{name}.csv").write_text(_csv_text(columns, rows), encoding="utf-8")
+        for name in self.tables:
+            (folder / f"{name}.csv").write_text(self.text_of(name), encoding="utf-8")
         (folder / "fixture.json").write_text(
             json.dumps({"name": self.name, "profile": self.profile, "seed": self.seed, "rows": self.row_count(), "digest": self.digest(),
                         "tables": {n: len(r) for n, (_, r) in self.tables.items()}, "types": self.types}, indent=1),
@@ -160,13 +168,15 @@ class Fixture:
         meta = json.loads((folder / "fixture.json").read_text(encoding="utf-8"))
         ddl = (folder / "schema.sql").read_text(encoding="utf-8")
         tables: dict[str, tuple[list[str], list[tuple]]] = {}
+        texts: dict[str, str] = {}
         for name in meta["tables"]:
             text = (folder / f"{name}.csv").read_text(encoding="utf-8")
+            texts[name] = text
             reader = csv.reader(io.StringIO(text))
             columns = next(reader)
             rows = [tuple(_from_csv(v) for v in row) for row in reader]
             tables[name] = (columns, rows)
-        fixture = cls(meta["name"], meta["profile"], int(meta["seed"]), tables, ddl, {k: list(v) for k, v in (meta.get("types") or {}).items()})
+        fixture = cls(meta["name"], meta["profile"], int(meta["seed"]), tables, ddl, {k: list(v) for k, v in (meta.get("types") or {}).items()}, texts)
         if fixture.digest() != meta.get("digest"):
             raise ConfigurationError(f"fixture {folder} does not match its recorded digest; it was edited or corrupted")
         return fixture

@@ -113,7 +113,7 @@ def _judge_term(
             evidence={"term": term.name, "phrase": match.phrase},
         )
     if term.kind == "chain":
-        return outcome, None  # judged by the required-predicate rule it was folded into
+        return _judge_chain(ctx, term, match, dialect, outcome)
     if term.table and term.table.strip() != "*" and not _reads(ctx, term.table) and not _reads_column_of(ctx, term, dialect):
         outcome.status = NOT_READ
         outcome.detail = f"the query reads none of {term.table}"
@@ -141,6 +141,50 @@ def _judge_term(
     if term.kind == "formula":
         return _judge_formula(ctx, term, match, node, outcome)
     return outcome, None  # chain: judged by the required-predicate rule it was folded into
+
+
+def _judge_chain(ctx: CheckContext, term: Term, match: Match, dialect: str, outcome: TermOutcome) -> tuple[TermOutcome, Finding | None]:
+    """An access chain, asked for by the question: an OR chain over the listed columns (any
+    table that has them, or the declared tables) against one value — the required-predicate
+    rule, applied because the term was matched. A one-column chain is a plain filter."""
+    from .catalog import RequiredPredicate
+    from .checks.policy import _or_chain_rule
+
+    left, _, right = term.sql_for(dialect).rpartition("=")
+    columns = tuple(c.strip() for c in left.split(",") if c.strip())
+    if not columns:
+        return outcome, None
+    if len(columns) == 1:
+        single = Term(term.name, term.phrases, "filter", term.table, f"{columns[0]} = {right.strip()}", term.nulls, term.description, term.dialects, term.row)
+        try:
+            node = parse_term_sql(single, dialect)
+        except Exception:
+            return outcome, None
+        if node is None:
+            return outcome, None
+        return _judge_filter(ctx, single, match, node, outcome, negated=False, catalogue=None, dialect=dialect)
+    tables = tuple(t.strip() for t in term.table.split(";") if t.strip() and t.strip() != "*")
+    rule = RequiredPredicate(term.name, columns, tables, "or_chain", "high", term.description)
+    if not any(rule.applies_to(t) for t in ctx.analysis.tables.values()):
+        outcome.status = NOT_READ
+        outcome.detail = "the query reads no table with those columns"
+        return outcome, Finding(
+            "term_source_not_read",
+            Severity.MEDIUM,
+            f'The question asks about "{match.phrase}" ({term.name}), an access chain over {", ".join(columns[:4])}…, and the query reads no table that has those columns.',
+            "question",
+            evidence={"term": term.name},
+        )
+    findings = list(_or_chain_rule(ctx, rule, Severity.HIGH, term.name))
+    if findings:
+        outcome.status = CONTRADICTED if "leaves out" in findings[0].message else MISSING
+        outcome.detail = findings[0].message[:160]
+        finding = findings[0]
+        finding.stage = "question"
+        finding.evidence["term"] = term.name
+        return outcome, finding
+    outcome.status = SATISFIED
+    return outcome, None
 
 
 def _bind(term: Term, bindings: dict[str, str]) -> Term:
@@ -258,14 +302,19 @@ def _column_of(node: exp.Expression) -> str | None:
         node = strip(node.this)
     if isinstance(node, exp.Cast):
         node = strip(node.this)
-    if isinstance(node, exp.Column):
+    if isinstance(node, exp.Column) and not _is_placeholder_column(node):
         return node.name.lower()
     return None
 
 
+def _is_placeholder_column(node: exp.Expression) -> bool:
+    """A term's ``{param}`` after parsing (``sqlgami_ph_param``), or the statement's own marker."""
+    return isinstance(node, exp.Column) and node.name.lower().startswith("sqlgami_ph_")
+
+
 def _is_literal(node: exp.Expression) -> bool:
     node = strip(node)
-    return isinstance(node, (exp.Literal, exp.Null, exp.Boolean, exp.Placeholder, exp.Parameter)) or (
+    return isinstance(node, (exp.Literal, exp.Null, exp.Boolean, exp.Placeholder, exp.Parameter)) or _is_placeholder_column(node) or (
         isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal)
     )
 
@@ -288,6 +337,11 @@ def _value(node: exp.Expression) -> Any:
         return bool(node.this)
     if isinstance(node, exp.Null):
         return None
+    if _is_placeholder_column(node):
+        return "{" + node.name[len("sqlgami_ph_"):] + "}"
+    if isinstance(node, (exp.Placeholder, exp.Parameter)):
+        name = node.name if isinstance(node.this, str) else getattr(node.this, "name", "")
+        return "{" + str(name) + "}"
     return node.sql()
 
 
@@ -318,6 +372,16 @@ def _conditions(ctx: CheckContext, column: str) -> list[tuple[_Cond, SelectModel
             cond = _canonical(part)
             if cond is not None and cond.column == column:
                 found.append((cond, model))
+        # A column equated through a join to one pinned to a value (invoices.tenant_id = t.id
+        # AND t.id = {tenant_id}) is filtered to that value too.
+        for ref, value in model.bound.items():
+            if not _is_literal(value):
+                continue
+            for member in [ref, *model.class_members(ref)]:
+                if member != ref and member[1].lower() == column:
+                    text = f"{member[0]}.{member[1]} = {ref[0]}.{ref[1]} = {value.sql()}"
+                    found.append((_Cond(column, "eq", (_value(value),), None, text), model))
+                    break
     return found
 
 

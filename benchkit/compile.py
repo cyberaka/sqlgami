@@ -57,6 +57,7 @@ def compile_suite(
         "dialect": engine,
         "snapshot_columns": config_block.get("snapshot_columns"),
         "required_predicates": config_block.get("required_predicates"),
+        "allowed_functions": config_block.get("allowed_functions") or [],
         "fixtures": rules,
         "references": references,
     }
@@ -72,7 +73,7 @@ def compile_suite(
         from . import build
 
         extra = yaml.safe_load(rules_file.read_text(encoding="utf-8")) if rules_file else {}
-        where = (extra or {}).get("subsample") or {}
+        where = (extra or {}).get("subsample") or rules.get("subsample") or {}  # the suite's own recipe when no file is given
         prebuilt = []
         for s in suite.nasty_seeds() or suite.seeds:
             conn = build.connect(suite, engine, s)
@@ -80,4 +81,38 @@ def compile_suite(
                 prebuilt.append(from_connection(conn, catalog, f"seed-{s.seed}", where=where, profile="subsample", seed=s.seed))
             finally:
                 conn.close()
-    return compile_bundle(config, out or bundle_dir(suite, engine), catalog=catalog, fixtures=prebuilt)
+    bundle = compile_bundle(config, out or bundle_dir(suite, engine), catalog=catalog, fixtures=prebuilt)
+    _measure_discrimination(bundle, suite, engine)
+    return bundle
+
+
+def _measure_discrimination(bundle: Bundle, suite: Suite, engine: str) -> None:
+    """How many of the suite's planted bugs each fixture tells apart from its gold: written into
+    the manifest so live scoring tries the most discriminating fixture first."""
+    import json
+
+    from sqlgami.bundle import _run_on
+
+    bugs = [b for b in suite.bugs if b.sql and (b.engine in (None, engine))]
+    if not bugs:
+        return
+    by_key = {r.key: r for r in bundle.references}
+    scores: dict[str, int] = {}
+    for entry in bundle.manifest.get("fixtures") or []:
+        name = entry["name"]
+        conn = bundle.connection(name)
+        diverged = 0
+        for bug in bugs:
+            reference = by_key.get(bug.question_id)
+            stored = reference.results.get(name) if reference else None
+            if not stored or not stored.get("ok") or not stored.get("row_count"):
+                continue
+            question = suite.question(bug.question_id)
+            params = question.param_values() if question else {}
+            result = _run_on(conn, bug.sql, engine, params or {}, timeout_s=10.0, slots=reference.slots, allowed_functions=(suite.config.get("sqlgami") or {}).get("allowed_functions") or ())
+            if not result.get("ok") or (result["strict"] != stored["strict"] and result["loose"] != stored["loose"]):
+                diverged += 1
+        scores[name] = diverged
+        entry["discrimination"] = diverged
+    bundle.manifest["bugs_measured"] = len(bugs)
+    (bundle.path / "manifest.json").write_text(json.dumps(bundle.manifest, indent=1), encoding="utf-8")

@@ -1,0 +1,15 @@
+{
+ "sources": [
+  {
+   "source": "/Users/cyberaka/shared/sqlgami-bench/saas_billing",
+   "files": {
+    "questions.jsonl": "91bd14f06431ec2d24f07faaf00ea452",
+    "bugs.jsonl": "bee516b779a1e14d99e365d9ebae41bb",
+    "equivalents.jsonl": "36d233e9b1cd3d1ece2d38892df44d3d",
+    "suite.yaml": "f8c6bf567e40ce635293074d3f8cd5cd",
+    "glossary.yaml": "71c80981a0e5f6f721e5f857f7e2160b",
+    "generate.py": "d7145bef6330322067f4f92b7bc99e16"
+   }
+  }
+ ]
+}

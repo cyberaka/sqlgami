@@ -192,7 +192,10 @@ def compile_bundle(
             problems: list[str] = []
             for fixture in fixtures:
                 started = time.perf_counter()
-                outcome = _run_on(connections[fixture.name], reference.sql, dialect, reference.params, slots=reference.slots)
+                outcome = _run_on(
+                    connections[fixture.name], reference.sql, dialect, reference.params, slots=reference.slots,
+                    allowed_functions=config.get("allowed_functions") or (), allowed_tables=config.get("allowed_tables") or (),
+                )
                 timings[fixture.name].append((time.perf_counter() - started) * 1000)
                 if outcome.get("error"):
                     problems.append(f"{fixture.name}: {outcome['error']}")
@@ -340,16 +343,33 @@ def _executable(sql: str, dialect: str, params: dict[str, Any], slots: dict[str,
     return text
 
 
-def _run_on(conn: Any, sql: str, dialect: str, params: dict[str, Any], timeout_s: float | None = None, slots: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Run ``sql`` on a fixture connection and return the stored form of its result."""
+def _run_on(
+    conn: Any,
+    sql: str,
+    dialect: str,
+    params: dict[str, Any],
+    timeout_s: float | None = None,
+    slots: dict[str, Any] | None = None,
+    allowed_functions: Sequence[str] = (),
+    allowed_tables: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Run ``sql`` on a fixture connection and return the stored form of its result. The same
+    gate as everywhere applies: a statement that is not a single read-only query over known
+    functions and tables is not sent."""
     from .engines.duckdb import DuckDBAdapter
+    from .errors import UnsafeQueryError
 
     try:
         text = _executable(sql, dialect, params, slots)
     except Exception as exc:
         return {"ok": False, "error": f"could not prepare: {exc}"}
     adapter = DuckDBAdapter(conn)
-    result = adapter.execute(text, max_rows=10_000, timeout_s=timeout_s or 30.0)
+    adapter.allowed_functions = frozenset(n.lower() for n in allowed_functions)
+    adapter.allowed_tables = frozenset(n.lower() for n in allowed_tables)
+    try:
+        result = adapter.execute(text, max_rows=10_000, timeout_s=timeout_s or 30.0)
+    except UnsafeQueryError as exc:
+        return {"ok": False, "error": f"not sent: {exc}"}
     if not result.ok:
         return {"ok": False, "error": result.error or "failed"}
     strict, loose = _fingerprint_text(result.columns, result.rows)
@@ -432,9 +452,11 @@ class Bundle:
             self.connection(entry["name"])
 
     def fixture_order(self) -> list[dict[str, Any]]:
-        """Fixtures in the order to try them live: the ones whose references took longest last."""
+        """Fixtures in the order to try them live: the most discriminating first (``discrimination``
+        in the manifest, when the compile step measured it against known-wrong queries), then the
+        ones whose references run fastest."""
         entries = list(self.manifest.get("fixtures") or [])
-        return sorted(entries, key=lambda e: (e.get("reference_max_ms") or 0.0))
+        return sorted(entries, key=lambda e: (-(e.get("discrimination") or 0.0), e.get("reference_max_ms") or 0.0))
 
     def reference_for(self, question: str | None, key: str | None = None, terms: Sequence[str] = ()) -> tuple[Reference | None, str]:
         """The reference for a question: by explicit key, by the exact question text, or by the

@@ -169,3 +169,105 @@ sqlgami:
                 lvl_2_id_fn, lvl_3_id_fn, lvl_4_id_fn, lvl_5_id_fn, lvl_6_id_fn, lvl_7_id_fn]
       match: or_chain
       severity: high
+  # Live-check fixtures. sqlgami builds one small in-memory DuckDB per profile at compile time
+  # and reruns the host's references on it during scoring. The study (sherlock, fixtures_study/)
+  # showed a 92-emp × 27-biweekly-period × 3-snap cut (~6,981 rows on seed 47, ~3-10k on the
+  # six source seeds) runs every holdout gold query in < 20 ms with a 5 ms average on DuckDB
+  # in-memory, well under the 50 ms live budget, and preserves 36/41 bug divergences on s47
+  # (union across six per-seed fixtures covers 41/41 planted bugs). The two sides below:
+  #   * subsample: predicates applied by `benchkit compile --from-seeds` when cutting the
+  #     generated seed databases down to a bundle fixture.
+  #   * rules below (seed/profiles/rows/.../critical_rows): the recipe for sqlgami's own
+  #     synthetic FixtureRules path, so a live build without the seed DBs still carries the
+  #     critical adversarial rows that every planted bug needs.
+  fixtures:
+    # --- subsample recipe for benchkit compile --from-seeds -------------------------
+    subsample:
+      hr.pay_period_dim: "freq_cd <> 'B' OR period_seq BETWEEN -27 AND 1"
+      hr.employee_dim: >-
+        assoc_id IN (SELECT s.assoc_id FROM hr.emp_period_snapshot s JOIN hr.pay_period_dim p ON p.ppe_dt = s.period_end_dt AND p.freq_cd = 'B'
+        WHERE s.snap_dt = s.period_end_dt AND (12003 IN (s.lvl_2_id, s.lvl_3_id, s.lvl_4_id, s.lvl_5_id, s.lvl_6_id, s.lvl_7_id, s.lvl_2_id_fn, s.lvl_3_id_fn, s.lvl_4_id_fn, s.lvl_5_id_fn, s.lvl_6_id_fn, s.lvl_7_id_fn)
+        OR 52002 IN (s.lvl_2_id, s.lvl_3_id, s.lvl_4_id, s.lvl_5_id, s.lvl_6_id, s.lvl_7_id, s.lvl_2_id_fn, s.lvl_3_id_fn, s.lvl_4_id_fn, s.lvl_5_id_fn, s.lvl_6_id_fn, s.lvl_7_id_fn)))
+      hr.emp_period_snapshot: >-
+        period_end_dt IN (SELECT ppe_dt FROM hr.pay_period_dim WHERE freq_cd = 'B' AND period_seq BETWEEN -27 AND 1)
+        AND assoc_id IN (SELECT s.assoc_id FROM hr.emp_period_snapshot s JOIN hr.pay_period_dim p ON p.ppe_dt = s.period_end_dt AND p.freq_cd = 'B'
+        WHERE s.snap_dt = s.period_end_dt AND (12003 IN (s.lvl_2_id, s.lvl_3_id, s.lvl_4_id, s.lvl_5_id, s.lvl_6_id, s.lvl_7_id, s.lvl_2_id_fn, s.lvl_3_id_fn, s.lvl_4_id_fn, s.lvl_5_id_fn, s.lvl_6_id_fn, s.lvl_7_id_fn)
+        OR 52002 IN (s.lvl_2_id, s.lvl_3_id, s.lvl_4_id, s.lvl_5_id, s.lvl_6_id, s.lvl_7_id, s.lvl_2_id_fn, s.lvl_3_id_fn, s.lvl_4_id_fn, s.lvl_5_id_fn, s.lvl_6_id_fn, s.lvl_7_id_fn)))
+
+    # --- synthetic FixtureRules (sqlgami.fixtures.FixtureRules.from_dict) -----------
+    seed: 47
+    profiles: [clean, nulls, duplicates, ties, sparse, edges]
+    rows:
+      hr.pay_period_dim: 156            # 52 biweekly + 104 weekly
+      hr.hierarchy_dim: 400             # both chains, lvls 2..7 pooled
+      hr.employee_dim: 92               # minimum in-scope cohort from the study
+      hr.emp_period_snapshot: 6981      # 92 emps × 27 B-periods × ~2.8 snaps
+    values:
+      hr.emp_period_snapshot.status_cd: [A, L, T, R, U]
+      hr.emp_period_snapshot.assoc_type: [FTE, Contractor, Intern]
+      hr.emp_period_snapshot.region: [NorthAm, EMEA, APAC, LATAM]
+      hr.emp_period_snapshot.segment: [Enterprise, MidMarket, SMB]
+      hr.emp_period_snapshot.country: [US, GB, IN, JP, DE, FR]
+      hr.emp_period_snapshot.job_grp: [ENG, DAT, DES, OPS, SAL]
+      hr.pay_period_dim.freq_cd: [B, W]
+    null_rate:
+      hr.emp_period_snapshot.status_cd: 0.02   # the "~2% NULL status" feature
+      hr.emp_period_snapshot.assoc_type: 0.10  # the "10% NULL employment type" feature
+      hr.emp_period_snapshot.invol_exit_ind: 0.0   # NOT NULL on turnover rows; let generator set
+      hr.employee_dim.term_dt: 0.6                 # most employees are not terminated
+    dates:
+      start: "2024-07-06"    # earliest period_end_dt in the suite
+      end: "2026-07-20"      # covers snap_dt = PPE + 28d for the current period
+    params:
+      manager_id: [12003, 52002]
+    param_columns:
+      manager_id:
+        # Both reporting-chain and functional-chain columns so the fixture carries
+        # the both-chain coverage the required_predicates rule tests.
+        - hr.emp_period_snapshot.lvl_3_id
+        - hr.emp_period_snapshot.lvl_7_id_fn
+    # Rows that MUST exist verbatim so every planted bug has a leak point in the fixture.
+    # These are the "critical aids" from the fixtures_study: seed-47's fn-only on-leave
+    # person (12028), seed-48's three rep-side on-leave injectees (12170/12221/12236),
+    # and the nasty-profile bad-row 999001. One authoritative-snap row per on-leave
+    # person at the current PPE (2026-06-20) with the chain column that makes the
+    # AND/OR precedence bug variants leak.
+    critical_rows:
+      hr.employee_dim:
+        # fn-only on-leave (seed 47 cohort): hire 3y ago, no term, matches 12003 only via fn chain
+        - {assoc_id: 12028, given_name: FnOnly, family_name: OnLeave, hire_dt: "2023-06-20", term_dt: null}
+        # rep-side on-leave (seed 48 cohort): lvl_3_id = 12003, no fn match, status L at current PPE
+        - {assoc_id: 12170, given_name: RepSide, family_name: OnLeaveA, hire_dt: "2023-06-20", term_dt: null}
+        - {assoc_id: 12221, given_name: RepSide, family_name: OnLeaveB, hire_dt: "2023-06-20", term_dt: null}
+        - {assoc_id: 12236, given_name: RepSide, family_name: OnLeaveC, hire_dt: "2023-06-20", term_dt: null}
+        # nasty "term before hire" bad row: exposes future arithmetic bugs on tenure
+        - {assoc_id: 999001, given_name: Bad, family_name: Row, hire_dt: "2026-01-15", term_dt: "2025-06-20"}
+      hr.emp_period_snapshot:
+        # 12028 — fn-only (lvl_7_id_fn=12003), status_cd=L, authoritative current PPE
+        - {snap_dt: "2026-06-20", period_end_dt: "2026-06-20", assoc_id: 12028,
+           hire_dt: "2023-06-20", term_dt: null, status_cd: L,
+           invol_exit_ind: null, new_hire_ind: 0, exit_filt_ind: 0, turn_filt_ind: 0,
+           region: NorthAm, segment: Enterprise, country: US, job_grp: ENG, assoc_type: FTE,
+           lvl_2_id: null, lvl_3_id: null, lvl_4_id: null, lvl_5_id: null, lvl_6_id: null, lvl_7_id: null,
+           lvl_2_id_fn: null, lvl_3_id_fn: null, lvl_4_id_fn: null, lvl_5_id_fn: null, lvl_6_id_fn: null, lvl_7_id_fn: 12003}
+        # 12170 — rep-side (lvl_3_id=12003), no fn match, status_cd=L at current PPE
+        - {snap_dt: "2026-06-20", period_end_dt: "2026-06-20", assoc_id: 12170,
+           hire_dt: "2023-06-20", term_dt: null, status_cd: L,
+           invol_exit_ind: null, new_hire_ind: 0, exit_filt_ind: 0, turn_filt_ind: 0,
+           region: NorthAm, segment: MidMarket, country: US, job_grp: DAT, assoc_type: FTE,
+           lvl_2_id: null, lvl_3_id: 12003, lvl_4_id: null, lvl_5_id: null, lvl_6_id: null, lvl_7_id: null,
+           lvl_2_id_fn: null, lvl_3_id_fn: null, lvl_4_id_fn: null, lvl_5_id_fn: null, lvl_6_id_fn: null, lvl_7_id_fn: null}
+        # 12221 — rep-side, no fn match
+        - {snap_dt: "2026-06-20", period_end_dt: "2026-06-20", assoc_id: 12221,
+           hire_dt: "2023-06-20", term_dt: null, status_cd: L,
+           invol_exit_ind: null, new_hire_ind: 0, exit_filt_ind: 0, turn_filt_ind: 0,
+           region: EMEA, segment: SMB, country: GB, job_grp: DES, assoc_type: FTE,
+           lvl_2_id: null, lvl_3_id: 12003, lvl_4_id: null, lvl_5_id: null, lvl_6_id: null, lvl_7_id: null,
+           lvl_2_id_fn: null, lvl_3_id_fn: null, lvl_4_id_fn: null, lvl_5_id_fn: null, lvl_6_id_fn: null, lvl_7_id_fn: null}
+        # 12236 — rep-side, no fn match
+        - {snap_dt: "2026-06-20", period_end_dt: "2026-06-20", assoc_id: 12236,
+           hire_dt: "2023-06-20", term_dt: null, status_cd: L,
+           invol_exit_ind: null, new_hire_ind: 0, exit_filt_ind: 0, turn_filt_ind: 0,
+           region: APAC, segment: Enterprise, country: IN, job_grp: OPS, assoc_type: FTE,
+           lvl_2_id: null, lvl_3_id: 12003, lvl_4_id: null, lvl_5_id: null, lvl_6_id: null, lvl_7_id: null,
+           lvl_2_id_fn: null, lvl_3_id_fn: null, lvl_4_id_fn: null, lvl_5_id_fn: null, lvl_6_id_fn: null, lvl_7_id_fn: null}

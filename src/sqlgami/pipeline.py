@@ -608,6 +608,7 @@ def _stages(
 
 
 BONUS_FIXTURES = (1.2, 1.6)  # the candidate matches the reference on one fixture / on two or more
+RUNAWAY_CODES = ("unbounded_recursion", "cartesian_join")  # statements not run on fixtures inside a deadline
 
 
 def _fixture_stage(
@@ -645,6 +646,13 @@ def _fixture_stage(
     if reference is None:
         _stage(report, name, StageStatus.NOT_RUN, how)
         return
+    runaway = [f.code for f in report.findings if f.code in RUNAWAY_CODES]
+    if runaway:
+        # A statement the static checks flag as potentially unbounded is not run on the
+        # fixtures inside the deadline: that risk is already a finding.
+        _stage(report, name, StageStatus.NOT_RUN, f"the statement may not finish in time ({', '.join(runaway)})")
+        report.signals["fixtures"] = {"reference": reference.key, "matched_by": how, "verdict": "unverified", "reason": "runaway", "fixtures": []}
+        return
     # The candidate's own values: the question's slots ({n}) and the template parameters it was
     # given. When they equal the reference's, the stored fingerprints serve; otherwise the
     # reference must be a template over those slots and is re-run live beside the candidate.
@@ -672,8 +680,10 @@ def _fixture_stage(
         if not stored or not stored.get("ok"):
             continue
         left = deadline.remaining_ms()
-        per_run = (entry.get("reference_max_ms") or 5.0)
-        needed = per_run * (4 if not same_values else 2) + 2.0
+        # What a run is expected to cost: the reference's typical time on this fixture, doubled
+        # (the candidate may be heavier). The per-statement clamp is the safety net beyond it.
+        per_run = entry.get("reference_ms") or entry.get("reference_max_ms") or 5.0
+        needed = per_run * (4 if not same_values else 2) + 1.0
         if left is not None and left < needed:
             deadline.cut(name)
             outcome["fixtures"].append({"fixture": fixture_name, "status": "not_run", "reason": DEADLINE})
@@ -685,7 +695,7 @@ def _fixture_stage(
             outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": str(exc)[:160]})
             continue
         if not same_values:
-            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots)
+            stored = B._run_on(conn, reference.sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables)
             if not stored.get("ok"):
                 outcome["fixtures"].append({"fixture": fixture_name, "status": "unavailable", "reason": f"the reference fails under these values: {str(stored.get('error'))[:120]}"})
                 continue
@@ -699,7 +709,7 @@ def _fixture_stage(
             # An empty reference result proves nothing: any query returning nothing would match.
             outcome["fixtures"].append({"fixture": fixture_name, "status": "no_evidence", "reason": "the reference returns no rows on this fixture"})
             continue
-        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots)
+        result = B._run_on(conn, sql, dialect, live_params, timeout_s=timeout_s, slots=live_slots, allowed_functions=options.allowed_functions, allowed_tables=options.allowed_tables)
         if not result.get("ok"):
             error = str(result.get("error") or "")
             status = "timeout" if "stopped" in error or "deadline" in error else "error"

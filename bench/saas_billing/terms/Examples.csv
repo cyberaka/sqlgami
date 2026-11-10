@@ -1,0 +1,3 @@
+id,question,params,correct_sql,expected_result,dataset
+ex001,What is total revenue from paid invoices for tenant 1001 last month?,tenant_id=1001,"SELECT SUM(i.total_cents) AS revenue_cents FROM billing.invoices i WHERE i.tenant_id = {tenant_id} AND i.deleted_at IS NULL AND i.status = 'paid' AND i.issued_at >= DATE_TRUNC('month', CAST('2026-06-30' AS DATE)) - INTERVAL '1' MONTH AND i.issued_at < DATE_TRUNC('month', CAST('2026-06-30' AS DATE));",,
+ex002,How many overdue invoices does tenant 1001 have?,tenant_id=1001,"SELECT COUNT(*) AS overdue_n FROM billing.invoices i WHERE i.tenant_id = {tenant_id} AND i.deleted_at IS NULL AND i.status = 'overdue';",,

@@ -133,3 +133,158 @@ nasty_profile_hazards:
   - Trailing whitespace in user emails
   - A "Quiet Holdings" tenant with no disputes / subscriptions / invoices (triggers outer-join collapse bugs)
   - A "Both Pro and Enterprise" tenant that has both plan tiers (triggers NOT IN / EXCEPT bugs)
+
+# How sqlgami is configured for this suite (the owner's real-world setup). benchkit passes
+# these to Scorer(...) when it evaluates the suite.
+sqlgami:
+  # Live-check fixtures. Same pattern as hr_snapshot (see that suite's note): synthetic DB
+  # per profile at compile time, references warmed once, candidate's result compared in a
+  # few ms during live scoring. Two sides:
+  #   * subsample: predicates applied by `benchkit compile --from-seeds` when cutting the
+  #     generated seed databases down to a bundle fixture. Billing is tenant-scoped; we
+  #     keep tenants 10001-10003 and 10007 ("Quiet Holdings" scenario), which together
+  #     span every nasty-profile hazard.
+  #   * rules below (seed/profiles/.../critical_rows): the recipe for sqlgami's own
+  #     synthetic FixtureRules path, so a live build without the seed DBs still carries
+  #     the boundary/tie/shared-number traps that bug divergence depends on.
+  fixtures:
+    # --- subsample recipe for benchkit compile --from-seeds -------------------------
+    # Tenant-scoped tables are cut to tenants 10001, 10002, 10003, 10007. Un-scoped
+    # catalog tables (currencies, exchange_rates, plans, features, PlanFeatures,
+    # usage_meters, usage_prices, tax_jurisdictions, tax_rates, roles) are kept whole
+    # — each has fewer than ~40 rows.
+    subsample:
+      billing.tenants: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.memberships: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.tenant_settings: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.billing_contacts: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.addresses: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.subscriptions: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.invoices: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.payment_methods: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.payments: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.refunds: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.credits: "tenant_id IN (10001, 10002, 10003, 10007)"
+      billing.usage_events: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.audit_log: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.disputes: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.email_events: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.notifications: "tenant_id IN (10001, 10002, 10003, 10007, 99999)"  # keep the orphan
+      audit.webhook_endpoints: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.api_keys: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.api_requests: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.feature_flag_evaluations: "tenant_id IN (10001, 10002, 10003, 10007)"
+      audit.background_jobs: "tenant_id IN (10001, 10002, 10003, 10007)"
+
+    # --- synthetic FixtureRules (sqlgami.fixtures.FixtureRules.from_dict) -----------
+    seed: 43              # nasty2 covers CHF + At-Average + boundary + Only-{Inv,Pay}
+    profiles: [clean, nulls, duplicates, ties, sparse, edges]
+    rows:
+      billing.tenants: 6
+      billing.currencies: 6
+      billing.exchange_rates: 24
+      billing.plans: 8
+      billing.subscriptions: 24
+      billing.invoices: 80
+      billing.payments: 60
+      billing.credits: 12
+    values:
+      billing.tenants.billing_timezone: ["Asia/Kolkata", "Asia/Tokyo", "America/Los_Angeles", "Europe/London"]
+      billing.tenants.currency_code: [USD, GBP, INR, JPY, EUR, CHF]
+      billing.currencies.currency_code: [USD, GBP, INR, JPY, EUR, CHF]
+      billing.plans.billing_interval: [month, year, week]
+      billing.subscriptions.status: [active, past_due, canceled, trialing]
+      billing.invoices.status: [paid, partial, overdue, open, void]
+      billing.payments.status: [succeeded, failed, pending, refunded]
+    null_rate:
+      billing.tenants.deleted_at: 0.0        # tenants with deleted_at NULL are "live"
+      billing.subscriptions.deleted_at: 0.1  # some soft-deleted subs
+      billing.subscriptions.ended_at: 0.6    # most subs are still active
+      billing.invoices.deleted_at: 0.04      # ~4% soft-deleted invoices
+      billing.credits.expires_at: 0.3
+    dates:
+      start: "2025-01-01"
+      end: "2026-07-31"
+    params:
+      tenant_id: [10001, 10002, 10003, 10007]
+      as_of: ["2026-06-30"]
+      n: [7, 30, 60, 90]
+    param_columns:
+      tenant_id:
+        - billing.tenants.tenant_id
+        - billing.memberships.tenant_id
+        - billing.tenant_settings.tenant_id
+        - billing.billing_contacts.tenant_id
+        - billing.addresses.tenant_id
+        - billing.subscriptions.tenant_id
+        - billing.invoices.tenant_id
+        - billing.payment_methods.tenant_id
+        - billing.payments.tenant_id
+        - billing.refunds.tenant_id
+        - billing.credits.tenant_id
+        - billing.usage_events.tenant_id
+        - audit.audit_log.tenant_id
+        - audit.disputes.tenant_id
+        - audit.email_events.tenant_id
+        - audit.notifications.tenant_id
+        - audit.webhook_endpoints.tenant_id
+        - audit.api_keys.tenant_id
+        - audit.api_requests.tenant_id
+        - audit.feature_flag_evaluations.tenant_id
+        - audit.background_jobs.tenant_id
+    # Rows that MUST exist verbatim so every boundary-trap and tie bug has a leak point.
+    # tenant_id 10001 is a baseline live tenant; 10007 is Quiet Holdings (no sub/inv/disp
+    # rows — triggers outer-join collapse bugs). Two tied-9999900 invoices expose
+    # row_number vs dense_rank. The 50000 invoice tests `> 50000` vs `>= 50000`. The
+    # 2026-07-01 credit tests inclusive vs exclusive upper-bound filters. CHF is listed
+    # as a tenant currency with NO USD<->CHF exchange_rates row so the missing-rate
+    # branch fires.
+    critical_rows:
+      billing.currencies:
+        - {currency_code: USD, minor_unit_scale: 100, display_name: US Dollar}
+        - {currency_code: CHF, minor_unit_scale: 100, display_name: Swiss Franc}
+      billing.exchange_rates:
+        # USD-GBP rate present; USD-CHF intentionally ABSENT to exercise the missing-rate branch.
+        - {from_ccy: USD, to_ccy: GBP, rate_date: "2026-06-01", rate_e8: 79000000, source: ecb}
+      billing.tenants:
+        - {tenant_id: 10001, name: "Acme Systems",   slug: acme-systems,   billing_timezone: "America/Los_Angeles", currency_code: USD, created_at: "2024-01-15T00:00:00+00:00", deleted_at: null}
+        - {tenant_id: 10002, name: "Globex Holdings", slug: globex-holdings, billing_timezone: "Europe/London",     currency_code: GBP, created_at: "2024-02-01T00:00:00+00:00", deleted_at: null}
+        - {tenant_id: 10003, name: "Initech Group",   slug: initech-group,   billing_timezone: "Asia/Kolkata",      currency_code: USD, created_at: "2024-03-01T00:00:00+00:00", deleted_at: null}
+        - {tenant_id: 10007, name: "Quiet Holdings",  slug: quiet-holdings,  billing_timezone: "Asia/Tokyo",        currency_code: USD, created_at: "2024-04-01T00:00:00+00:00", deleted_at: null}
+      billing.plans:
+        - {plan_id: 4001, code: PRO_M,  display_name: "Pro Monthly",  billing_interval: month, base_price_cents: 50000,  currency_code: USD, is_active: true, created_at: "2024-01-01T00:00:00+00:00"}
+        - {plan_id: 4002, code: ENT_M,  display_name: "Enterprise Monthly", billing_interval: month, base_price_cents: 500000, currency_code: USD, is_active: true, created_at: "2024-01-01T00:00:00+00:00"}
+      billing.invoices:
+        # Boundary trap: total_cents = 50000 (exact) — tests > 50000 vs >= 50000.
+        - {invoice_id: 200001, tenant_id: 10001, subscription_id: null, invoice_number: "INV-10001-0200001",
+           issued_at: "2026-05-20T00:00:00+00:00", period_start: "2026-05-01", period_end: "2026-05-31",
+           currency_code: USD, subtotal_cents: 50000, tax_cents: 0, total_cents: 50000, status: paid,
+           IsAutoBilled: true, due_date: "2026-06-19", created_at: "2026-05-20T00:00:00+00:00", deleted_at: null}
+        # Two tied highest-paid invoices on tenants 10002 & 10003 — exposes row_number vs dense_rank.
+        - {invoice_id: 200002, tenant_id: 10002, subscription_id: null, invoice_number: "INV-10002-0200002",
+           issued_at: "2026-05-21T00:00:00+00:00", period_start: "2026-05-01", period_end: "2026-05-31",
+           currency_code: GBP, subtotal_cents: 9999900, tax_cents: 0, total_cents: 9999900, status: paid,
+           IsAutoBilled: true, due_date: "2026-06-20", created_at: "2026-05-21T00:00:00+00:00", deleted_at: null}
+        - {invoice_id: 200003, tenant_id: 10003, subscription_id: null, invoice_number: "INV-10003-0200003",
+           issued_at: "2026-05-22T00:00:00+00:00", period_start: "2026-05-01", period_end: "2026-05-31",
+           currency_code: USD, subtotal_cents: 9999900, tax_cents: 0, total_cents: 9999900, status: paid,
+           IsAutoBilled: true, due_date: "2026-06-21", created_at: "2026-05-22T00:00:00+00:00", deleted_at: null}
+        # Shared invoice_number across 10001 and 10002 — exposes missing tenant scope on joins by number.
+        - {invoice_id: 200004, tenant_id: 10001, subscription_id: null, invoice_number: "INV-SHARED-0001",
+           issued_at: "2026-04-10T00:00:00+00:00", period_start: "2026-04-01", period_end: "2026-04-30",
+           currency_code: USD, subtotal_cents: 100000, tax_cents: 7250, total_cents: 107250, status: paid,
+           IsAutoBilled: true, due_date: "2026-05-10", created_at: "2026-04-10T00:00:00+00:00", deleted_at: null}
+        - {invoice_id: 200005, tenant_id: 10002, subscription_id: null, invoice_number: "INV-SHARED-0001",
+           issued_at: "2026-04-11T00:00:00+00:00", period_start: "2026-04-01", period_end: "2026-04-30",
+           currency_code: GBP, subtotal_cents: 100000, tax_cents: 20000, total_cents: 120000, status: paid,
+           IsAutoBilled: true, due_date: "2026-05-11", created_at: "2026-04-11T00:00:00+00:00", deleted_at: null}
+        # Upper Q2 boundary: issued exactly at 2026-07-01T00:00:00+00:00 — tests `< 2026-07-01` vs `<= ...`.
+        - {invoice_id: 200006, tenant_id: 10001, subscription_id: null, invoice_number: "INV-10001-0200006",
+           issued_at: "2026-07-01T00:00:00+00:00", period_start: "2026-06-01", period_end: "2026-06-30",
+           currency_code: USD, subtotal_cents: 25000, tax_cents: 1813, total_cents: 26813, status: paid,
+           IsAutoBilled: true, due_date: "2026-07-31", created_at: "2026-07-01T00:00:00+00:00", deleted_at: null}
+      billing.credits:
+        # Credit expiring exactly at 2026-07-01 — tests inclusive/exclusive upper bounds.
+        - {credit_id: 700001, tenant_id: 10001, amount_cents: 50000, currency_code: USD,
+           issued_at: "2026-05-01T00:00:00+00:00", expires_at: "2026-07-01T00:00:00+00:00",
+           created_at: "2026-05-01T00:00:00+00:00"}

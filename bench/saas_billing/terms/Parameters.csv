@@ -1,0 +1,13 @@
+name,type,example_values
+tenant_id,integer,1001;1002
+as_of,input,
+n,integer,7;30;60;90
+date_a,input,
+date_b,input,
+base_price_cents,input,
+total_cents,input,
+issued_at,input,
+paid_at,input,
+rate,input,
+amount_cents,input,
+rate_e8,input,

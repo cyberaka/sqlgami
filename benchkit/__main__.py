@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             m = bundle.manifest
             print(f"bundle: {bundle.path}  references {m['references']} (rejected {m['rejected']})")
             for entry in m["fixtures"]:
-                print(f"  {entry['name']:16} {entry['rows']:6} rows   gold p50 {entry['reference_ms'] or 0:.1f} ms  max {entry['reference_max_ms'] or 0:.1f} ms")
+                print(f"  {entry['name']:16} {entry['rows']:6} rows   gold p50 {entry['reference_ms'] or 0:.1f} ms  max {entry['reference_max_ms'] or 0:.1f} ms   bugs diverging {entry.get('discrimination', '-')}/{m.get('bugs_measured', '-')}")
             return 0
         if args.command == "latency":
             from .latency import format_result, measure, write_result
