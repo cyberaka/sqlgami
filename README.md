@@ -346,6 +346,7 @@ last_n_pay_periods,last {n} pay periods,window,hr.pay_period_dim,period_seq BETW
 n_pay_periods_ago,{n} pay periods ago,window,hr.pay_period_dim,period_seq = -{n},,
 hire_date,hire date;hired in,source,,hr.employee_dim.hire_dt,,the snapshot's copy may be stale
 my_organisation,my organisation;my org,chain,hr.emp_period_snapshot,"lvl_2_id, lvl_3_id, lvl_2_id_fn, lvl_3_id_fn = {manager_id}",,
+top_dense_ranks,top {n} dense-ranks;top {n} dense ranks,rank,,DENSE_RANK() <= {n},,ties kept
 headcount,headcount,,,,,documentation only: matched but not enforced
 ```
 
@@ -369,7 +370,11 @@ the column `term_differs`); `window` — the query's range on the column has
 the declared size or offset (`BETWEEN -26 AND 0` for "last 26 periods" is
 `term_window`, frames `ROWS BETWEEN n PRECEDING` too); `source` — the column
 is read from the table named (`term_source`); `chain` — an access OR-chain
-over the listed columns (judged as a required predicate); KPI `format`
+over the listed columns (judged as a required predicate); `rank` — a "top
+{n}" is cut the declared way (`LIMIT {n}`, `DENSE_RANK() <= {n}`, `RANK() <=
+{n}` or `ROW_NUMBER() <= {n}`, through CTE columns and QUALIFY) at the number
+the question states: another number, another tie rule or no cut at all is a
+HIGH `term_rank`; KPI `format`
 `integer`/`floor` — the output column named for the KPI is cast or floored and
 not rounded (`term_format`), and a formula `({current} - {prior}) ...` is not
 subtracted the other way round (`term_formula`). Every match and outcome is in
@@ -390,7 +395,28 @@ the `Examples` sheet of the term catalogue plus any `references:` in the config
 — on every fixture, and writes a plain, versioned folder: `manifest.json`,
 `schema.sql`, `terms/`, `fixtures/<name>/*.csv`, `references.json`,
 `rejected.jsonl` (references whose query failed on a fixture; nothing enters
-the bundle unverified). No model is called.
+the bundle unverified). No model is called unless you ask for the optional
+expansion step:
+
+```yaml
+expansion: {model: "hf:meta-llama/Llama-3.3-70B-Instruct", per_term: 6, per_example: 4}
+```
+
+Then — offline, and only here — a model proposes further wordings for every
+term and KPI and paraphrases of every reference question, some with other
+numbers. Nothing enters on its word: a wording is kept only if, added to the
+catalogue, no registered question changes its pattern or slots, it does not
+already occur in a question where it means something else, and a question
+that uses the term re-matches to the same terms and slots with the new
+wording in its place; a paraphrase only if it re-matches the reference's
+pattern, binds the slots the model claims it does, states the same other
+numbers, and the reference runs at those values on every fixture. Accepted
+wordings go to `bundle/review/Terms.additions.csv` for you to paste into the
+workbook (the live catalogue stays yours); accepted paraphrases become
+variants in `references.json`, matched by text and serving their numbers
+without a live re-run; everything else goes to `rejected.jsonl` with the
+reason. Models: `hf:<name>` (allow-listed families, `HF_TOKEN`) or
+`claude:<name>` (`pip install anthropic`, `ANTHROPIC_API_KEY`).
 
 ```yaml
 dialect: duckdb
@@ -409,13 +435,23 @@ Live, `Scorer("duckdb", db=conn, bundle="bundle/")` loads only the bundle (its
 schema hash must match the catalogue; the fixtures go into in-memory DuckDB
 once, at construction). For a question with a reference — chosen by
 `score(..., reference="key")`, else by the exact question text, else by the
-exact set of matched catalogue terms when that set belongs to one reference —
+question's *pattern* — the set of catalogue terms it matches, closed over what
+the catalogue declares (a KPI's `requires`, the shorter phrases a matched
+phrase contains) — when that pattern belongs to exactly one reference; two
+references with one pattern are reported as ambiguous and neither is used —
 the candidate runs on the fixtures while the deadline allows, under the
-reference's own parameter values, and its result fingerprint is compared with
-the stored one: a match on the fixtures run is `likely_right`-grade support; a
-mismatch is `fixture_mismatch` (HIGH, `likely_wrong`) with the differing rows
-as evidence, and the remaining fixtures are not run. A reference that returns
-no rows on a fixture proves nothing there and is skipped. Fixtures can also be
+question's own slot and parameter values, and its result fingerprint is
+compared with the stored one: a match on the fixtures run is
+`likely_right`-grade support; a mismatch is `fixture_mismatch` (HIGH,
+`likely_wrong`) with the differing rows as evidence, and the remaining
+fixtures are not run. A reference that returns no rows on a fixture proves
+nothing there and is skipped. Values are never guessed: a reference written
+over `{n}` is re-run live for a question that binds another `n`; a reference
+fixed at one value, a question that binds no value for a slot, or a question
+and reference that state different numbers no slot accounts for ("top five"
+with no rank term) is `not_run` with the reason. `compile` lists references
+whose text states such a number ("if four nodes tie…"), so the host can
+reword them or write the number as a slot. Fixtures can also be
 cut from a real database (`sqlgami.fixtures.from_connection`); that is an
 explicit choice, since those rows then live in the bundle.
 

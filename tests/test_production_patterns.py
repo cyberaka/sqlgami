@@ -380,6 +380,8 @@ def test_wording_of_bounds(scorer):
         ("How many orders have a total greater than 50?", "SELECT COUNT(*) FROM orders WHERE total > 50"),
         ("How many orders have a total greater than 50?", "SELECT COUNT(*) FROM orders WHERE 50 < total"),
         ("How many orders have a total of 50 or more?", "SELECT COUNT(*) FROM orders WHERE total >= 50"),
+        # a bound word does not reach across a clause break: "before as-of; 0 otherwise" is not "before 0"
+        ("Flag customers with an order placed at or before 2024-01-31; 0 otherwise.", "SELECT c.id, CASE WHEN COUNT(o.id) > 0 THEN 1 ELSE 0 END FROM customers c LEFT JOIN orders o ON o.customer_id = c.id AND o.created_at <= '2024-01-31' GROUP BY c.id"),
     ):
         assert not scorer.sample(sql, question).has("comparison_operator"), sql
 
@@ -648,6 +650,24 @@ def test_or_chain_against_a_column_pinned_to_the_parameter():
     assert finding.severity == Severity.HIGH and "leaves out" in finding.message
     unpinned = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s JOIN hierarchy_dim h ON {chain}", "headcount under a manager")
     assert unpinned.has("required_predicate")  # h.node_id is not pinned to anything: no access filter
+
+
+def test_or_chain_over_columns_each_joined_to_a_level():
+    """One hierarchy_dim join per level (ON s.lvl_2_id = h2.node_id ...) and the chain written over
+    the joined columns (h2.node_id = {m} OR h3.node_id = {m} ...): each branch is a branch on the
+    level it is equated to. A chain that leaves out the functional levels is still incomplete."""
+    ddl = HIER_DDL + "CREATE TABLE hierarchy_dim (node_id INTEGER, hierarchy_kind TEXT);"
+    levels = [f"lvl_{n}_id" for n in range(2, 8)] + [f"lvl_{n}_id_fn" for n in range(2, 8)]
+    joins = " ".join(f"JOIN hierarchy_dim h_{c} ON s.{c} = h_{c}.node_id" for c in levels)
+    both_chains = {"name": "hierarchy_access", "tables": ["snap"], "match": "or_chain", "columns": levels}
+    sc = Scorer("duckdb", catalog=ddl, required_predicates=[both_chains])
+    chain = " OR ".join(f"h_{c}.node_id = {{manager_id}}" for c in levels)
+    full = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s {joins} WHERE ({chain})", "headcount under a manager", params={"manager_id": 7})
+    assert not full.has("required_predicate"), full.summary()
+    reporting_only = " OR ".join(f"h_{c}.node_id = {{manager_id}}" for c in levels[:6])
+    short = sc.explain(f"SELECT COUNT(DISTINCT s.assoc_id) FROM snap s {joins} WHERE ({reporting_only})", "headcount under a manager", params={"manager_id": 7})
+    finding = next(f for f in short.findings if f.code == "required_predicate")
+    assert finding.severity == Severity.HIGH and "leaves out" in finding.message
 
 
 def test_distinct_entity_keys_from_a_snapshot_are_not_a_grain_problem():

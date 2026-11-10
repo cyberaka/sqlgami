@@ -145,7 +145,10 @@ class _Tracer:
                         counted=len(model.sources) == 1
                         or model.multiplied(alias).state == NO
                         or self._lists_rows(model, alias),
-                        lookup=lookup and (len(model.sources) == 1 or model.multiplied(alias).state == NO),
+                        # Looked up only: through a consumer that only looks this query's values up, or
+                        # joined here at most one row per row of the table that brings the rows, with
+                        # its own key neither listed nor grouped by.
+                        lookup=(lookup and (len(model.sources) == 1 or model.multiplied(alias).state == NO)) or self._is_lookup(model, alias),
                     ),
                 )
             elif source.kind == "derived" and source.scope is not None:
@@ -328,11 +331,9 @@ class _Tracer:
                 if isinstance(inner, exp.Column) and inner.table == alias:
                     if any(key and key <= {inner.name} for key in model.key_info(alias).keys):
                         return False  # its key is listed: rows per tenant
-        driver = any(
-            model.multiplied(other).state == NO and not model.joins_at_most_one(other, set(model.sources) - {other})
-            for other in others
-        )
-        return driver
+        # Some other source brings the rows (it is not itself joined at most one per row of the
+        # rest); whether a third table repeats that source is a fan-out question, not this one.
+        return any(not model.joins_at_most_one(other, set(model.sources) - {other}) for other in others)
 
     def _key_semi_joined(self, model: SelectModel, anchored: set[str], outer: frozenset[ColRef]) -> set[str]:
         """``t.key IN (SELECT key FROM t WHERE <the filter>)``: the outer rows are the filtered ones."""
@@ -551,9 +552,13 @@ def _or_chain_rule(ctx: CheckContext, rule: RequiredPredicate, severity: Severit
             if not same_value:
                 continue
             for ref in refs:
-                base = _base_of(model, ref)
-                if base is not None:
-                    per_table.setdefault(base[0].qualified_name, set()).add(catalog.column_key(base[1]))
+                # A branch on a column equated to another through a join (ON eps.lvl_2_id = h2.node_id
+                # ... WHERE h2.node_id = 7 OR ...) is a branch on that column too: rows where the
+                # branch holds have both equal to the value.
+                for member in {ref, *model.class_members(ref)}:
+                    base = _base_of(model, member)
+                    if base is not None:
+                        per_table.setdefault(base[0].qualified_name, set()).add(catalog.column_key(base[1]))
         for name, columns in per_table.items():
             chains.setdefault(name, []).append(columns)
     for table in ctx.analysis.tables.values():

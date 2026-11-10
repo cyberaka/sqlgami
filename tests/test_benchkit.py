@@ -332,3 +332,22 @@ def test_sync_keeps_the_scorer_block_the_source_lacks(tmp_path):
         fh.write("\nsqlgami:\n  snapshot_columns:\n    t: snap_dt\n")
     sync_suite(source, dest)
     assert load_suite(dest).config.get("sqlgami") == {"snapshot_columns": {"t": "snap_dt"}}
+
+
+def test_accepting_an_expansion_review_adds_the_wordings_to_the_bundle_copy(tmp_path):
+    """After review, the accepted wordings join the bundle's own Terms/KPIs sheets (what a host
+    does by hand in the workbook); the manifest records that the copy is no longer the host's."""
+    from benchkit.compile import _accept_expansion
+    from sqlgami.bundle import Bundle
+
+    bundle = tmp_path / "bundle"
+    (bundle / "terms").mkdir(parents=True)
+    (bundle / "review").mkdir()
+    (bundle / "terms" / "Terms.csv").write_text("term,phrases,kind,table,sql,nulls,description\npaid,paid,filter,orders,status = 'paid',,\n")
+    (bundle / "terms" / "KPIs.csv").write_text("kpi,phrases,formula,format,requires,reference_sql,description\nrevenue,revenue,SUM({total}),,paid,,\n")
+    (bundle / "review" / "Terms.additions.csv").write_text("term,phrase,evidence\npaid,settled,ex1\npaid,\"fully paid, in full\",ex1\nrevenue,takings,ex2\n")
+    (bundle / "manifest.json").write_text(json.dumps({"bundle_version": 1, "fixtures": [], "references": 0, "rejected": 0}))
+    _accept_expansion(Bundle(bundle, json.loads((bundle / "manifest.json").read_text()), []))
+    assert 'paid,"paid;settled;fully paid, in full",filter' in (bundle / "terms" / "Terms.csv").read_text()
+    assert "revenue,revenue;takings" in (bundle / "terms" / "KPIs.csv").read_text()
+    assert json.loads((bundle / "manifest.json").read_text())["expansion_accepted"] is True

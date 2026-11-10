@@ -263,12 +263,20 @@ def _projects_a_key_of(inner: SelectModel, aliases: list[str]) -> bool:
     return False
 
 
+_RANKING = tuple(getattr(exp, name) for name in ("Rank", "DenseRank", "RowNumber", "Ntile", "PercentRank", "CumeDist") if hasattr(exp, name))
+
+
 def _window_aggregates(model: SelectModel) -> list[exp.AggFunc]:
+    """Window aggregates that read joined rows. In an aggregated SELECT a window runs over the
+    grouped rows, after the join's repeats have been folded by GROUP BY, so none applies there;
+    ranking functions (RANK() OVER (ORDER BY COUNT(*))) number rows rather than sum them."""
+    if model.is_aggregated:
+        return []
     found = []
     for projection in model.select.expressions:
         for node in walk_own(projection):
             if isinstance(node, exp.Window) and isinstance(node.this, exp.AggFunc):
-                if not isinstance(node.this, _REPEAT_SAFE):
+                if not isinstance(node.this, _REPEAT_SAFE + _RANKING):
                     found.append(node.this)
     return found
 

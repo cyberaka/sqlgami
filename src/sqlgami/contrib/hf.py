@@ -247,3 +247,70 @@ class HFProber:
         from ..reconcile import extract_json, parse_specs
 
         return parse_specs(extract_json(text if isinstance(text, str) else ""), source=self.model)
+
+
+# ------------------------------------------------------------------- offline chat
+
+
+class HFChat:
+    """A plain chat call for the offline compile step (``sqlgami.expand``): messages in, reply
+    text out. Same endpoint, allowlist and token rules as :class:`HFGenerator`."""
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        token: str | None = None,
+        endpoint: str = DEFAULT_ENDPOINT,
+        temperature: float = 0.3,
+        max_tokens: int = 1200,
+        timeout_s: float = 90.0,
+        transport: Transport | None = None,
+    ) -> None:
+        self.model = check_model(model)
+        self.endpoint = endpoint
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout_s = timeout_s
+        self._transport = transport or _post
+        self._token = token or os.environ.get("HF_TOKEN") or ""
+        if not self._token:
+            raise ConfigurationError("no access token: set HF_TOKEN in the environment or pass token=")
+
+    def __repr__(self) -> str:
+        return f"HFChat(model={self.model!r})"
+
+    def __call__(self, messages: list[dict[str, str]]) -> str:
+        headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
+        payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "temperature": self.temperature}
+        reply = self._transport(self.endpoint, headers, payload, self.timeout_s)
+        try:
+            text = reply["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise GeneratorError("the model provider returned an unexpected reply") from None
+        return text if isinstance(text, str) else ""
+
+
+class ClaudeChat:
+    """The same, through the Anthropic SDK (``pip install anthropic``; ``ANTHROPIC_API_KEY``)."""
+
+    def __init__(self, model: str, *, temperature: float = 0.3, max_tokens: int = 1200) -> None:
+        try:
+            import anthropic  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ConfigurationError("claude:<model> needs the anthropic package: pip install anthropic") from exc
+        if not model.lower().startswith("claude"):
+            raise ConfigurationError(f"model {model!r} is not a Claude model")
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self._client = anthropic.Anthropic()
+
+    def __repr__(self) -> str:
+        return f"ClaudeChat(model={self.model!r})"
+
+    def __call__(self, messages: list[dict[str, str]]) -> str:
+        system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+        rest = [m for m in messages if m.get("role") != "system"]
+        reply = self._client.messages.create(model=self.model, max_tokens=self.max_tokens, temperature=self.temperature, system=system or None, messages=rest)
+        return "".join(getattr(block, "text", "") for block in reply.content)

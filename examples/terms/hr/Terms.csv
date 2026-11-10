@@ -7,4 +7,5 @@ n_to_m_pay_periods_ago,{n} to {m} pay periods ago;{n} to {m} pay-periods-ago win
 trailing_moving_average,trailing {n} period moving average;{n} period moving average,window,,ROWS BETWEEN {n}-1 PRECEDING AND CURRENT ROW,,"The current row and the N-1 before it."
 hire_date,hire date;date of hire;hired in,source,,hr.employee_dim.hire_dt,,"hire_dt is read from employee_dim; the snapshot's copy may be stale."
 my_organisation,my organisation;my org;under me,chain,hr.emp_period_snapshot,"lvl_2_id, lvl_3_id, lvl_4_id, lvl_5_id, lvl_6_id, lvl_7_id, lvl_2_id_fn, lvl_3_id_fn, lvl_4_id_fn, lvl_5_id_fn, lvl_6_id_fn, lvl_7_id_fn = {manager_id}",,"Every associate whose reporting or functional chain contains the manager."
+top_dense_ranks,top {n} ranks;top {n} dense-ranks;top {n} dense ranks,rank,,DENSE_RANK() <= {n},,"The top N dense ranks: every tie at a rank is kept and no rank is skipped (a plain LIMIT drops ties)."
 headcount,headcount,,,,,"Documentation only: the distinct count of in-scope associates at a period. Give it a sql to have it checked."

@@ -166,3 +166,24 @@ def test_pattern_matching_with_slots(tmp_path):
         # a reference fixed at one value cannot serve another: not run, never guessed
         report = scorer.explain("SELECT id FROM orders WHERE status = 'paid' ORDER BY total DESC LIMIT 4", "The top 4 paid orders")
         assert report.stage("fixtures").status == StageStatus.NOT_RUN and "no reference for these values" in (report.stage("fixtures").detail or "")
+
+
+def test_pattern_is_closed_over_what_the_catalogue_declares():
+    """A KPI's ``requires`` terms are part of saying the KPI, and a long phrase says the shorter
+    phrases it contains: both sides of a pattern comparison see the same closure."""
+    from sqlgami.terms import Catalogue
+
+    cat = Catalogue.from_dict(
+        {
+            "terms": [{"term": "paid", "phrases": ["paid"], "kind": "filter", "table": "orders", "sql": "status = 'paid'"}],
+            "kpis": [
+                {"kpi": "revenue", "phrases": ["revenue", "paid revenue"], "formula": "SUM({total})", "requires": ["paid"]},
+                {"kpi": "revenue_growth", "phrases": ["paid revenue growth"], "formula": "({now} - {prior}) / {prior}", "requires": ["revenue"]},
+            ],
+        }
+    )
+    assert cat.pattern("Total revenue per customer") == ("paid", "revenue")  # requires closure
+    assert cat.pattern("Total paid revenue per customer") == ("paid", "revenue")
+    assert cat.pattern("Paid revenue growth per customer") == ("paid", "revenue", "revenue_growth")  # contained phrases
+    assert cat.pattern("Orders per customer") == ()
+    assert [m.name for m in cat.match("Paid revenue growth per customer")] == ["revenue_growth"]  # judging still sees the longest phrase only

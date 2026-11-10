@@ -67,6 +67,7 @@ class Reference:
     terms: tuple[str, ...] = ()  # names of the catalogue terms the question matched: the question's PATTERN
     slots: dict[str, Any] = field(default_factory=dict)  # numbers the question bound into those terms ({n: 26})
     results: dict[str, dict[str, Any]] = field(default_factory=dict)  # fixture name -> stored result
+    variant_of: str = ""  # a paraphrase of another reference (same SQL, its own question and slots)
 
     @property
     def question_key(self) -> str:
@@ -82,7 +83,7 @@ class Reference:
     def to_dict(self) -> dict[str, Any]:
         return {
             "key": self.key, "question": self.question, "sql": self.sql, "params": self.params,
-            "terms": list(self.terms), "slots": self.slots, "results": self.results,
+            "terms": list(self.terms), "slots": self.slots, "results": self.results, "variant_of": self.variant_of,
         }
 
     @classmethod
@@ -90,6 +91,7 @@ class Reference:
         return cls(
             str(data["key"]), str(data["question"]), str(data["sql"]), dict(data.get("params") or {}),
             tuple(data.get("terms") or ()), dict(data.get("slots") or {}), dict(data.get("results") or {}),
+            str(data.get("variant_of") or ""),
         )
 
 
@@ -132,10 +134,21 @@ def _plain(value: Any) -> Any:
 
 
 def compile_bundle(
-    config: dict[str, Any] | str | Path, out: str | Path, *, catalog: Catalog | None = None, fixtures: Sequence[Fixture] | None = None
+    config: dict[str, Any] | str | Path,
+    out: str | Path,
+    *,
+    catalog: Catalog | None = None,
+    fixtures: Sequence[Fixture] | None = None,
+    chat: Any = None,
 ) -> "Bundle":
     """Build the bundle folder at ``out`` from ``config`` (a dict, YAML text, or a YAML file).
-    ``fixtures`` replaces the generated ones with fixtures built elsewhere (a subsample)."""
+    ``fixtures`` replaces the generated ones with fixtures built elsewhere (a subsample).
+
+    With an ``expansion:`` block (``model: hf:<name>``, ``per_term``, ``per_example``) — or a
+    ``chat`` callable — a language model proposes synonym phrases and paraphrased questions
+    offline; see :mod:`sqlgami.expand` for what is kept. Accepted phrases go to
+    ``review/Terms.additions.csv`` for the host; accepted variants are run on every fixture
+    and stored as references of their own. This is the only place a model is ever called."""
     if isinstance(config, (str, Path)) and not str(config).lstrip().startswith(("{", "dialect:", "schema:")) and Path(config).exists():
         base = Path(config).parent
         config = _load_yaml(Path(config).read_text(encoding="utf-8"))
@@ -185,6 +198,34 @@ def compile_bundle(
     references = _references(config, catalogue)
     kept: list[Reference] = []
     rejected: list[dict[str, Any]] = []
+    expansion_summary: dict[str, Any] | None = None
+    expansion_config = dict(config.get("expansion") or {})
+    if (chat is not None or expansion_config.get("model")) and catalogue is not None:
+        from .expand import chat_for, expand
+
+        model = str(expansion_config.get("model") or getattr(chat, "model", "") or "")
+        chat = chat if chat is not None else chat_for(model)
+        expansion = expand(
+            catalogue,
+            references,
+            chat,
+            model=model,
+            per_term=int(expansion_config.get("per_term", 6)),
+            per_example=int(expansion_config.get("per_example", 4)),
+            slot_choices=expansion_config.get("slot_values") or {},
+        )
+        references = list(references) + list(expansion.variants)
+        rejected.extend(expansion.rejected)
+        (out / "review").mkdir(exist_ok=True)
+        (out / "review" / "Terms.additions.csv").write_text(expansion.review_csv(), encoding="utf-8")
+        (out / "review" / "README.txt").write_text(
+            "Terms.additions.csv lists wordings a language model proposed and sqlgami accepted after "
+            "re-matching every registered question deterministically. Nothing here is live until you add "
+            "the rows to the Terms sheet of your workbook and compile again. The variants in "
+            "references.json were validated against the catalogue with these wordings in place.\n",
+            encoding="utf-8",
+        )
+        expansion_summary = expansion.to_dict()
     timings: dict[str, list[float]] = {f.name: [] for f in fixtures}
     connections = {f.name: f.connect() for f in fixtures}
     try:
@@ -233,6 +274,13 @@ def compile_bundle(
         "params": rules.params,
         "references": len(kept),
         "rejected": len(rejected),
+        "expansion": expansion_summary,
+        # References whose question states a number that no slot or parameter binds ("the two
+        # counts"): a question compares under them only when it states the same number, so the
+        # host may want to reword the reference, or write that number as a {slot}.
+        "references_with_free_numbers": {
+            r.key: list(free_numbers(r.question, r.slots, r.params or {})) for r in kept if free_numbers(r.question, r.slots, r.params or {})
+        },
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return Bundle.load(out)
@@ -285,7 +333,7 @@ def _references(config: dict[str, Any], catalogue: Catalogue | None) -> list[Ref
         seen.add(reference.key)
         if catalogue is not None:
             matches = catalogue.match(reference.question)
-            reference.terms = tuple(sorted({m.name.lower() for m in matches}))
+            reference.terms = catalogue.pattern(reference.question)
             reference.slots = {**reference.slots, **slot_values(matches)}
         unique.append(reference)
     return unique
@@ -445,9 +493,24 @@ class Bundle:
         self._by_key = {r.key: r for r in references}
         by_terms: dict[tuple[str, ...], list[Reference]] = {}
         for r in references:
-            if r.terms:
+            if r.terms and not r.variant_of:  # variants share their base's pattern: the base stands for them
                 by_terms.setdefault(r.terms, []).append(r)
         self._by_terms = by_terms  # a pattern (term set) -> its references; usable only when exactly one
+        self._variants: dict[str, list[Reference]] = {}
+        for r in references:
+            if r.variant_of:
+                self._variants.setdefault(r.variant_of, []).append(r)
+
+    def stored_for(self, reference: Reference, slots: dict[str, Any], params: dict[str, Any]) -> Reference | None:
+        """The reference itself, or one of its compiled variants, whose stored results were
+        produced under exactly these slot and parameter values; None when none was."""
+        base = self._by_key.get(reference.variant_of) if reference.variant_of else reference
+        if base is None:
+            return None
+        for candidate in [base, *self._variants.get(base.key, [])]:
+            if candidate.slots == slots and candidate.params == params:
+                return candidate
+        return None
 
     @classmethod
     def load(cls, path: str | Path) -> "Bundle":

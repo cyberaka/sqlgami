@@ -170,6 +170,23 @@ LLM use in `compile` is through the same optional contrib interface as today (ho
 callable, allow-listed models, token never logged); `compile` works without any LLM — then
 there are no generated variants, only the host's references.
 
+**Expansion (implemented, `sqlgami.expand`).** With `expansion: {model: ...}` the compile
+step asks the model for (a) further wordings of every term and KPI and (b) paraphrases of
+every reference question, some at other slot values. Acceptance is deterministic and the
+model's text is never trusted on its own: a wording enters only if, added to the catalogue,
+no registered question changes its pattern or slots, it does not already occur in a
+registered question outside the term's own span, and a question that uses the term
+re-matches to the same terms and slots with the new wording substituted; a paraphrase
+enters only if it re-matches the reference's pattern, binds the reference's slots with the
+values the model claimed, states the same free numbers, and — when its values differ — the
+reference is written over those slots and runs at them on every fixture. Accepted wordings
+are written to `review/Terms.additions.csv` for the host to accept into the workbook (the
+live catalogue is the host's); accepted paraphrases are stored as variant references
+(`variant_of`), found by exact text and serving their slot values from stored results, so a
+question at a compiled value needs no live re-run. Everything else is in `rejected.jsonl`
+with its reason. Bench measurements made after accepting the review are reported as tuned
+on the questions the model saw.
+
 ### 5. The term catalogue in the same cache
 
 ADR 0001's compiled terms live in the per-Scorer compiled state (section 2.1) and, when a

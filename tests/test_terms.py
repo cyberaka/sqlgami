@@ -335,3 +335,64 @@ def test_a_negated_phrase_expects_the_inverse_and_a_sibling_term_is_a_note():
     assert _term_findings(mentioned)["term_differs"].severity == Severity.LOW  # the query applies the sibling not_deleted
     asked = sc.explain("SELECT COUNT(*) FROM hr_emp_period_snapshot WHERE hire_dt IS NULL", "How many soft-deleted rows are there?")
     assert "term_differs" in _term_findings(asked) and "term_contradicted" not in _term_findings(asked)
+
+
+# ------------------------------------------------------------------ rank terms
+
+
+RANK_TERMS = TERMS + "top_dense,top {n} dense-ranks;top {n} dense ranks,rank,,DENSE_RANK() <= {n},,\ntop_n,top {n};{n} largest,rank,,LIMIT {n},,\n"
+PER_NODE = "SELECT s.lvl_3_id, COUNT(DISTINCT s.assoc_id) AS active_n FROM hr_emp_period_snapshot s WHERE s.status_cd = 'A' GROUP BY s.lvl_3_id"
+
+
+def _rank_scorer() -> Scorer:
+    return Scorer("duckdb", catalog=HR_DDL, terms=Catalogue.from_sheets({"terms": RANK_TERMS, "kpis": KPIS, "parameters": PARAMS}))
+
+
+@pytest.mark.parametrize(
+    "sql,status,code",
+    [
+        # the cut the catalogue asks for, at the question's number, through a CTE column
+        (f"WITH n AS ({PER_NODE}), r AS (SELECT n.*, DENSE_RANK() OVER (ORDER BY active_n DESC) AS rk FROM n) SELECT lvl_3_id, active_n, rk FROM r WHERE rk <= 3 ORDER BY rk, lvl_3_id", "satisfied", None),
+        (f"WITH n AS ({PER_NODE}) SELECT lvl_3_id, active_n FROM n QUALIFY DENSE_RANK() OVER (ORDER BY active_n DESC) <= 3", "satisfied", None),
+        (f"WITH n AS ({PER_NODE}), r AS (SELECT n.*, DENSE_RANK() OVER (ORDER BY active_n DESC) AS rk FROM n) SELECT * FROM r WHERE rk < 4", "satisfied", None),
+        # the wrong number
+        (f"WITH n AS ({PER_NODE}), r AS (SELECT n.*, DENSE_RANK() OVER (ORDER BY active_n DESC) AS rk FROM n) SELECT * FROM r WHERE rk <= 5", "contradicted", "term_rank"),
+        # another tie rule: RANK, ROW_NUMBER or a plain LIMIT drop or skip ties
+        (f"WITH n AS ({PER_NODE}), r AS (SELECT n.*, RANK() OVER (ORDER BY active_n DESC) AS rk FROM n) SELECT * FROM r WHERE rk <= 3", "contradicted", "term_rank"),
+        (f"WITH n AS ({PER_NODE}) SELECT * FROM n ORDER BY active_n DESC LIMIT 3", "contradicted", "term_rank"),
+        (f"WITH n AS ({PER_NODE}), r AS (SELECT n.*, DENSE_RANK() OVER (ORDER BY active_n DESC) AS rk FROM n) SELECT * FROM r WHERE rk <= 3 LIMIT 3", "contradicted", "term_rank"),
+        # no cut at all
+        (f"WITH n AS ({PER_NODE}) SELECT * FROM n ORDER BY active_n DESC", "missing", "term_rank"),
+    ],
+)
+def test_rank_term_checks_the_cut_and_the_tie_rule(sql, status, code):
+    report = _rank_scorer().explain(sql, "Rank the LVL_3 nodes by active headcount and return the top 3 dense-ranks, keeping ties")
+    outcome = next(o for o in report.signals["terms"]["outcomes"] if o["term"] == "top_dense")
+    assert outcome["status"] == status, (outcome, report.summary())
+    findings = _term_findings(report)
+    if code is None:
+        assert "term_rank" not in findings
+    else:
+        assert findings[code].severity == Severity.HIGH and report.score <= 0.4
+        assert "DENSE_RANK" in findings[code].message
+
+
+def test_limit_rank_term_accepts_a_limit_or_a_row_number_and_binds_number_words():
+    sc = _rank_scorer()
+    ok = sc.explain(f"WITH n AS ({PER_NODE}) SELECT * FROM n ORDER BY active_n DESC LIMIT 5", "The five largest LVL_3 nodes by active headcount")
+    assert next(o for o in ok.signals["terms"]["outcomes"] if o["term"] == "top_n")["status"] == "satisfied"
+    rn = sc.explain(f"WITH n AS ({PER_NODE}), r AS (SELECT n.*, ROW_NUMBER() OVER (ORDER BY active_n DESC) AS rn FROM n) SELECT * FROM r WHERE rn <= 5", "The five largest LVL_3 nodes by active headcount")
+    assert next(o for o in rn.signals["terms"]["outcomes"] if o["term"] == "top_n")["status"] == "satisfied"
+    wrong = sc.explain(f"WITH n AS ({PER_NODE}) SELECT * FROM n ORDER BY active_n DESC LIMIT 3", "The five largest LVL_3 nodes by active headcount")
+    assert _term_findings(wrong)["term_rank"].severity == Severity.HIGH
+    # a LIMIT bound by a parameter is judged through the call's parameters, else left unverified
+    by_param = sc.explain(f"WITH n AS ({PER_NODE}) SELECT * FROM n ORDER BY active_n DESC LIMIT {{n}}", "The top 5 LVL_3 nodes by active headcount", params={"n": 5})
+    assert next(o for o in by_param.signals["terms"]["outcomes"] if o["term"] == "top_n")["status"] == "satisfied"
+    unknown = sc.explain(f"WITH n AS ({PER_NODE}) SELECT * FROM n ORDER BY active_n DESC LIMIT {{k}}", "The top 5 LVL_3 nodes by active headcount")
+    assert next(o for o in unknown.signals["terms"]["outcomes"] if o["term"] == "top_n")["status"] == "unverified"
+    assert "term_rank" not in _term_findings(unknown)
+
+
+def test_rank_term_sql_is_validated():
+    problems = Catalogue.from_sheets({"terms": TERMS + "top_n,top {n},rank,,ORDER BY x DESC,,\n"}).validate()
+    assert any("rank is written as" in str(p) and "sql" in str(p) for p in problems), problems

@@ -528,14 +528,14 @@ SELECT s.tenant_id,
  WHERE p.billing_interval = 'month';
 
 CREATE VIEW billing.mrr_by_month_v AS
-SELECT DATE_TRUNC('month', s.started_at)::date AS month_start,
+SELECT CAST(DATE_TRUNC('month', s.started_at) AS DATE) AS month_start,
        t.tenant_id,
        SUM(m.mrr_cents) AS tenant_mrr_cents
   FROM billing.tenant_mrr_v m
   JOIN billing.subscriptions s ON s.subscription_id = m.subscription_id
   JOIN billing.tenants t       ON t.tenant_id = m.tenant_id
  WHERE t.deleted_at IS NULL
- GROUP BY DATE_TRUNC('month', s.started_at), t.tenant_id;
+ GROUP BY CAST(DATE_TRUNC('month', s.started_at) AS DATE), t.tenant_id;
 
 CREATE VIEW billing.at_risk_accounts_v AS
 SELECT t.tenant_id,

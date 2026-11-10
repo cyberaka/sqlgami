@@ -13,8 +13,10 @@ Sheets, one row each, plain text columns:
   ``formula`` (``sql`` is how a value is computed; ``{x}`` names its input), ``window``
   (``sql`` is a range on a column: ``period_seq BETWEEN -({n}-1) AND 0``, ``period_seq = -{n}``
   or ``ROWS BETWEEN {n}-1 PRECEDING AND CURRENT ROW``), ``source`` (``sql`` is the
-  ``table.column`` that holds the value) or ``chain`` (``sql`` is ``col1, col2, ... = {param}``,
-  an access chain). A row with a blank ``sql`` is documentation only: it is matched, so the
+  ``table.column`` that holds the value), ``chain`` (``sql`` is ``col1, col2, ... = {param}``,
+  an access chain) or ``rank`` (``sql`` says how a "top {n}" is cut: ``LIMIT {n}``,
+  ``DENSE_RANK() <= {n}``, ``RANK() <= {n}`` or ``ROW_NUMBER() <= {n}``). A row with a blank
+  ``sql`` is documentation only: it is matched, so the
   term is not reported as undefined, but nothing is enforced and the score is capped as for an
   undefined term.
 * **KPIs**: ``kpi | phrases | formula | format | requires | reference_sql | description``.
@@ -43,7 +45,8 @@ from sqlglot import exp
 
 from .errors import ConfigurationError
 
-KINDS = ("filter", "formula", "window", "source", "chain")
+KINDS = ("filter", "formula", "window", "source", "chain", "rank")
+RANK_METHODS = ("limit", "rank", "dense_rank", "row_number")
 NULLS = ("", "include", "exclude", "separate")
 TERM_COLUMNS = ("term", "phrases", "kind", "table", "sql", "nulls", "description")
 KPI_COLUMNS = ("kpi", "phrases", "formula", "format", "requires", "reference_sql", "description")
@@ -341,6 +344,27 @@ class Catalogue:
         found.sort(key=lambda x: x.span)
         return found
 
+    def pattern(self, question: str) -> tuple[str, ...]:
+        """The question's PATTERN: the sorted set of term and KPI names it matches, closed over
+        what the catalogue itself declares — a KPI's ``requires`` terms (saying "headcount" when
+        headcount requires ``active`` is saying "active headcount"), and the shorter phrases a
+        longer matched phrase contains ("year-over-year active-headcount growth" contains
+        "active headcount"). Two questions compare under one reference only when their patterns
+        are equal; the closure uses declared facts only, never a guess."""
+        text = normalise(question)
+        names: set[str] = set()
+        for pattern, name, _phrase, _kind in self._compiled():
+            if pattern.search(text):
+                names.add(name.lower())  # explicit and contained phrases alike
+        pending = list(names)
+        while pending:
+            kpi = self.kpi(pending.pop())
+            for required in kpi.requires if kpi else ():
+                if required.lower() not in names:
+                    names.add(required.lower())
+                    pending.append(required.lower())
+        return tuple(sorted(names))
+
     def _compiled(self) -> list[tuple[re.Pattern[str], str, str, str]]:
         if self._patterns is None:
             entries: list[tuple[re.Pattern[str], str, str, str, int]] = []
@@ -562,12 +586,35 @@ def parse_term_sql(term: Term, dialect: str) -> exp.Expression | None:
         return sqlglot.parse_one(f"SELECT {text} AS v FROM t", read=dialect).expressions[0].this
     if term.kind == "source":
         return sqlglot.parse_one(f"SELECT {text} FROM t", read=dialect).expressions[0]
+    if term.kind == "rank":
+        rule = rank_rule(sql)
+        if rule is None:
+            raise ValueError("a rank is written as 'LIMIT {n}', 'DENSE_RANK() <= {n}', 'RANK() <= {n}' or 'ROW_NUMBER() <= {n}'")
+        return exp.Tuple(expressions=[exp.Literal.string(rule[0]), exp.Literal.string(rule[1])])
     if term.kind == "chain":
         left, _, right = text.rpartition("=")
         columns = [c.strip() for c in left.split(",") if c.strip()]
         if not columns or not right.strip():
             raise ValueError("a chain is written as 'col1, col2, ... = {param}'")
         return sqlglot.parse_one(f"SELECT 1 FROM t WHERE ({', '.join(columns)}) = ({right.strip()})", read=dialect).args["where"].this
+    return None
+
+
+def rank_rule(sql: str) -> tuple[str, str] | None:
+    """How a ``rank`` term cuts the top N: ``("limit" | "rank" | "dense_rank" | "row_number",
+    bound)`` where the bound is a number or a ``{slot}``; None when the text is not one of those."""
+    text = sql.strip()
+    m = re.fullmatch(r"(?is)limit\s+(\{\w+\}|\d+)", text)
+    if m:
+        return "limit", m.group(1)
+    m = re.fullmatch(r"(?is)(rank|dense_rank|row_number)\s*\(\s*\)\s*(<=|<)\s*(\{\w+\}|\d+)", text)
+    if m:
+        bound = m.group(3)
+        if m.group(2) == "<":
+            if not bound.isdigit():
+                return None  # "< {n}" is one less than n: write "<= {n}" over a slot
+            bound = str(int(bound) - 1)
+        return m.group(1).lower(), bound
     return None
 
 

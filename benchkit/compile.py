@@ -30,10 +30,17 @@ def compile_suite(
     from_seeds: bool = False,
     rules_file: Path | None = None,
     references_file: Path | None = None,
+    expand: str | None = None,
+    per_term: int = 6,
+    per_example: int = 4,
+    accept: bool = False,
 ) -> Bundle:
     """``from_seeds`` builds one fixture per nasty seed by subsampling the suite's own databases
     with the ``subsample:`` predicates of ``rules_file`` (what the fixture study did), instead of
-    generating synthetic rows."""
+    generating synthetic rows. ``expand`` names a model (``hf:<name>``) for the offline expansion
+    step; ``accept`` then writes the accepted wordings into the bundle's own copy of the Terms
+    sheet (as a host would, after review), so an evaluation with ``--terms-from-bundle`` measures
+    the expansion — a tuned number, since the model saw the suite's questions."""
     ddl = suite.schema_file(engine).read_text(encoding="utf-8")
     config_block = suite.config.get("sqlgami") or {}
     catalog = Catalog.from_ddl(ddl, engine, snapshot_columns=config_block.get("snapshot_columns") or None)
@@ -84,6 +91,14 @@ def compile_suite(
     terms = suite.terms_source(engine)
     if terms is not None:
         config["terms"] = str(terms)
+    if expand:
+        slot_values: dict[str, list[Any]] = {}
+        for question in suite.questions:  # the numbers the suite's questions use, as values to vary
+            for match in __import__("re").finditer(r"\b(\d+)\b", question.question):
+                slot_values.setdefault("n", [])
+                if int(match.group(1)) not in slot_values["n"] and 1 < int(match.group(1)) <= 60:
+                    slot_values["n"].append(int(match.group(1)))
+        config["expansion"] = {"model": expand, "per_term": per_term, "per_example": per_example, "slot_values": slot_values}
     prebuilt = None
     if from_seeds:
         import yaml
@@ -103,7 +118,47 @@ def compile_suite(
                 conn.close()
     bundle = compile_bundle(config, out or bundle_dir(suite, engine), catalog=catalog, fixtures=prebuilt)
     _measure_discrimination(bundle, suite, engine)
+    if expand and accept:
+        _accept_expansion(bundle)
     return bundle
+
+
+def _accept_expansion(bundle: Bundle) -> None:
+    """Add the accepted wordings to the bundle's copy of the Terms/KPIs sheets, as a host would
+    after reviewing ``review/Terms.additions.csv``; recorded in the manifest."""
+    import csv
+    import io
+    import json
+
+    review = bundle.path / "review" / "Terms.additions.csv"
+    if not review.exists():
+        return
+    additions: dict[str, list[str]] = {}
+    for row in csv.DictReader(io.StringIO(review.read_text(encoding="utf-8"))):
+        additions.setdefault(row["term"].lower(), []).append(row["phrase"])
+    if not additions:
+        return
+    for sheet, column in (("Terms.csv", "term"), ("KPIs.csv", "kpi")):
+        path = bundle.path / "terms" / sheet
+        if not path.exists():
+            continue
+        rows = list(csv.DictReader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+        if not rows:
+            continue
+        for row in rows:
+            extra = additions.get((row.get(column) or "").lower())
+            if extra:
+                row["phrases"] = ";".join([p for p in (row.get("phrases") or "").split(";") if p] + extra)
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        path.write_text(buffer.getvalue(), encoding="utf-8")
+    manifest_path = bundle.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["expansion_accepted"] = True
+    manifest_path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    bundle.manifest = manifest
 
 
 def _measure_discrimination(bundle: Bundle, suite: Suite, engine: str) -> None:

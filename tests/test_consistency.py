@@ -272,3 +272,17 @@ def test_agreement_from_weak_sources_is_capped(engine, db):
         strong = scorer.sample(RIGHT, QUESTION, alternatives=[(SAME_1, "strong-1"), (SAME_2, "strong-2")])
         assert alone.score < weak.score < strong.score
         assert weak.score - alone.score < 0.12, (alone.score, weak.score)
+
+
+def test_fingerprints_compare_timestamps_as_utc_instants():
+    """DuckDB hands back TIMESTAMPTZ in the session zone with its offset, Postgres in +00:00:
+    the same instant must fingerprint the same (and a naive timestamp is taken as written)."""
+    import datetime as dt
+
+    from sqlgami.consistency import fingerprint
+
+    plus5 = dt.datetime(2026, 1, 1, 5, 0, tzinfo=dt.timezone(dt.timedelta(hours=5)))
+    utc = dt.datetime(2026, 1, 1, 0, 0, tzinfo=dt.timezone.utc)
+    assert fingerprint([(1, plus5)]) == fingerprint([(1, utc)])
+    assert fingerprint([(1, dt.datetime(2026, 1, 1, 0, 0))]) == fingerprint([(1, utc)])
+    assert fingerprint([(1, dt.datetime(2026, 1, 1, 5, 0))]) != fingerprint([(1, utc)])

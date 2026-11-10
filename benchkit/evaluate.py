@@ -196,6 +196,7 @@ def evaluate(
     substitute: bool = False,
     terms: bool = True,
     bundle: str | None = None,
+    terms_from_bundle: bool = False,
 ) -> tuple[list[Item], dict[str, Any]]:
     """Score every labelled statement for one engine. Returns the items and their metrics.
 
@@ -222,6 +223,8 @@ def evaluate(
         bundle_path = bundle_dir(suite, engine) if bundle == "auto" else Path(bundle)
         if not (bundle_path / "manifest.json").exists():
             raise SuiteError(f"no bundle at {bundle_path}; run: python -m benchkit compile {suite.path} --engine {engine}")
+        if terms_from_bundle and terms:
+            catalogue = bundle_path / "terms"  # the bundle's copy, with the accepted expansion wordings
 
     def scorer_for(question: Question) -> Scorer:
         scoped = question.tenant is not None

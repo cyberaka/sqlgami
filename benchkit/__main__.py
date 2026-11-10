@@ -48,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     p_comp.add_argument("--rules", help="YAML with a subsample: block of per-table predicates (with --from-seeds)")
     p_comp.add_argument("--references", help="JSONL of host-registered references (id, question, sql, n_default) replacing golds of the same id")
     p_comp.add_argument("--out", help="bundle folder (default bench/.runs/bundles/<suite>-<engine>)")
+    p_comp.add_argument("--expand", help="offline expansion with a model: hf:<model> or claude:<model> (phrases to review, variants into the bundle)")
+    p_comp.add_argument("--per-term", type=int, default=6, help="wordings to ask for per term (with --expand)")
+    p_comp.add_argument("--per-example", type=int, default=4, help="paraphrases to ask for per reference (with --expand)")
+    p_comp.add_argument("--accept", action="store_true", help="with --expand: write the accepted wordings into the bundle's Terms sheet copy (a tuned measurement)")
 
     p_lat = sub.add_parser("latency", help="p50/p90/p99 of score() per mode on the suite's gold statements")
     p_lat.add_argument("suite")
@@ -112,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_eval.add_argument("--no-terms", action="store_true", help="score without the suite's term catalogue (terms/ folder), to report both numbers")
     p_eval.add_argument("--bundle", nargs="?", const="auto", help="score with a compiled bundle (default: the suite's own, from benchkit compile)")
+    p_eval.add_argument("--terms-from-bundle", action="store_true", help="with --bundle: match terms with the bundle's Terms copy (after --accept) instead of the suite's")
     p_eval.add_argument("--role", choices=["confirm", "judge"], default="confirm", help="how far the alternatives are trusted")
     p_eval.add_argument("--max-samples", type=int, help="with --consistency: use only samples 0..N-1 of each verifier")
     p_eval.add_argument("--score-only", action="append", help="score only candidates from these generators (repeatable)")
@@ -157,11 +162,16 @@ def main(argv: list[str] | None = None) -> int:
                 suite, args.engine, args.seed, args.profiles.split(",") if args.profiles else None,
                 from_seeds=args.from_seeds, rules_file=Path(args.rules) if args.rules else None,
                 references_file=Path(args.references) if args.references else None, out=Path(args.out) if args.out else None,
+                expand=args.expand, per_term=args.per_term, per_example=args.per_example, accept=args.accept,
             )
+            if m := bundle.manifest.get("expansion"):
+                print(f"  expansion ({m['model']}): {m['proposals']} proposals, {len(m['phrases'])} wordings accepted for review, {len(m['variants'])} variants compiled, {m['rejected']} rejected" + (" — wordings accepted into the bundle's Terms copy" if bundle.manifest.get("expansion_accepted") else ""))
             m = bundle.manifest
             print(f"bundle: {bundle.path}  references {m['references']} (rejected {m['rejected']})")
             for entry in m["fixtures"]:
                 print(f"  {entry['name']:16} {entry['rows']:6} rows   gold p50 {entry['reference_ms'] or 0:.1f} ms  max {entry['reference_max_ms'] or 0:.1f} ms   bugs diverging {entry.get('discrimination', '-')}/{m.get('bugs_measured', '-')}")
+            for key, numbers in (m.get("references_with_free_numbers") or {}).items():
+                print(f"  note: reference {key} states {numbers} and no slot binds it; only a question stating the same compares under it")
             return 0
         if args.command == "latency":
             from .latency import format_result, measure, write_result
@@ -232,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                     substitute=args.substitute,
                     terms=not args.no_terms,
                     bundle=args.bundle,
+                    terms_from_bundle=args.terms_from_bundle,
                 )
                 path = write_run(suite, engine, mode, items, result, run_id)
                 print(f"== {suite.name} / {engine} / {mode}")

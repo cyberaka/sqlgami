@@ -638,7 +638,7 @@ def _fixture_stage(
     if terms is not None and question:
         try:
             matches = terms.match(question)
-            matched_terms = sorted({m.name.lower() for m in matches})
+            matched_terms = list(terms.pattern(question))
             slots = B.slot_values(matches)
         except Exception:
             matched_terms, slots = [], {}
@@ -646,6 +646,10 @@ def _fixture_stage(
     if reference is None:
         _stage(report, name, StageStatus.NOT_RUN, how)
         return
+    if how == "question":
+        # The very text the reference was compiled from: its numbers are the reference's own (a
+        # variant validated under wordings the live catalogue may not have yet).
+        slots = {**reference.slots, **slots}
     runaway = [f.code for f in report.findings if f.code in RUNAWAY_CODES]
     if runaway:
         # A statement the static checks flag as potentially unbounded is not run on the
@@ -677,6 +681,11 @@ def _fixture_stage(
     live_slots = dict(reference.slots)
     live_slots.update({k: v for k, v in slots.items() if k in reference.slots or k in reference.slot_names_in_sql})
     same_values = live_params == reference.params and live_slots == reference.slots
+    if not same_values:
+        # A variant compiled under exactly these values carries stored results: no live re-run.
+        stored_variant = bundle.stored_for(reference, live_slots, live_params)
+        if stored_variant is not None:
+            reference, same_values = stored_variant, True
     if not same_values:
         differing_slots = {k for k, v in live_slots.items() if reference.slots.get(k) != v}
         missing = differing_slots - reference.slot_names_in_sql

@@ -816,9 +816,9 @@ def _time_period(asked: _Asked) -> list[Finding]:
 # ---------------------------------------------------------- comparison words
 
 _STRICT_ABOVE = r"greater than|more than|over|above|exceeds?|exceeding|strictly after|after|later than|higher than|bigger than|larger than"
-_INCLUSIVE_ABOVE = r"at least|no less than|not less than|on or after|or more|or greater|or later|minimum of|from"
+_INCLUSIVE_ABOVE = r"at least|no less than|not less than|on or after|at or after|or more|or greater|or later|minimum of|from"
 _STRICT_BELOW = r"less than|fewer than|under|below|strictly before|before|earlier than|lower than|smaller than"
-_INCLUSIVE_BELOW = r"at most|no more than|not more than|on or before|or less|or fewer|or earlier|up to|maximum of|through|until"
+_INCLUSIVE_BELOW = r"at most|no more than|not more than|on or before|at or before|or less|or fewer|or earlier|up to|maximum of|through|until"
 _BOUND_WORDS = re.compile(
     rf"\b(?:(?P<sa>{_STRICT_ABOVE})|(?P<ia>{_INCLUSIVE_ABOVE})|(?P<sb>{_STRICT_BELOW})|(?P<ib>{_INCLUSIVE_BELOW}))\b",
     re.IGNORECASE,
@@ -833,7 +833,9 @@ def _bound_phrase(asked: _Asked, position: int, end: int) -> str | None:
     found = None
     for match in _BOUND_WORDS.finditer(before):
         gap = before[match.end():]
-        if len(gap.split()) <= 2 and match.lastgroup not in ("ia", "ib") or len(gap.split()) <= 2:
+        if re.search(r"[;:,.()]", gap):
+            continue  # "...at or before as-of; 0 otherwise": the bound belongs to the clause before the break
+        if len(gap.split()) <= 2:
             found = match.lastgroup
     trailing = re.match(r"\s*(or more|or greater|or later|or less|or fewer|or earlier)\b", after, re.IGNORECASE)
     if trailing:

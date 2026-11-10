@@ -70,6 +70,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {entry['name']:16} {entry['rows']:6} rows   reference query p50 {entry['reference_ms'] or 0:.1f} ms, max {entry['reference_max_ms'] or 0:.1f} ms")
         if manifest["rejected"]:
             print(f"  see {bundle.path / 'rejected.jsonl'}")
+        for key, numbers in (manifest.get("references_with_free_numbers") or {}).items():
+            print(f"  note: reference {key} states {numbers} and no slot binds it; only a question stating the same compares under it")
+        if expansion := manifest.get("expansion"):
+            print(
+                f"  expansion ({expansion['model']}): {expansion['proposals']} proposals, {len(expansion['phrases'])} wordings to review in "
+                f"{bundle.path / 'review' / 'Terms.additions.csv'}, {len(expansion['variants'])} variants compiled, {expansion['rejected']} rejected"
+            )
         return 0
     try:
         if args.sql is not None:

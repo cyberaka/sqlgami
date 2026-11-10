@@ -140,6 +140,8 @@ def _judge_term(
         return _judge_source(ctx, term, match, node, outcome)
     if term.kind == "formula":
         return _judge_formula(ctx, term, match, node, outcome)
+    if term.kind == "rank":
+        return _judge_rank(ctx, term, match, node, outcome, params)
     return outcome, None  # chain: judged by the required-predicate rule it was folded into
 
 
@@ -775,6 +777,165 @@ def _same_range(a: _Range, b: _Range) -> bool:
     if b.point is not None:
         return a.point == b.point
     return a.lower == b.lower and a.upper == b.upper
+
+
+# --------------------------------------------------------------------- rank
+
+_RANK_FUNCTIONS = {"RANK": "rank", "DENSE_RANK": "dense_rank", "ROW_NUMBER": "row_number"}
+_TIES = {"limit": "a plain row limit (ties at the cut are dropped)", "row_number": "ROW_NUMBER (ties at the cut are dropped)", "rank": "RANK (ties kept, ranks skip after a tie)", "dense_rank": "DENSE_RANK (ties kept, no rank skipped)"}
+
+
+@dataclass
+class _Cut:
+    method: str  # limit | rank | dense_rank | row_number
+    bound: float | None  # None when the bound is a parameter the call did not supply
+    text: str
+
+
+def _judge_rank(
+    ctx: CheckContext, term: Term, match: Match, node: exp.Expression, outcome: TermOutcome, params: dict[str, Any] | None
+) -> tuple[TermOutcome, Finding | None]:
+    """A "top {n}" term: the query must cut its rows the way the catalogue says — by a LIMIT or
+    by a bounded ranking function — and at the number the question states."""
+    method, bound_text = node.expressions[0].name, node.expressions[1].name
+    wanted = bound_number(bound_text)
+    if wanted is None:
+        value = (params or {}).get(bound_text.strip("{}"))
+        wanted = bound_number(str(value)) if value is not None else None
+    if wanted is None:
+        outcome.detail = f"the term's bound {bound_text} is not bound by the question or the parameters"
+        return outcome, None
+    expected = f"{_TIES[method]} at {int(wanted)}"
+    cuts = _cuts(ctx, params)
+    if not cuts:
+        outcome.status = MISSING
+        outcome.detail = "no LIMIT and no bounded ranking function"
+        return outcome, Finding(
+            "term_rank",
+            Severity.HIGH,
+            f'The question asks for "{match.phrase}" ({term.name}), which the catalogue defines as {expected}; '
+            "the query has no LIMIT and bounds no ranking function, so it returns every row.",
+            "question",
+            evidence={"term": term.name, "expected": expected},
+        )
+    equivalent = {"limit": {"limit", "row_number"}, "row_number": {"limit", "row_number"}, "rank": {"rank"}, "dense_rank": {"dense_rank"}}[method]
+    for cut in cuts:
+        if cut.bound is None:
+            continue
+        if cut.method in equivalent and cut.bound == wanted:
+            continue
+        outcome.status = CONTRADICTED
+        outcome.detail = cut.text
+        if cut.method in equivalent:
+            what = f"the query cuts at {int(cut.bound)} ({cut.text})"
+            suggestion = f"Cut at {int(wanted)}."
+        else:
+            what = f"the query uses {_TIES[cut.method]} ({cut.text})"
+            suggestion = f"Cut with {_TIES[method].split(' (')[0]} at {int(wanted)}."
+        return outcome, Finding(
+            "term_rank",
+            Severity.HIGH,
+            f'The catalogue defines "{match.phrase}" ({term.name}) as {expected}; {what}.',
+            "question",
+            snippet=cut.text,
+            suggestion=suggestion,
+            evidence={"term": term.name, "expected": expected, "found": cut.text},
+        )
+    if any(cut.bound == wanted and cut.method in equivalent for cut in cuts):
+        outcome.status = SATISFIED
+        outcome.detail = next(c.text for c in cuts if c.bound == wanted and c.method in equivalent)
+        return outcome, None
+    outcome.detail = cuts[0].text  # bounded by a parameter the call did not supply
+    return outcome, None
+
+
+def _cuts(ctx: CheckContext, params: dict[str, Any] | None) -> list[_Cut]:
+    """Every way the query cuts its rows: LIMIT / FETCH clauses and comparisons that bound a
+    ranking function (directly, or through a column a derived source defines as one)."""
+    found: list[_Cut] = []
+    for model in ctx.cache.models():
+        select = model.select
+        for key in ("limit", "fetch"):
+            clause = select.args.get(key)
+            if clause is None:
+                continue
+            value = clause.args.get("count") if key == "fetch" else clause.expression
+            found.append(_Cut("limit", _constant_or_param(model, value, params), clause.sql()))
+        parts: list[exp.Expression] = [c.expr for c in model.conjuncts if c.origin == "where"]
+        for key in ("qualify", "having"):
+            clause = select.args.get(key)
+            if clause is not None:
+                parts.append(clause.this)
+        for part in parts:
+            for condition in flatten_and(part):
+                cut = _rank_cut(ctx, model, condition, params)
+                if cut is not None:
+                    found.append(cut)
+    return found
+
+
+def _rank_cut(ctx: CheckContext, model: SelectModel, condition: exp.Expression, params: dict[str, Any] | None) -> _Cut | None:
+    condition = strip(condition)
+    if isinstance(condition, (exp.LTE, exp.LT, exp.EQ, exp.GTE, exp.GT)):
+        pairs = [(condition.this, condition.expression, type(condition))]
+        flipped = {exp.LTE: exp.GTE, exp.LT: exp.GT, exp.GTE: exp.LTE, exp.GT: exp.LT, exp.EQ: exp.EQ}
+        pairs.append((condition.expression, condition.this, flipped[type(condition)]))
+        for side, other, op in pairs:
+            method = _rank_function(ctx, model, side)
+            if method is None:
+                continue
+            value = _constant_or_param(model, other, params)
+            if op is exp.LT and value is not None:
+                value -= 1
+            if op in (exp.GTE, exp.GT):
+                return None  # a lower bound ("rank > 3") is not a top-N cut
+            return _Cut(method, value, condition.sql())
+    if isinstance(condition, exp.Between):
+        method = _rank_function(ctx, model, condition.this)
+        if method is not None:
+            return _Cut(method, _constant_or_param(model, condition.args["high"], params), condition.sql())
+    if isinstance(condition, exp.In) and condition.expressions:
+        method = _rank_function(ctx, model, condition.this)
+        if method is not None:
+            values = [_constant_or_param(model, e, params) for e in condition.expressions]
+            return _Cut(method, max(values) if all(v is not None for v in values) else None, condition.sql())
+    return None
+
+
+def _rank_function(ctx: CheckContext, model: SelectModel | None, node: exp.Expression) -> str | None:
+    """``rank`` / ``dense_rank`` / ``row_number`` when ``node`` is that window function, or a
+    column that a derived source (a CTE, a subquery) defines as one."""
+    node = strip(node)
+    if isinstance(node, exp.Window):
+        return _RANK_FUNCTIONS.get(node.this.sql_name().upper()) if isinstance(node.this, exp.Func) else None
+    if isinstance(node, exp.Column) and model is not None:
+        sources = [model.sources[node.table]] if node.table in model.sources else ([] if node.table else list(model.sources.values()))
+        for source in sources:
+            if source.kind != "derived" or not isinstance(source.node, exp.Select):
+                continue
+            for projection in source.node.expressions:
+                if projection.alias_or_name.lower() == node.name.lower():
+                    inner = ctx.cache.model(source.scope) if source.scope is not None else None
+                    return _rank_function(ctx, inner, unalias(projection))
+    return None
+
+
+def _constant_or_param(model: SelectModel | None, node: exp.Expression | None, params: dict[str, Any] | None) -> float | None:
+    if node is None:
+        return None
+    value = _constant_of(model, node)
+    if value is not None:
+        return value
+    name = None
+    if isinstance(node, exp.Placeholder):
+        name = node.name or node.this
+    elif isinstance(node, exp.Column) and node.name.startswith("sqlgami_ph_"):
+        name = node.name[len("sqlgami_ph_"):]
+    elif isinstance(node, exp.Parameter):
+        name = node.name
+    if name and params and name in params:
+        return bound_number(str(params[name]))
+    return None
 
 
 # ------------------------------------------------------------------- source
