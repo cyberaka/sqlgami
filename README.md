@@ -18,6 +18,7 @@ to show anything, is up to your application.
 
 **On a work laptop beside a live warehouse: read [`docs/PRODUCTION_RUNBOOK.md`](docs/PRODUCTION_RUNBOOK.md) first.**
 Handing this to a coding agent? Start with [`docs/AGENT_PICKUP.md`](docs/AGENT_PICKUP.md).
+Documentation site: https://cyberaka.github.io/sqlgami/ (the overview presentation, runbook, guarantees, pilot guide and ADRs).
 
 First release candidate for a production test: **v0.1.0-rc1** — what it is, how to set it up
 in shadow mode, the measured numbers and the known limitations are in [`RELEASE.md`](RELEASE.md);
