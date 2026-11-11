@@ -23,13 +23,13 @@ html,body{margin:0;height:100%;background:#D9DEE8;color:var(--ink);font-family:v
 h1,h2{font-family:var(--display);font-weight:800;letter-spacing:-.025em;margin:0;color:var(--ink)}
 h1{font-size:76px;line-height:1.02;max-width:1150px}
 h2{font-size:60px;line-height:1.05;max-width:1200px}
-.lede{font-size:28px;line-height:1.45;color:var(--soft);max-width:900px;margin:28px 0 0}
+.lede{font-size:26px;line-height:1.45;color:var(--soft);max-width:1180px;margin:24px 0 0}
 .small{font-size:20px;line-height:1.5;color:var(--soft)}
 .foot{position:absolute;left:120px;bottom:56px;font-size:16px;color:var(--soft);max-width:1300px}
 .page{position:absolute;right:120px;bottom:56px;font-size:16px;color:var(--soft);font-variant-numeric:tabular-nums}
 
 /* the confidence scale: the one memorable element */
-.scale{position:relative;height:200px;margin-top:110px}
+.scale{position:relative;height:200px;margin-top:56px}
 .scale .bar{position:absolute;left:0;right:0;top:92px;height:30px;display:flex}
 .scale .z{height:100%;position:relative}
 .scale .z.w{flex:40;background:var(--wrong)}
@@ -158,7 +158,7 @@ nav button:focus-visible{outline:3px solid var(--fold);outline-offset:2px}
 <section class="slide on" aria-label="Title">
   <div class="brand"><span class="mark">sqlgami</span><span class="by">Abhinav Anand</span></div>
   <h1>Every query an LLM writes, with a confidence score attached.</h1>
-  <p class="lede">A deterministic check that tells you, in milliseconds, whether AI-written SQL actually answers the question.</p>
+  <p class="lede">Our mission: make SQL written by LLMs and coding agents safe to trust in production. sqlgami checks every query the way a careful analyst would, against your schema, your business definitions and verified reference answers, and returns a deterministic confidence score with the evidence, in milliseconds. No AI judge, no guesswork, and nothing leaves your systems.</p>
   <div class="scale" aria-label="Confidence scale from 0 to 1 with two example queries">
     <div class="pin" style="left:3%;transform:translateX(-22px);text-align:left"><style>.pin[style*="left:3%"] .dot{margin-left:11px}</style><div class="t">off-by-one window</div><div class="v" style="color:var(--wrong)">0.03</div><div class="dot"></div></div>
     <div class="pin" style="left:81%"><div class="t">correct query</div><div class="v" style="color:var(--right)">0.81</div><div class="dot"></div></div>
@@ -224,6 +224,56 @@ GROUP  BY 1</pre>
   <div class="foot">Same SQL, same score, every time. Runs inside the application in about 50 ms.</div>
 </section>
 
+
+<section class="slide" aria-label="Architecture">
+  <h2>Architecture</h2>
+  <svg viewBox="0 0 1360 600" width="1360" height="600" style="margin-top:34px;display:block" role="img" aria-label="Offline compile produces a bundle; live scoring uses the bundle inside the application">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#16213A"/></marker>
+      <marker id="arb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2B4FD8"/></marker>
+    </defs>
+    <style>
+      .lane{font:600 17px 'Instrument Sans',sans-serif;fill:#5B6580}
+      .bx{fill:#fff;stroke:#CBD2E0;stroke-width:1.5}
+      .bk{fill:#16213A}
+      .bb{fill:#2B4FD8}
+      .t{font:600 19px 'Bricolage Grotesque',sans-serif;fill:#16213A}
+      .tw{font:600 19px 'Bricolage Grotesque',sans-serif;fill:#fff}
+      .s{font:15px 'Instrument Sans',sans-serif;fill:#5B6580}
+      .sw{font:15px 'Instrument Sans',sans-serif;fill:#C9D2EA}
+      .ln{stroke:#16213A;stroke-width:2;fill:none}
+      .lb{stroke:#2B4FD8;stroke-width:2.5;fill:none}
+      .dash{stroke:#5B6580;stroke-width:1.5;stroke-dasharray:6 6;fill:none}
+    </style>
+    <text class="lane" x="0" y="18">Offline, once per change (an LLM may suggest phrasings here; every suggestion is verified)</text>
+    <rect class="bx" x="0" y="40" width="250" height="56"/><text class="t" x="16" y="66">Schema DDL</text><text class="s" x="16" y="86">tables, views, table functions</text>
+    <rect class="bx" x="0" y="106" width="250" height="56"/><text class="t" x="16" y="132">Terms &amp; KPIs</text><text class="s" x="16" y="152">Excel / CSV workbook</text>
+    <rect class="bx" x="0" y="172" width="250" height="56"/><text class="t" x="16" y="198">Reference queries</text><text class="s" x="16" y="218">one per question pattern</text>
+    <rect class="bx" x="0" y="238" width="250" height="56"/><text class="t" x="16" y="264">Data rules</text><text class="s" x="16" y="284">for realistic mock data</text>
+    <path class="ln" d="M250,68 H300 V166 H330" marker-end="url(#ar)"/><path class="ln" d="M250,134 H300"/><path class="ln" d="M250,200 H300"/><path class="ln" d="M250,266 H300 V166"/>
+    <rect class="bk" x="335" y="96" width="300" height="140"/><text class="tw" x="355" y="130">sqlgami compile</text><text class="sw" x="355" y="158">verifies every reference</text><text class="sw" x="355" y="180">builds adversarial mock datasets</text><text class="sw" x="355" y="202">stores reference fingerprints</text>
+    <path class="ln" d="M635,166 H690" marker-end="url(#ar)"/>
+    <rect class="bx" x="695" y="96" width="250" height="140" style="stroke:#2B4FD8;stroke-width:2.5"/><text class="t" x="715" y="130">Bundle</text><text class="s" x="715" y="158">versioned folder in git</text><text class="s" x="715" y="180">catalogue, fixtures,</text><text class="s" x="715" y="202">fingerprints, schema hash</text>
+    <rect x="1010" y="96" width="350" height="140" fill="none" stroke="#5B6580" stroke-dasharray="6 6"/><text class="t" x="1030" y="130">BigQuery sandbox</text><text class="s" x="1030" y="158">offline only: proves each translated</text><text class="s" x="1030" y="180">construct gives BigQuery's answer,</text><text class="s" x="1030" y="202">and labels test sets</text>
+    <path class="dash" d="M1010,166 H945"/>
+    <line x1="0" y1="330" x2="1360" y2="330" stroke="#CBD2E0"/>
+    <text class="lane" x="0" y="364">Live, inside the agent or application, ≤50 ms, no network, no LLM</text>
+    <rect class="bx" x="0" y="392" width="160" height="88"/><text class="t" x="16" y="426">Agent / app</text><text class="s" x="16" y="450">SQL + question</text><text class="s" x="16" y="468">+ parameters</text>
+    <path class="ln" d="M160,436 H198" marker-end="url(#ar)"/>
+    <rect class="bx" x="202" y="392" width="170" height="88"/><text class="t" x="218" y="426">Parse &amp; gate</text><text class="s" x="218" y="450">schema, safety,</text><text class="s" x="218" y="468">allow-lists</text>
+    <path class="ln" d="M372,436 H404" marker-end="url(#ar)"/>
+    <rect class="bx" x="408" y="392" width="170" height="88"/><text class="t" x="424" y="426">Rule checks</text><text class="s" x="424" y="450">~40 failure</text><text class="s" x="424" y="468">patterns</text>
+    <path class="ln" d="M578,436 H610" marker-end="url(#ar)"/>
+    <rect class="bx" x="614" y="392" width="170" height="88"/><text class="t" x="630" y="426">Terms &amp; KPIs</text><text class="s" x="630" y="450">your definitions</text><text class="s" x="630" y="468">vs the SQL</text>
+    <path class="ln" d="M784,436 H816" marker-end="url(#ar)"/>
+    <rect class="bk" x="820" y="392" width="260" height="88"/><text class="tw" x="836" y="426">Answer check</text><text class="sw" x="836" y="450">run on mock data via proven</text><text class="sw" x="836" y="468">translation; compared to reference</text>
+    <path class="ln" d="M1080,436 H1112" marker-end="url(#ar)"/>
+    <rect class="bb" x="1116" y="392" width="244" height="88"/><text class="tw" x="1132" y="426">Report</text><text class="sw" x="1132" y="450">verdict, confidence + range,</text><text class="sw" x="1132" y="468">findings, timing</text>
+    <path class="lb" d="M820,236 V300 H950 V392" marker-end="url(#arb)"/>
+    <text class="s" x="958" y="300">bundle loaded once at start-up</text>
+    <text class="s" x="0" y="520">Anything the system cannot verify (an unsupported construct, an undefined term, no matching reference) is reported as "can't check" and lowers confidence. It is never guessed.</text>
+  </svg>
+</section>
 
 <section class="slide" aria-label="Inside the answer check">
   <h2>Inside the answer check</h2>
@@ -391,55 +441,6 @@ report.timing         # ms per stage</pre>
 </section>
 
 
-<section class="slide" aria-label="Architecture">
-  <h2>Architecture</h2>
-  <svg viewBox="0 0 1360 600" width="1360" height="600" style="margin-top:34px;display:block" role="img" aria-label="Offline compile produces a bundle; live scoring uses the bundle inside the application">
-    <defs>
-      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#16213A"/></marker>
-      <marker id="arb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2B4FD8"/></marker>
-    </defs>
-    <style>
-      .lane{font:600 17px 'Instrument Sans',sans-serif;fill:#5B6580}
-      .bx{fill:#fff;stroke:#CBD2E0;stroke-width:1.5}
-      .bk{fill:#16213A}
-      .bb{fill:#2B4FD8}
-      .t{font:600 19px 'Bricolage Grotesque',sans-serif;fill:#16213A}
-      .tw{font:600 19px 'Bricolage Grotesque',sans-serif;fill:#fff}
-      .s{font:15px 'Instrument Sans',sans-serif;fill:#5B6580}
-      .sw{font:15px 'Instrument Sans',sans-serif;fill:#C9D2EA}
-      .ln{stroke:#16213A;stroke-width:2;fill:none}
-      .lb{stroke:#2B4FD8;stroke-width:2.5;fill:none}
-      .dash{stroke:#5B6580;stroke-width:1.5;stroke-dasharray:6 6;fill:none}
-    </style>
-    <text class="lane" x="0" y="18">Offline, once per change (an LLM may suggest phrasings here; every suggestion is verified)</text>
-    <rect class="bx" x="0" y="40" width="250" height="56"/><text class="t" x="16" y="66">Schema DDL</text><text class="s" x="16" y="86">tables, views, table functions</text>
-    <rect class="bx" x="0" y="106" width="250" height="56"/><text class="t" x="16" y="132">Terms &amp; KPIs</text><text class="s" x="16" y="152">Excel / CSV workbook</text>
-    <rect class="bx" x="0" y="172" width="250" height="56"/><text class="t" x="16" y="198">Reference queries</text><text class="s" x="16" y="218">one per question pattern</text>
-    <rect class="bx" x="0" y="238" width="250" height="56"/><text class="t" x="16" y="264">Data rules</text><text class="s" x="16" y="284">for realistic mock data</text>
-    <path class="ln" d="M250,68 H300 V166 H330" marker-end="url(#ar)"/><path class="ln" d="M250,134 H300"/><path class="ln" d="M250,200 H300"/><path class="ln" d="M250,266 H300 V166"/>
-    <rect class="bk" x="335" y="96" width="300" height="140"/><text class="tw" x="355" y="130">sqlgami compile</text><text class="sw" x="355" y="158">verifies every reference</text><text class="sw" x="355" y="180">builds adversarial mock datasets</text><text class="sw" x="355" y="202">stores reference fingerprints</text>
-    <path class="ln" d="M635,166 H690" marker-end="url(#ar)"/>
-    <rect class="bx" x="695" y="96" width="250" height="140" style="stroke:#2B4FD8;stroke-width:2.5"/><text class="t" x="715" y="130">Bundle</text><text class="s" x="715" y="158">versioned folder in git</text><text class="s" x="715" y="180">catalogue, fixtures,</text><text class="s" x="715" y="202">fingerprints, schema hash</text>
-    <rect x="1010" y="96" width="350" height="140" fill="none" stroke="#5B6580" stroke-dasharray="6 6"/><text class="t" x="1030" y="130">BigQuery sandbox</text><text class="s" x="1030" y="158">offline only: proves each translated</text><text class="s" x="1030" y="180">construct gives BigQuery's answer,</text><text class="s" x="1030" y="202">and labels test sets</text>
-    <path class="dash" d="M1010,166 H945"/>
-    <line x1="0" y1="330" x2="1360" y2="330" stroke="#CBD2E0"/>
-    <text class="lane" x="0" y="364">Live, inside the agent or application, ≤50 ms, no network, no LLM</text>
-    <rect class="bx" x="0" y="392" width="160" height="88"/><text class="t" x="16" y="426">Agent / app</text><text class="s" x="16" y="450">SQL + question</text><text class="s" x="16" y="468">+ parameters</text>
-    <path class="ln" d="M160,436 H198" marker-end="url(#ar)"/>
-    <rect class="bx" x="202" y="392" width="170" height="88"/><text class="t" x="218" y="426">Parse &amp; gate</text><text class="s" x="218" y="450">schema, safety,</text><text class="s" x="218" y="468">allow-lists</text>
-    <path class="ln" d="M372,436 H404" marker-end="url(#ar)"/>
-    <rect class="bx" x="408" y="392" width="170" height="88"/><text class="t" x="424" y="426">Rule checks</text><text class="s" x="424" y="450">~40 failure</text><text class="s" x="424" y="468">patterns</text>
-    <path class="ln" d="M578,436 H610" marker-end="url(#ar)"/>
-    <rect class="bx" x="614" y="392" width="170" height="88"/><text class="t" x="630" y="426">Terms &amp; KPIs</text><text class="s" x="630" y="450">your definitions</text><text class="s" x="630" y="468">vs the SQL</text>
-    <path class="ln" d="M784,436 H816" marker-end="url(#ar)"/>
-    <rect class="bk" x="820" y="392" width="260" height="88"/><text class="tw" x="836" y="426">Answer check</text><text class="sw" x="836" y="450">run on mock data via proven</text><text class="sw" x="836" y="468">translation; compared to reference</text>
-    <path class="ln" d="M1080,436 H1112" marker-end="url(#ar)"/>
-    <rect class="bb" x="1116" y="392" width="244" height="88"/><text class="tw" x="1132" y="426">Report</text><text class="sw" x="1132" y="450">verdict, confidence + range,</text><text class="sw" x="1132" y="468">findings, timing</text>
-    <path class="lb" d="M820,236 V300 H950 V392" marker-end="url(#arb)"/>
-    <text class="s" x="958" y="300">bundle loaded once at start-up</text>
-    <text class="s" x="0" y="520">Anything the system cannot verify (an unsupported construct, an undefined term, no matching reference) is reported as "can't check" and lowers confidence. It is never guessed.</text>
-  </svg>
-</section>
 
 <section class="slide" aria-label="Thank you">
   <div class="brand"><span class="mark">sqlgami</span><span class="by">Abhinav Anand</span></div>
@@ -448,7 +449,7 @@ report.timing         # ms per stage</pre>
   <div class="contact">
     <div><span>Website</span><a href="https://abhinav-anand.com/">abhinav-anand.com</a></div>
     <div><span>Blog</span><a href="https://www.cyberaka.com/">cyberaka.com</a></div>
-    <div><span>Email</span><a href="mailto:cyberaka@cyberaka.com">cyberaka@cyberaka.com</a></div>
+    <div><span>Email</span><a href="mailto:cyberaka@gmail.com">cyberaka@gmail.com</a></div>
   </div>
   <div class="scale" style="margin-top:56px;height:60px"><div class="bar" style="top:0"><div class="z w"></div><div class="z u"></div><div class="z r"></div></div></div>
 </section>

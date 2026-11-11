@@ -249,4 +249,4 @@ disagreements need the native rows (the sandbox project only; never a production
 No employer, customer or product names belong in issues, tests or fixtures.
 
 Author: Abhinav Anand — https://abhinav-anand.com/ · blog https://www.cyberaka.com/ ·
-cyberaka@cyberaka.com
+cyberaka@gmail.com

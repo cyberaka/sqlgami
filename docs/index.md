@@ -18,4 +18,4 @@ less trustworthy, not a guarantee. The first target is BigQuery.
 - Architecture decisions: [ADR 0001 — the term catalogue](adr/0001-term-catalogue.html) · [ADR 0002 — deterministic live scoring, models offline](adr/0002-deterministic-live-and-offline-compile.html) · [ADR 0003 — BigQuery through a proof-gated translation](adr/0003-bigquery.html)
 - [Source on GitHub](https://github.com/cyberaka/sqlgami) (Apache License 2.0)
 
-Author: Abhinav Anand — [abhinav-anand.com](https://abhinav-anand.com/) · blog [cyberaka.com](https://www.cyberaka.com/) · cyberaka@cyberaka.com
+Author: Abhinav Anand — [abhinav-anand.com](https://abhinav-anand.com/) · blog [cyberaka.com](https://www.cyberaka.com/) · cyberaka@gmail.com

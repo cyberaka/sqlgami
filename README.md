@@ -783,4 +783,4 @@ several tenants, soft-deleted rows, boundary dates).
 Apache License 2.0. See [LICENSE](LICENSE).
 
 Author: Abhinav Anand — https://abhinav-anand.com/ · blog https://www.cyberaka.com/ ·
-cyberaka@cyberaka.com
+cyberaka@gmail.com
